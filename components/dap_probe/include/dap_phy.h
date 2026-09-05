@@ -115,6 +115,15 @@ bool dap_phy_self_drive_check(void);
  */
 void dap_phy_training_pattern(int reps);
 
+/*
+ * Force the direction pin to a chosen level with the S3 driving the data line,
+ * for polarity testing.  dap_phy_self_drive_check() cannot settle this: in
+ * INPUT_OUTPUT mode the S3 reads back its own pad and the FPGA's buffer is
+ * never in the loop, so it passes either way.  Watching the connector with the
+ * logic analyser while this drives is what actually decides it.
+ */
+void dap_phy_force_dir(int level);
+
 #ifdef __cplusplus
 }
 #endif

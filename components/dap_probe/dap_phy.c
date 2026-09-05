@@ -209,9 +209,14 @@ bool dap_phy_self_drive_check(void)
 {
     bool ok = true;
 
-    /* INPUT_OUTPUT keeps the input path alive while the S3 drives, so the pad
-     * can be read back.  The FPGA's buffer is in the loop as well, but its
-     * outbound enable is what we are testing here. */
+    /*
+     * NOTE ON WHAT THIS DOES NOT PROVE.  In INPUT_OUTPUT mode the S3 reads back
+     * its *own* pad, so the FPGA's buffer is not in the loop and this passes
+     * whatever the direction pin is doing.  It therefore only rules out a dead
+     * S3 output or a misconfigured pin - it says nothing about whether the data
+     * reaches the connector.  Only watching the pads settles that; see
+     * dap_phy_force_dir() and the analyser harness in main.c.
+     */
     gpio_set_level((gpio_num_t)s_cfg.dir_pin, 0);
     gpio_set_direction((gpio_num_t)s_cfg.dat_pin, GPIO_MODE_INPUT_OUTPUT);
 
@@ -226,6 +231,12 @@ bool dap_phy_self_drive_check(void)
     dat_set(1);
     gpio_set_direction((gpio_num_t)s_cfg.dat_pin, GPIO_MODE_OUTPUT);
     return ok;
+}
+
+void dap_phy_force_dir(int level)
+{
+    gpio_set_level((gpio_num_t)s_cfg.dir_pin, level);
+    gpio_set_direction((gpio_num_t)s_cfg.dat_pin, GPIO_MODE_OUTPUT);
 }
 
 void dap_phy_training_pattern(int reps)

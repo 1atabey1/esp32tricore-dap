@@ -231,7 +231,10 @@ esp_err_t dap_probe_bringup_report(void)
         ESP_LOGW(TAG, "   DAP1 reads low with the target driving: unpowered target, "
                       "open wire, or the direction pin is inverted");
     } else if (idle_high == 32) {
-        ESP_LOGI(TAG, "   DAP1 idles high: wire and inbound path look intact");
+        /* Measured on this board: a floating DAP1 also reads high, because the
+         * ICE40's input has a pull-up.  So this is not evidence of a target. */
+        ESP_LOGI(TAG, "   DAP1 idles high - note an unconnected line reads the "
+                      "same, via the FPGA's pull-up");
     }
 
     /* Checkpoint 1: sync must draw the 0xAAAAAAAA training pattern. */

@@ -36,6 +36,7 @@
 #include "port_cfg.h"
 #if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
 #include "dap_probe.h"
+#include "dap_phy.h"
 #endif
 #include "xvc_server.h"
 #include "esp32jtag_common.h"
@@ -916,6 +917,148 @@ bool sreset_is_asserted(void)
  *   2 = PORTD_OUT_COUNTER_HI — drive cnt1[7:4]  (counter high nibble)
  *   3 = PORTD_OUT_GPIO       — drive data_reg_1[3:0] directly (value = 0..15)
  */
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+/*
+ * Watch the DAP wires with the board's own logic analyser.
+ *
+ * Port C is logic-analyser channels 8..11, which is exactly where the DAP
+ * signals sit: PC01=ch8 (DAP2), PC02=ch9 (DAP0 clock), PC03=ch10 (DAP1 data),
+ * PC04=ch11 (TRST).  The capture block samples the pads, so this works while
+ * Port C is muxed to Black Magic Probe rather than to the analyser - which is
+ * the whole point, since that is the configuration the probe runs in.
+ *
+ * The question this answers first: does our clock actually reach the connector?
+ * The self-drive check only ever proved the bidirectional pin, and DAP0 and
+ * TRST share a register-controlled output enable rather than GPIO 45's.  So the
+ * trigger is armed on the clock channel: if the capture never triggers, the
+ * clock is not getting out, and no amount of protocol theory matters.
+ */
+extern uint8_t *psram_buffer;   /* the 128 KB capture landing buffer, in ice.c */
+
+#define DAP_LA_CH_DAP2   8
+#define DAP_LA_CH_DAP0   9
+#define DAP_LA_CH_DAP1  10
+#define DAP_LA_CH_TRST  11
+
+static void dap_la_summarise(const uint16_t *samples, size_t count)
+{
+    static const char *names[4] = { "DAP2/PC01", "DAP0/PC02", "DAP1/PC03", "TRST/PC04" };
+
+    for (int c = 0; c < 4; c++) {
+        const int ch = DAP_LA_CH_DAP2 + c;
+        int  edges = 0;
+        int  high  = 0;
+        int  first_edge = -1;
+        int  prev = (samples[0] >> ch) & 1;
+
+        for (size_t i = 0; i < count; i++) {
+            const int bit = (samples[i] >> ch) & 1;
+            high += bit;
+            if (bit != prev) {
+                edges++;
+                if (first_edge < 0) {
+                    first_edge = (int)i;
+                }
+                prev = bit;
+            }
+        }
+        ESP_LOGI(TAG, "  ch%-2d %-10s edges=%-6d high=%d%%  first edge at sample %d",
+                 ch, names[c], edges, (int)((100L * high) / (long)count), first_edge);
+    }
+}
+
+/* Arm the analyser on the clock channel and hand back once it is waiting. */
+static void dap_la_arm(void)
+{
+    gbl_sample_rate_reg  = 2;         /* 132/3 = 44 MHz, 64 Ki samples ~ 1.49 ms */
+    gbl_trigger_enabled  = true;
+    gbl_trigger_mode_or  = true;
+    gbl_trigger_position = 5;
+    for (int i = 0; i < 16; i++) {
+        gbl_channel_triggers[i] = TRIGGER_DISABLED;
+    }
+    gbl_channel_triggers[DAP_LA_CH_DAP0] = TRIGGER_RISING;
+    start_capture(false);
+}
+
+/* Wait for the capture to complete, read it back and summarise it. */
+static bool dap_la_collect(const char *what)
+{
+    for (int attempt = 0; attempt < 20 && !gbl_triggered_flag; attempt++) {
+        read_capture_status();
+        if (!gbl_triggered_flag) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (!gbl_triggered_flag) {
+        ESP_LOGE(TAG, "  %s: no trigger - the clock never reached PC02", what);
+        return false;
+    }
+
+    read_and_return_capture();
+    const uint16_t *samples = (const uint16_t *)(psram_buffer + 4);
+    const size_t    count   = (ICE_CAPTURE_BUFFER_SIZE - 4) / sizeof(uint16_t);
+
+    ESP_LOGI(TAG, "  %s:", what);
+    dap_la_summarise(samples, count);
+    return true;
+}
+
+/*
+ * Which level of the direction pin lets our data out?
+ *
+ * Drives an alternating pattern on DAP1 with the direction pin held at each
+ * level in turn, and watches the connector.  Exactly one of the two should show
+ * the pattern on ch10; whichever it is settles the polarity, and if neither
+ * does then the FPGA is not passing our data at all in this port mode.
+ */
+static void dap_la_direction_polarity(void)
+{
+    for (int dir = 0; dir <= 1; dir++) {
+        dap_la_arm();
+        dap_phy_force_dir(dir);
+        dap_phy_training_pattern(32);   /* 128 clocks, DAP1 alternating */
+        char label[48];
+        snprintf(label, sizeof(label), "dir=%d, 128 clocks of alternating DAP1", dir);
+        dap_la_collect(label);
+    }
+}
+
+static void dap_la_capture_test(void)
+{
+    if (!g_board->has_logic_analyzer) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "=== DAP wire capture: arming on the clock channel ===");
+
+    /*
+     * This runs before start_background_tasks(), so logic_analyzer_init() has
+     * not allocated the landing buffer yet.  Allocating it here is safe and
+     * idempotent: the allocation in ice.c is guarded on psram_buffer == NULL.
+     */
+    if (psram_buffer == NULL) {
+        psram_buffer = heap_caps_malloc(ICE_CAPTURE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        if (psram_buffer == NULL) {
+            ESP_LOGE(TAG, "  no PSRAM for the capture buffer");
+            return;
+        }
+    }
+
+    if (dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ) != ESP_OK) {
+        ESP_LOGE(TAG, "  PHY init failed, nothing to capture");
+        return;
+    }
+    dap_la_arm();                     /* armed, waiting for the clock's first edge */
+    dap_exchange_t x;
+    dap_probe_sync(&x);               /* the traffic we want to see on the wire */
+    dap_la_collect("sync frame plus reply window");
+
+    /* Then settle what the sync capture only hints at. */
+    dap_la_direction_polarity();
+}
+#endif /* CONFIG_AEL_DAP_BRINGUP_AT_BOOT */
+
 esp_err_t set_portd_output(uint8_t mode, uint8_t value)
 {
     if (!g_board->has_fpga) {
@@ -1228,6 +1371,8 @@ void app_main(void) {
     set_la_input_sel(false);
 
 #if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+    dap_la_capture_test();
+
     /*
      * Sweep the ADC channels the schematic wires to the port pins through 100 K
      * dividers (R108: PA01, PB01; R109: PC01, PD01).  With a target attached
