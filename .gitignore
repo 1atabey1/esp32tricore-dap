@@ -25,3 +25,7 @@ components/jimtcl/tmp/
 dependencies.lock
 managed_components/
 components/jimtcl/src/
+
+# Python tooling
+.venv/
+__pycache__/
