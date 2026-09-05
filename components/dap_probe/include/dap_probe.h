@@ -76,6 +76,14 @@ esp_err_t dap_probe_bringup_report(void);
  */
 esp_err_t dap_probe_attach_sweep(void);
 
+/*
+ * Try each Port C pin that can be an output as the clock, with the data line
+ * fixed on the one bidirectional pin, and report which one draws a reply.
+ * Cheaper than asking someone to trace a cable, and it covers the case where
+ * the wires are not where the documentation says.
+ */
+esp_err_t dap_probe_clock_pin_search(void);
+
 #ifdef __cplusplus
 }
 #endif

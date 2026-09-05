@@ -138,6 +138,51 @@ esp_err_t dap_probe_client_read(uint8_t io_instruction, uint8_t size_exponent,
     return exchange(&f, reply_bits, out);
 }
 
+esp_err_t dap_probe_clock_pin_search(void)
+{
+    /*
+     * DAP1 has to be on the bidirectional pin, so the data line is fixed - but
+     * the clock only needs to be an output, and two Port C pins can be one.
+     * If the cables are not where we think, trying both is cheaper and more
+     * reliable than asking someone to trace a wire.
+     *
+     * PC01 is not a candidate: it is register-driven and cannot be clocked.
+     */
+    static const struct { int pin; const char *label; } candidates[] = {
+        { AEL_DAP0_PIN,     "GPIO47 -> PC02, J3 pin 23" },
+        { AEL_DAP_TRST_PIN, "GPIO40 -> PC04, J3 pin 27" },
+    };
+
+    ESP_LOGI(TAG, "--- clock pin search, data fixed on GPIO%d (PC03) ---", AEL_DAP1_PIN);
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        const dap_phy_cfg_t cfg = {
+            .clk_pin  = candidates[i].pin,
+            .dat_pin  = AEL_DAP1_PIN,
+            .dir_pin  = AEL_DAP1_DIR_PIN,
+            /* Do not touch the other candidate while it might be the clock. */
+            .trst_pin = -1,
+            .clock_hz = CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ,
+        };
+        if (dap_phy_init(&cfg) != ESP_OK) {
+            continue;
+        }
+
+        dap_exchange_t x;
+        const esp_err_t err = dap_probe_sync(&x);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "clock on %s ANSWERED: wait %d, reply 0x%08" PRIX64,
+                     candidates[i].label, x.wait_cycles, x.reply);
+            return ESP_OK;
+        }
+        ESP_LOGI(TAG, "clock on %s: silent", candidates[i].label);
+    }
+
+    /* Leave the PHY on the documented assignment. */
+    dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    return ESP_FAIL;
+}
+
 esp_err_t dap_probe_attach_sweep(void)
 {
     static const uint32_t rates[]  = { 200000u, 500000u, 1000000u };
@@ -251,7 +296,8 @@ esp_err_t dap_probe_bringup_report(void)
         failures++;
         /* Everything downstream assumes sync worked, so rather than emit a
          * cascade of failures with one cause, try the cheap attach variants. */
-        if (dap_probe_attach_sweep() == ESP_OK) {
+        if (dap_probe_clock_pin_search() == ESP_OK ||
+            dap_probe_attach_sweep() == ESP_OK) {
             ESP_LOGW(TAG, "=== a sweep combination answered: adopt it and re-run ===");
         } else {
             ESP_LOGE(TAG, "=== target silent on every attach variant ===");
