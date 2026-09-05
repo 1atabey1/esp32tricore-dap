@@ -34,6 +34,9 @@
 #include "gdb_main.h"
 #include "boards/board_profile.h"
 #include "port_cfg.h"
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+#include "dap_probe.h"
+#endif
 #include "xvc_server.h"
 #include "esp32jtag_common.h"
 #include "ice.h"
@@ -1223,6 +1226,42 @@ void app_main(void) {
     set_cfga(b_use_porta, b_use_portb, b_use_portc, b_use_portd, true, !SPI_nGPIO); // use_portc, not use_porta, swdio, SPI not gpio
 
     set_la_input_sel(false);
+
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+    /*
+     * Sweep the ADC channels the schematic wires to the port pins through 100 K
+     * dividers (R108: PA01, PB01; R109: PC01, PD01).  With a target attached
+     * this is a four-point voltmeter on the connector, which is the cheapest
+     * way to tell an unpowered target from a protocol problem.  Raw counts are
+     * logged rather than scaled volts: the divider ratio is only known for the
+     * one channel the firmware already scales.
+     */
+    for (int ch = ADC_CHANNEL_0; ch <= ADC_CHANNEL_4; ch++) {
+        adc_oneshot_chan_cfg_t cfg = {
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        if (adc_oneshot_config_channel(gbl_adc_handle, ch, &cfg) != ESP_OK) {
+            continue;
+        }
+        int raw = 0;
+        if (adc_oneshot_read(gbl_adc_handle, ch, &raw) == ESP_OK) {
+            ESP_LOGI(TAG, "port ADC ch%d raw=%d", ch, raw);
+        }
+    }
+
+    /* Port C is now routed to the S3's GPIO, which is what the DAP probe needs.
+     * Run before start_background_tasks() so BMP's gdb thread is not also
+     * holding these pins. */
+    if (b_use_portc) {
+        if (dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ) == ESP_OK) {
+            dap_probe_bringup_report();
+        }
+    } else {
+        ESP_LOGW(TAG, "DAP bring-up skipped: Port C is not in SWD/JTAG mode");
+    }
+#endif
+
     start_background_tasks();
     if (g_board->has_lcd) {
         draw_port_cfg_info();

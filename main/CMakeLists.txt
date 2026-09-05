@@ -34,6 +34,7 @@ set(dependencies
     blackmagic_esp32
     lcd
     CherryDAP
+    dap_probe
 )
 
 idf_component_register(

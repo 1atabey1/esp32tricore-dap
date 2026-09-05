@@ -29,6 +29,31 @@
 #define AEL_BMP_TDI_PIN 40
 #define AEL_BMP_TDO_PIN 15
 
+/*
+ * Infineon DAP master for AURIX TC3xx targets, on Port C of header J3.
+ *
+ * These are not free choices.  The stock FPGA bitstream fixes which S3 pin
+ * reaches which connector pin, and only PC03 is bidirectional; recovered by
+ * tracing the bitstream netlist, see docs/tc38x_dap_probe_plan_2026-09-05.md
+ * and tools/bitstream/trace_nets.py.
+ *
+ *   DAP0  clock, probe-driven    -> PC02, J3 pin 23, ICE40 pin 32
+ *   DAP1  data, half duplex     <-> PC03, J3 pin 25, ICE40 pin 31
+ *   DAP2  wide mode              -> PC01, J3 pin 21: register-driven in the
+ *                                   stock bitstream, so there is no fast path
+ *                                   and wide mode waits for Phase 2
+ *   TRST                         -> PC04, J3 pin 27, ICE40 pin 28
+ *
+ * AEL_DAP1_DIR_PIN drives the FPGA's output enable for both ends of the
+ * bidirectional pair: 0 = probe drives, 1 = target drives.
+ */
+#define AEL_BOARD_HAS_DAP_PROBE 1
+#define AEL_DAP0_PIN 47
+#define AEL_DAP1_PIN 41
+#define AEL_DAP1_DIR_PIN 45
+#define AEL_DAP2_PIN GPIO_NUM_NC
+#define AEL_DAP_TRST_PIN 40
+
 #define AEL_PIN_NUM_CS0 GPIO_NUM_21
 #define AEL_PIN_NUM_CS1 GPIO_NUM_13
 #define AEL_PIN_NUM_CS2 GPIO_NUM_11
@@ -68,6 +93,14 @@
 #define AEL_BMP_SWDIO_RDNWR_PIN GPIO_NUM_NC
 #define AEL_BMP_TDI_PIN 7
 #define AEL_BMP_TDO_PIN 15
+
+/* No DAP probe on the devkit: it has no direction control for a half-duplex line. */
+#define AEL_BOARD_HAS_DAP_PROBE 0
+#define AEL_DAP0_PIN GPIO_NUM_NC
+#define AEL_DAP1_PIN GPIO_NUM_NC
+#define AEL_DAP1_DIR_PIN GPIO_NUM_NC
+#define AEL_DAP2_PIN GPIO_NUM_NC
+#define AEL_DAP_TRST_PIN GPIO_NUM_NC
 
 #define AEL_PIN_NUM_CS0 GPIO_NUM_NC
 #define AEL_PIN_NUM_CS1 GPIO_NUM_NC
