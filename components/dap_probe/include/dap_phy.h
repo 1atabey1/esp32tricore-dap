@@ -124,6 +124,9 @@ void dap_phy_training_pattern(int reps);
  */
 void dap_phy_force_dir(int level);
 
+/* Drive the data line to a level, with the probe in control. */
+void dap_phy_drive_data(int level);
+
 #ifdef __cplusplus
 }
 #endif

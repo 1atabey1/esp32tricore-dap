@@ -239,6 +239,11 @@ void dap_phy_force_dir(int level)
     gpio_set_direction((gpio_num_t)s_cfg.dat_pin, GPIO_MODE_OUTPUT);
 }
 
+void dap_phy_drive_data(int level)
+{
+    dat_set(level);
+}
+
 void dap_phy_training_pattern(int reps)
 {
     for (int r = 0; r < reps; r++) {

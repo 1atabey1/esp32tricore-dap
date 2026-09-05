@@ -1024,6 +1024,50 @@ static void dap_la_direction_polarity(void)
     }
 }
 
+/*
+ * Is anything actually attached to the data line?
+ *
+ * Hold DAP1 low with the probe driving, then release it and watch how fast the
+ * pad comes back up.  The rise is an RC against whatever pull-up is on the net:
+ *
+ *   only the ICE40's own input pull-up (~100 k) into pad plus a little cable
+ *   capacitance takes microseconds - hundreds of samples at 44 MHz;
+ *   a target pin with its own pull-up of a few tens of k is several times
+ *   faster; a target holding the line down means it never rises at all.
+ *
+ * This distinguishes a bare floating pad from a connected target pin, which is
+ * the one thing the edge counts cannot tell apart.
+ */
+static void dap_la_release_time(void)
+{
+    ESP_LOGI(TAG, "  release test: hold DAP1 low, let go, time the rise");
+
+    for (int start_level = 0; start_level <= 1; start_level++) {
+        dap_phy_force_dir(0);
+        dap_phy_drive_data(start_level);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        gbl_sample_rate_reg  = 2;
+        gbl_trigger_enabled  = true;
+        gbl_trigger_mode_or  = true;
+        gbl_trigger_position = 5;
+        for (int i = 0; i < 16; i++) {
+            gbl_channel_triggers[i] = TRIGGER_DISABLED;
+        }
+        gbl_channel_triggers[DAP_LA_CH_DAP0] = TRIGGER_RISING;
+        start_capture(false);
+
+        dap_phy_idle_clocks(1, start_level);   /* marker, data still held */
+        dap_phy_turnaround_to_read();          /* release */
+
+        char label[72];
+        snprintf(label, sizeof(label),
+                 "released from %s: does the net move on its own?",
+                 start_level ? "high" : "low");
+        dap_la_collect(label);
+    }
+}
+
 static void dap_la_capture_test(void)
 {
     if (!g_board->has_logic_analyzer) {
@@ -1056,6 +1100,7 @@ static void dap_la_capture_test(void)
 
     /* Then settle what the sync capture only hints at. */
     dap_la_direction_polarity();
+    dap_la_release_time();
 }
 #endif /* CONFIG_AEL_DAP_BRINGUP_AT_BOOT */
 
