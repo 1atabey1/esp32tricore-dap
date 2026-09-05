@@ -1068,6 +1068,55 @@ static void dap_la_release_time(void)
     }
 }
 
+/*
+ * Which of the four Port C wires is attached to a target pull-up?
+ *
+ * A powered target's DAP1 sits behind a pull-up on any sane debug header,
+ * while its DAP0 is a probe-clocked input with nothing pulling it.  So:
+ * drive every pin we can reach low, then tri-state the whole port by taking
+ * Port C out of SWD/JTAG mode, and watch which channels come back up.  The
+ * ones that rise are connected to something that pulls; the ones that hold
+ * low are inert.
+ *
+ * This identifies the real DAP1 without anyone tracing a wire, and it works
+ * regardless of how the cables happen to be arranged.
+ */
+static void dap_la_find_pulled_pins(bool restore_portc, bool use_portb, bool use_portd)
+{
+    ESP_LOGI(TAG, "  pull-up hunt: drive Port C low, tri-state it, see what rises");
+
+    dap_phy_force_dir(0);
+    dap_phy_drive_data(0);                 /* PC03 low */
+    gpio_set_level((gpio_num_t)AEL_DAP0_PIN, 0);      /* PC02 low */
+    gpio_set_level((gpio_num_t)AEL_DAP_TRST_PIN, 0);  /* PC04 low */
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    gbl_sample_rate_reg  = 2;
+    gbl_trigger_enabled  = true;
+    gbl_trigger_mode_or  = true;           /* any of the four may fire */
+    gbl_trigger_position = 5;
+    for (int i = 0; i < 16; i++) {
+        gbl_channel_triggers[i] = TRIGGER_DISABLED;
+    }
+    for (int ch = DAP_LA_CH_DAP2; ch <= DAP_LA_CH_TRST; ch++) {
+        gbl_channel_triggers[ch] = TRIGGER_RISING;
+    }
+    start_capture(false);
+
+    /* cfgpc = 0 takes Port C to high impedance: nothing on our side drives it. */
+    set_cfga(false, use_portb, false, use_portd, true, true);
+
+    if (!dap_la_collect("tri-stated - a channel at high% is pulled by the target")) {
+        ESP_LOGW(TAG, "    nothing rose: no target pull-up on any Port C wire");
+    }
+
+    if (restore_portc) {
+        set_cfga(false, use_portb, true, use_portd, true, true);
+    }
+}
+
+static bool b_use_portb_cached, b_use_portd_cached;
+
 static void dap_la_capture_test(void)
 {
     if (!g_board->has_logic_analyzer) {
@@ -1101,6 +1150,7 @@ static void dap_la_capture_test(void)
     /* Then settle what the sync capture only hints at. */
     dap_la_direction_polarity();
     dap_la_release_time();
+    dap_la_find_pulled_pins(true, b_use_portb_cached, b_use_portd_cached);
 }
 #endif /* CONFIG_AEL_DAP_BRINGUP_AT_BOOT */
 
@@ -1416,6 +1466,8 @@ void app_main(void) {
     set_la_input_sel(false);
 
 #if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+    b_use_portb_cached = b_use_portb;
+    b_use_portd_cached = b_use_portd;
     dap_la_capture_test();
 
     /*
