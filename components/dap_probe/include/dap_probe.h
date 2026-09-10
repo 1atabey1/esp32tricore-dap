@@ -117,6 +117,9 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
  */
 esp_err_t dap_probe_set_rw_mode(bool supervisor);
 
+/* Log an IOINFO value with its bits named. */
+void dap_probe_log_ioinfo(uint16_t v);
+
 /* Clear Cerberus Error State, in which reads and writes are silently dropped. */
 esp_err_t dap_probe_clear_error_state(void);
 

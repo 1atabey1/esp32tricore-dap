@@ -69,6 +69,36 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
  */
 #define DAP_IOCONF_MODE_RW     0x0001u
 #define DAP_IOCONF_SVM         0x0080u
+
+/*
+ * IOCONF is a 12-bit register, and the width matters more than it looks.
+ *
+ * Each IO instruction has a required data length N - IO_CONFIG is 12,
+ * IO_SET_ADDRESS is 16 or 32 - and the shift core is explicit about what
+ * happens when a tool disagrees: fewer bits than N cancels the write
+ * entirely, and *more* bits than N means only the last N are used.
+ *
+ * Sending IOCONF as 16 bits therefore does not write 0x0081.  The device keeps
+ * the last twelve bits, which is 0x008, so MODE stays 0 and the interface
+ * stays in communication mode - where every read goes to COMDATA and waits for
+ * on-chip software that is not listening.  That is precisely the symptom this
+ * cost a long time to find: IOClient register reads working, every bus read
+ * silently dropped, and no error flagged anywhere.
+ */
+#define DAP_IOCONF_BITS        12u
+
+/*
+ * IOINFO bit assignments, which are not what an earlier note in this file
+ * assumed.  Bit 5 is ENDINIT, not PWR_DWN, and IF_LCK is bit 7.
+ */
+#define DAP_IOINFO_IDLE        (1u << 0)
+#define DAP_IOINFO_PWR_DWN     (1u << 1)
+#define DAP_IOINFO_BUS_RD_ERR  (1u << 2)
+#define DAP_IOINFO_BUS_WR_ERR  (1u << 3)
+#define DAP_IOINFO_PWR_DWN_ERR (1u << 4)
+#define DAP_IOINFO_ENDINIT     (1u << 5)
+#define DAP_IOINFO_BUS_RST     (1u << 6)
+#define DAP_IOINFO_IF_LCK      (1u << 7)
 #define DAP_CLIENT_ID_EXPECT   0x0260u
 
 /*
@@ -714,10 +744,24 @@ esp_err_t dap_probe_set_rw_mode(bool supervisor)
     const uint16_t conf = DAP_IOCONF_MODE_RW |
                           (uint16_t)(supervisor ? DAP_IOCONF_SVM : 0u);
 
-    const esp_err_t err = dap_probe_client_write(DAP_IO_CONF, 4, conf, 16, &x);
+    const esp_err_t err = dap_probe_client_write(DAP_IO_CONF, 4, conf,
+                                                DAP_IOCONF_BITS, &x);
     ESP_LOGI(TAG, "IOCONF <- 0x%04X: %s after %d cycles", conf,
              err == ESP_OK ? "acknowledged" : "NOT acknowledged", x.wait_cycles);
     return err;
+}
+
+void dap_probe_log_ioinfo(uint16_t v)
+{
+    ESP_LOGI(TAG, "   IOINFO 0x%04X:%s%s%s%s%s%s%s%s", v,
+             (v & DAP_IOINFO_IDLE)        ? " IDLE"        : "",
+             (v & DAP_IOINFO_PWR_DWN)     ? " PWR_DWN"     : "",
+             (v & DAP_IOINFO_BUS_RD_ERR)  ? " BUS_RD_ERR"  : "",
+             (v & DAP_IOINFO_BUS_WR_ERR)  ? " BUS_WR_ERR"  : "",
+             (v & DAP_IOINFO_PWR_DWN_ERR) ? " PWR_DWN_ERR" : "",
+             (v & DAP_IOINFO_ENDINIT)     ? " ENDINIT"     : "",
+             (v & DAP_IOINFO_BUS_RST)     ? " BUS_RST"     : "",
+             (v & DAP_IOINFO_IF_LCK)      ? " IF_LCK"      : "");
 }
 
 esp_err_t dap_probe_clear_error_state(void)
@@ -731,7 +775,12 @@ esp_err_t dap_probe_clear_error_state(void)
      * it.  Worth doing before a sequence, because the state survives whatever
      * caused it, including an earlier session's mistake.
      */
-    return dap_probe_client_read(DAP_IO_INFO, 4, 16, &x);
+    const esp_err_t err = dap_probe_client_read(DAP_IO_INFO, 4, 16, &x);
+    if (err == ESP_OK && (x.reply & (DAP_IOINFO_BUS_RST | DAP_IOINFO_IF_LCK |
+                                     DAP_IOINFO_BUS_RD_ERR | DAP_IOINFO_BUS_WR_ERR))) {
+        dap_probe_log_ioinfo((uint16_t)x.reply);
+    }
+    return err;
 }
 
 esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
@@ -1054,7 +1103,16 @@ esp_err_t dap_probe_bringup_report(void)
     }
 
     /* Checkpoint 4: CLIENT_ID.  This is the one that says the probe is real. */
-    err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
+        if (err == ESP_OK && x.reply == DAP_CLIENT_ID_EXPECT) {
+            break;
+        }
+        /* Flush and retry: the first sequence after a board reset regularly
+         * fails here where the next one succeeds. */
+        dap_phy_idle_clocks(s_max_wait, 0);
+        dap_probe_clear_error_state();
+    }
     log_exchange("4 client_read ID", &x);
     {
         /* 32-bit form: the hardware replicates the halfword, so a correct
@@ -1105,12 +1163,55 @@ esp_err_t dap_probe_bringup_report(void)
             { 0xA0000000u, "PFLASH0, non-cached alias" },
             { 0xF0000480u, "OSTATE (OCDS block)" },
         };
-        uint32_t word = 0;
+        uint32_t word = 0, again = 0;
+
+        /*
+         * Order matters and is not optional: clear any Error State, put the
+         * IOClient in RW mode, and only then set an address and read.  RW mode
+         * is a 12-bit IOCONF write - sending 16 bits leaves MODE clear,
+         * because the device keeps only the last N bits of an over-long write.
+         */
         dap_probe_clear_error_state();
+
+        /*
+         * Before blaming the address, establish whether *any* bus read works
+         * and what the IOClient says about itself.  Register reads through
+         * instruction 0xF and 0xB already work, so a failure here separates
+         * "this address" from "bus access at all" - and the plan notes that
+         * OJCONF through the IOClient keeps working when the bus is locked or
+         * unclocked, which is exactly the shape of what we are seeing.
+         */
+        static const struct { uint8_t instr; uint8_t exp; size_t bits; const char *what; } widths[] = {
+            { DAP_IO_READ_BYTE,  3,  8, "IO_READ_BYTE  (0x9)" },
+            { DAP_IO_READ_HWORD, 4, 16, "IO_READ_HWORD (0x7)" },
+            { DAP_IO_READ_WORD,  5, 32, "IO_READ_WORD  (0x5)" },
+        };
+        static const struct { uint8_t instr; const char *what; } regs[] = {
+            { 0xEu, "OJCONF (0xE)" },
+            { 0xBu, "IOINFO (0xB)" },
+        };
+        for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+            dap_exchange_t r;
+            if (dap_probe_client_read(regs[i].instr, 4, 16, &r) == ESP_OK) {
+                ESP_LOGI(TAG, "   %s = 0x%04" PRIX64, regs[i].what, r.reply);
+            } else {
+                ESP_LOGW(TAG, "   %s no reply", regs[i].what);
+            }
+        }
         esp_err_t mode = dap_probe_set_rw_mode(true);
         ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
                  mode == ESP_OK ? "acknowledged" : "no acknowledge");
         int reads_ok = 0;
+        /*
+         * Map the IOClient's readable instruction space.
+         *
+         * IOCONF is write-only, so a MODE=1 write cannot be confirmed by
+         * reading it back, and an acknowledge only says a frame was accepted.
+         * Sweeping every instruction shows which registers answer and what
+         * they hold - including whichever one reports the interface lock,
+         * which is the leading explanation for bus reads being dropped while
+         * register reads work.  Reads only; nothing here changes state.
+         */
         for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
             if (dap_probe_read32(probes[i].addr, &word) == ESP_OK) {
                 reads_ok++;
@@ -1126,6 +1227,24 @@ esp_err_t dap_probe_bringup_report(void)
                          (inf.reply & ~0x0020u) ? "  <- bits beyond PWR_DWN" : "");
             }
         }
+        /*
+         * The timer read twice is the check that cannot be faked: a counter
+         * that reports the same value twice is not being read.
+         */
+        if (dap_probe_read32(0xF0001010u, &word) == ESP_OK &&
+            dap_probe_read32(0xF0001010u, &again) == ESP_OK) {
+            if (word != again) {
+                ESP_LOGI(TAG, "5 STM0_TIM0 advanced: 0x%08" PRIX32 " -> 0x%08" PRIX32
+                              "  (+%" PRIu32 ")", word, again, again - word);
+            } else {
+                ESP_LOGW(TAG, "5 STM0_TIM0 read the same value twice: 0x%08" PRIX32
+                              " - not a live read", word);
+                failures++;
+            }
+        } else {
+            failures++;
+        }
+
         if (!reads_ok) {
             failures++;
         }
