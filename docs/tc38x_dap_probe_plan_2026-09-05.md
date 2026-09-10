@@ -644,8 +644,33 @@ reply CRC-valid, in one sequence with no retries.
 2 dapisc long     -> wait 1,  reply 0x0F00      residue-ok
 3 client_set(1)   -> wait 1,  acknowledge
 4 client_read ID  -> wait 11, reply 0x0260      residue-ok
-   32-bit CLIENT_ID reads 0x02600260, IOINFO reads 0x0020
+5 read 0xF0001010 = 0x1C11A414   STM0_TIM0, and it advances between reads
+6 miniMCDS ID     = 0x00D6C007   after the OCDS enable sequence
+7 blockread 8 words: matches single reads, ID lands at word index 2
+=== bring-up PASSED (0 failures) ===
 ```
+
+**Phases 1 and 3 are done, and the throughput goal is already met.** Block
+reads run at 116 kB/s from a bit-banged GPIO PHY - three times the 38 kB/s
+miniWiggler ceiling that forced the 12x publish-rate cut - with no FPGA work at
+all:
+
+| bit rate setting | 1 kB blocks | throughput |
+|---|---|---|
+| 400 kHz | 8/8 | 33 kB/s |
+| 1 MHz | 8/8 | 64 kB/s |
+| 2 MHz | 8/8 | 91 kB/s |
+| 4 MHz | 8/8 | **116 kB/s** |
+
+Single-word register reads, for comparison, run 4739/s at 400 kHz rising to
+14084/s at the 4 MHz setting, 200/200 CRC-valid at every rate.
+
+Those numbers also calibrate the rest of the budget. 33.5 us per word against
+33 bits per word puts the *effective* bit rate at about 1 MHz, so the GPIO call
+overhead - not the protocol - is the limit, and the table above is a measurement
+of the bit-bang loop rather than of DAP. A GP-SPI PHY at 20 MHz should give
+about 2.4 MB/s at the pins, which is what this document already predicted, and
+which would cover the six-signal 800 kB/s case without the FPGA.
 
 Every value this document predicted for those steps was right. What it had
 wrong was the *mechanics* around them, and those cost more debugging time than
@@ -686,6 +711,42 @@ silently recovers from. Re-derive the window from every `dapisc` reply.
 aborted block transfer, clock at least `MAXWAIT8` cycles with `DAP1` low to
 return the device to `Active::RECEIVE`. Phase 4's drain loop needs exactly
 this, and this document did not have it.
+
+**`client_write` is telegram `0x08`, not `0x1B`.** `0x1B` is
+`client_readwrite`, a combined transaction, so sending it in place of a write
+makes the device read the frame as read-first and desynchronise - while
+acknowledging, so the write looks accepted and has no effect. A write telegram
+also carries no size exponent: `LEN` is 4 + n, the 4-bit IO instruction
+followed by n data bits.
+
+**Instruction data widths are mandatory, and the failure mode is silent.** Each
+IO instruction has a required length N - `IO_CONFIG` is **12** bits,
+`IO_SET_ADDRESS` 16 or 32 - and the shift core keeps only the *last* N bits of
+an over-long write while cancelling a short one outright. Writing `IOCONF` as
+16 bits therefore stores `0x008` rather than `0x0081`: `MODE` stays clear, the
+IOClient stays in communication mode, and every read goes to `COMDATA` to wait
+for on-chip software that is not listening. Each write is acknowledged
+throughout. This cost more debugging than any other single item here.
+
+**`IOINFO`'s bits are not what this document assumed.** Bit 5 is `ENDINIT`
+(initialisation finished), not `PWR_DWN` - that is bit 1. Bit 6 is `BUS_RST`,
+which blocks every bus-targeting instruction while set, including
+`IO_SET_ADDRESS`, and is cleared by reading `IOINFO`. `IF_LCK` is bit 7. A
+steady `0x0020` means nothing more alarming than "initialisation finished".
+
+**`IO_SUPERVISOR` is instruction `0xB`** - the same read that returns `IOINFO`
+clears Error State, which is the state a failed bus access leaves behind and in
+which every instruction except `0xB` and `IO_READ_AGAIN` (`0xC`) returns
+infinite busy bits. The bus instructions pair up: `2H`/`3H` block, `4H`/`5H`
+word, `6H`/`7H` halfword, `8H`/`9H` byte, writes even.
+
+**OCDS enable needs one step this document did not list: the module clock.**
+`OSTATE.OEN = 1` makes the miniMCDS register space *reachable*, but the block
+stays clock-gated and still reads nothing. `CLC` at offset `0x0000` must be
+written to zero as well - a `CLC` register stays accessible while its module is
+disabled, which is how a module gets enabled at all. The working order is the
+four contiguous `OEC.PAT` writes, the `OSTATE.OEN` check, `OCNTRL`, **`CLC`**,
+then `CT.SETE`. With that, `ID` reads `0x00D6C007` where it bus-errored before.
 
 **`CLIENT_ID`'s instruction is `0xF`, as originally written.** It was changed to
 `0xB` on the strength of a USB capture in which every `client_read` carried
@@ -817,11 +878,17 @@ running through DMA at a measured rate, including one that needed a continuation
 transaction. The CRC6 rule is settled on paper, so a silent target here means a
 framing or timing fault rather than a checksum one.
 
-**Status: 1a is done.** Checkpoints 1 to 4 pass on a TC38x with every reply
-CRC-valid - see "Attach, as it actually works on silicon" for the sequence and
-for the seven corrections it took. Checkpoint 5, a word of target memory, needs
-`IOADDR` and `IO_READ_WORD`, which is Phase 3's access layer. 1b and 1c are
-untouched: the bit-bang PHY was enough to get here.
+**Status: 1a is complete, and so is Phase 3.** All five checkpoints pass on a
+TC38x with every reply CRC-valid, plus the OCDS enable sequence and a block
+read - see "Attach, as it actually works on silicon". 1b and 1c were never
+needed to get here: the bit-bang PHY carried the whole of Phases 1 and 3, and
+block reads out of it already run at three times the miniWiggler baseline.
+
+**1c is now the highest-value remaining work.** The measured 116 kB/s is limited
+by GPIO call overhead, not by the protocol - about 1 MHz effective against a
+4 MHz setting - so replacing the clocking with GP-SPI and DMA is what buys the
+order of magnitude the trace case needs. 1b's turnaround question is settled by
+the specification and by every exchange since.
 
 #### Phase 2 - A second, DAP-only bitstream (2-3 weeks, and possibly deferrable)
 
@@ -924,6 +991,13 @@ list starts with the four pattern writes.
 Exit: memory read/write and halt/resume driven from the host, `OSTATE.OEN` reads
 back as 1, and a read of a miniMCDS register returns data instead of a bus
 error.
+
+**Status: done, except halt/resume.** `OSTATE` reads `0x00080001` after the
+enable sequence and the miniMCDS `ID` reads `0x00D6C007` where it bus-errored
+before, so the register space is live. Memory reads, writes and block reads all
+work. Halt and resume via `OJCONF` are not implemented: `OJCONF` is instruction
+`0xE` and reads `0x0000` today, but halting the application under test is a
+deliberate act and was left for when it is actually wanted.
 
 #### Phase 4 - Autonomous TRAM drain (1-1.5 weeks)
 
