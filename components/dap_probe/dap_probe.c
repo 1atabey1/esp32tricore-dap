@@ -7,6 +7,7 @@
 #include "dap_frame.h"
 #include "dap_phy.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "DAP";
 
@@ -50,6 +51,24 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
  */
 #define DAP_IO_CLIENT_ID       0xFu
 #define DAP_IO_INFO            0xBu
+#define DAP_IO_SET_ADDRESS     0x1u   /* loads IOADDR, 16- or 32-bit write */
+#define DAP_IO_CONF            0x0u   /* IOCONF, write-only */
+
+/*
+ * IOCONF.MODE selects what a read instruction means, and the reset value is
+ * the wrong one for a debugger.
+ *
+ *   MODE = 0, communication mode: IO_READ_WORD fetches COMDATA and raises
+ *             IOSR.CRSYNC to ask the target's own software for data.  With no
+ *             software playing along the read simply never completes.
+ *   MODE = 1, read/write mode:    IO_READ_WORD performs a bus read from the
+ *             address in IOADDR, which is what memory access needs.
+ *
+ * SVM_MODE at bit 7 selects supervisor privilege, which register space
+ * generally wants.
+ */
+#define DAP_IOCONF_MODE_RW     0x0001u
+#define DAP_IOCONF_SVM         0x0080u
 #define DAP_CLIENT_ID_EXPECT   0x0260u
 
 /*
@@ -599,6 +618,116 @@ esp_err_t dap_probe_attach_now(dap_exchange_t out[6])
     return ESP_OK;
 }
 
+esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
+                                 uint64_t data, size_t data_bits,
+                                 dap_exchange_t *out)
+{
+    dap_frame_t f;
+    const uint8_t sel = dap_client_read_payload(io_instruction, size_exponent);
+
+    /*
+     * A write telegram is the same 4-bit instruction and 3-bit size exponent
+     * as a read, followed by the data - so LEN is 7 plus the data width, and
+     * the whole payload goes out LSB first like every other field.
+     */
+    if (data_bits > 32) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!dap_frame_build(&f, DAP_CMD_CLIENT_WRITE, (uint8_t)(7u + data_bits),
+                         ((uint64_t)data << 7) | sel, 7u + data_bits)) {
+        return ESP_FAIL;
+    }
+    /* Writes acknowledge with a bare start bit, like client_set. */
+    return exchange(&f, 0, out);
+}
+
+esp_err_t dap_probe_set_rw_mode(bool supervisor)
+{
+    dap_exchange_t x;
+    const uint16_t conf = DAP_IOCONF_MODE_RW |
+                          (uint16_t)(supervisor ? DAP_IOCONF_SVM : 0u);
+
+    return dap_probe_client_write(DAP_IO_CONF, 4, conf, 16, &x);
+}
+
+esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
+{
+    dap_exchange_t x;
+
+    /*
+     * IO_SET_ADDRESS (instruction 0x1) loads IOADDR - 32 bits for a full
+     * address, or 16 bits to change only the low half, which saves shift
+     * cycles for random access inside a 64 kB window.  Then IO_READ_WORD
+     * (0x5) at size exponent 5 returns the 32-bit word.
+     */
+    esp_err_t err = dap_probe_client_write(DAP_IO_SET_ADDRESS, 5, addr, 32, &x);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "IOADDR write for 0x%08" PRIX32 " was not acknowledged", addr);
+        return err;
+    }
+
+    err = dap_probe_client_read(DAP_IO_READ_WORD, 5, 32, &x);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (!x.crc_ok) {
+        ESP_LOGW(TAG, "read of 0x%08" PRIX32 " has a bad CRC residue", addr);
+    }
+    *value = (uint32_t)x.reply;
+    return ESP_OK;
+}
+
+esp_err_t dap_probe_rate_test(void)
+{
+    /*
+     * How fast does a single-word register read actually go, and how far does
+     * the bit-banged PHY carry before the wire stops agreeing?
+     *
+     * CLIENT_ID is the ideal probe for this: hard-wired to 0x0260, so every
+     * reply is self-checking.  A rate where the value still reads 0x0260 with
+     * a valid CRC is a rate that works; one where it does not is where the
+     * PHY's edge placement or the target's setup and hold give out.  This
+     * plan's Phase 1 numbers - "150-250 kB/s at ~4 MHz" - were an estimate and
+     * have never been measured.
+     */
+    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u };
+    const int reads = 200;
+
+    ESP_LOGW(TAG, "--- rate test: %d CLIENT_ID reads per rate ---", reads);
+
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        dap_exchange_t x;
+        int      good = 0;
+        uint32_t crc_ok = 0;
+
+        dap_phy_set_clock(rates[r]);
+
+        const int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < reads; i++) {
+            if (dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x) == ESP_OK) {
+                if (x.reply == DAP_CLIENT_ID_EXPECT) {
+                    good++;
+                }
+                if (x.crc_ok) {
+                    crc_ok++;
+                }
+            }
+        }
+        const int64_t us = esp_timer_get_time() - t0;
+
+        /* A 16-bit read is a 26-bit frame plus a 23-bit reply, so call it
+         * 49 bits of wire time plus the lead-in and the wait. */
+        const int per_read_us = (int)(us / reads);
+        ESP_LOGW(TAG, "  %7" PRIu32 " Hz: %3d/%d correct, %" PRIu32 " CRC ok, "
+                      "%d us/read -> %d reads/s",
+                 rates[r], good, reads, crc_ok, per_read_us,
+                 per_read_us ? (int)(1000000 / per_read_us) : 0);
+    }
+
+    dap_phy_set_clock(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    return ESP_OK;
+}
+
 esp_err_t dap_probe_trailer_sweep(void)
 {
     static const size_t trailers[] = { 0, 1, 2, 4, 8, 18 };
@@ -767,12 +896,7 @@ esp_err_t dap_probe_bringup_report(void)
         return ESP_FAIL;
     }
 
-    /* Measure the real shape of a reply window before trusting any length. */
-    dap_probe_dump_sync_reply(120);
 
-    dap_probe_trailer_sweep();
-    dap_probe_sync_health(12);
-    dap_probe_second_frame_matrix();
 
     /* And the whole handshake with no host work between frames. */
     {
@@ -864,6 +988,80 @@ esp_err_t dap_probe_bringup_report(void)
         failures++;
     } else {
         ESP_LOGI(TAG, "   CLIENT_ID 0x0260: the probe is talking to Cerberus");
+    }
+
+    /*
+     * Checkpoint 5: a word of target memory.  OSTATE is the right first read -
+     * it is read-only, it is the register the OCDS enable sequence checks, and
+     * its OEN bit tells us whether the miniMCDS space is reachable yet.
+     * IOINFO afterwards reports whether the access took a bus error.
+     */
+    {
+        /*
+         * Several addresses, because a single failure cannot distinguish "the
+         * read mechanism does not work" from "that address is not readable".
+         * Program flash and the CPU0 scratchpad are ordinary memory; OSTATE
+         * sits in the OCDS control block, which may itself be gated until
+         * OCDS is enabled.
+         */
+        static const struct { uint32_t addr; const char *what; } probes[] = {
+            { 0xA0000000u, "PFLASH0, non-cached alias" },
+            { 0x80000000u, "PFLASH0, cached alias" },
+            { 0x70000000u, "CPU0 DSPR" },
+            { 0xF0000480u, "OSTATE (OCDS block)" },
+        };
+        uint32_t word = 0;
+        esp_err_t mode = dap_probe_set_rw_mode(true);
+        ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
+                 mode == ESP_OK ? "acknowledged" : "no acknowledge");
+        int reads_ok = 0;
+        for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+            if (dap_probe_read32(probes[i].addr, &word) == ESP_OK) {
+                reads_ok++;
+                ESP_LOGI(TAG, "5 read 0x%08" PRIX32 " = 0x%08" PRIX32 "  %s",
+                         probes[i].addr, word, probes[i].what);
+            } else {
+                ESP_LOGW(TAG, "5 read 0x%08" PRIX32 "   no reply       %s",
+                         probes[i].addr, probes[i].what);
+            }
+            dap_exchange_t inf;
+            if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &inf) == ESP_OK &&
+                inf.reply != 0x0020u) {
+                ESP_LOGW(TAG, "     IOINFO changed to 0x%04" PRIX64, inf.reply);
+            }
+        }
+        if (!reads_ok) {
+            failures++;
+        }
+    }
+
+    if (0) {
+        uint32_t word = 0;
+        esp_err_t mode = dap_probe_set_rw_mode(true);
+        ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
+                 mode == ESP_OK ? "acknowledged" : "no acknowledge");
+        if (dap_probe_read32(0xF0000480u, &word) == ESP_OK) {
+            ESP_LOGI(TAG, "5 read 0xF0000480    OSTATE = 0x%08" PRIX32
+                          " (OEN=%" PRIu32 ")", word, word & 1u);
+        } else {
+            /* Try without supervisor privilege before calling it a failure. */
+            dap_probe_set_rw_mode(false);
+            if (dap_probe_read32(0xF0000480u, &word) == ESP_OK) {
+                ESP_LOGI(TAG, "5 read 0xF0000480    OSTATE = 0x%08" PRIX32
+                              " (user privilege)", word);
+            } else {
+                ESP_LOGE(TAG, "5 read 0xF0000480    no reply either way");
+                failures++;
+            }
+        }
+        dap_exchange_t info;
+        if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
+            ESP_LOGI(TAG, "   IOINFO after the read: 0x%04" PRIX64, info.reply);
+        }
+    }
+
+    if (!failures) {
+        dap_probe_rate_test();
     }
 
     ESP_LOGI(TAG, "=== bring-up %s (%d failure%s) ===",

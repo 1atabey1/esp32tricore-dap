@@ -103,6 +103,23 @@ esp_err_t dap_probe_replay_preamble(void);
 /* The four bring-up frames back to back, with no host work between them. */
 esp_err_t dap_probe_attach_now(dap_exchange_t out[6]);
 
+/* Write an IOClient register or operand: instruction, size exponent, data. */
+esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
+                                 uint64_t data, size_t data_bits,
+                                 dap_exchange_t *out);
+
+/*
+ * Put the IOClient in read/write mode, so read instructions address the system
+ * bus rather than COMDATA.  Required before any memory access.
+ */
+esp_err_t dap_probe_set_rw_mode(bool supervisor);
+
+/* Set IOADDR and read the 32-bit word there. */
+esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value);
+
+/* Single-word read rate, and how far the bit-banged PHY carries. */
+esp_err_t dap_probe_rate_test(void);
+
 /* Does the reply trailer length explain the alternation? */
 esp_err_t dap_probe_trailer_sweep(void);
 

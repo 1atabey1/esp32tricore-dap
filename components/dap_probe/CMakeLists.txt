@@ -7,5 +7,5 @@
 idf_component_register(
     SRCS "dap_frame.c" "dap_phy.c" "dap_probe.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_hw_support platform_include
+    REQUIRES driver esp_hw_support esp_timer platform_include
 )
