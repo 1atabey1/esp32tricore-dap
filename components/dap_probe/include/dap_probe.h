@@ -126,6 +126,16 @@ esp_err_t dap_probe_clear_error_state(void);
 /* Set IOADDR and read the 32-bit word there. */
 esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value);
 
+/* Set IOADDR and write a 32-bit word there. */
+esp_err_t dap_probe_write32(uint32_t addr, uint32_t value);
+
+/*
+ * Enable OCDS: the four contiguous OEC.PAT pattern writes, a check that
+ * OSTATE.OEN came up, then OCNTRL and CT.SETE.  Without this the whole
+ * miniMCDS register space bus-errors.
+ */
+esp_err_t dap_probe_enable_ocds(void);
+
 /* Single-word read rate, and how far the bit-banged PHY carries. */
 esp_err_t dap_probe_rate_test(void);
 

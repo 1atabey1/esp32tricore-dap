@@ -52,7 +52,17 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
 #define DAP_IO_CLIENT_ID       0xFu
 #define DAP_IO_INFO            0xBu
 #define DAP_IO_SET_ADDRESS     0x1u   /* loads IOADDR, 16- or 32-bit write */
-#define DAP_IO_CONF            0x0u   /* IOCONF, write-only */
+#define DAP_IO_CONF            0x0u   /* IOCONF, write-only, N = 12 */
+
+/*
+ * The bus access instructions pair up, writes even and reads odd:
+ * 2H/3H block, 4H/5H word, 6H/7H halfword, 8H/9H byte.  All RW Mode only.
+ */
+#define DAP_IO_WRITE_BLOCK     0x2u
+#define DAP_IO_READ_BLOCK      0x3u
+#define DAP_IO_WRITE_WORD      0x4u
+#define DAP_IO_WRITE_HWORD     0x6u
+#define DAP_IO_WRITE_BYTE      0x8u
 
 /*
  * IOCONF.MODE selects what a read instruction means, and the reset value is
@@ -157,6 +167,16 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
 /* Cold-attach dapisc: signature plus the register value the reference writes. */
 #define DAP_DAPISC_SIGNATURE   0x4ABBAF53u
 #define DAP_DAPISC_VALUE       0x0F00u
+
+/* SCU / OCDS control block, and the miniMCDS registers Phase 3 touches. */
+#define DAP_ADDR_OEC_PAT       0xF0000478u
+#define DAP_ADDR_OCNTRL        0xF000047Cu
+#define DAP_ADDR_OSTATE        0xF0000480u
+#define DAP_ADDR_MCDS_BASE     0xFB718000u
+#define DAP_ADDR_MCDS_CLC      (DAP_ADDR_MCDS_BASE + 0x0000u)
+#define DAP_ADDR_MCDS_ID       (DAP_ADDR_MCDS_BASE + 0x0008u)
+#define DAP_ADDR_MCDS_CT       (DAP_ADDR_MCDS_BASE + 0x0010u)
+#define DAP_MCDS_ID_EXPECT     0x00D6C007u
 
 #define DAP_SYNC_EXPECT        0xAAAAAAAAu
 #define DAP_SYNC_WIRE_WORD     0x09FE1u
@@ -812,6 +832,72 @@ esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
     return ESP_OK;
 }
 
+esp_err_t dap_probe_write32(uint32_t addr, uint32_t value)
+{
+    dap_exchange_t x;
+    esp_err_t err = dap_probe_client_write(DAP_IO_SET_ADDRESS, 5, addr, 32, &x);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    return dap_probe_client_write(DAP_IO_WRITE_WORD, 5, value, 32, &x);
+}
+
+esp_err_t dap_probe_enable_ocds(void)
+{
+    /*
+     * Turn OCDS on, which the miniMCDS register space and the TRAM behind it
+     * need: with OSTATE.OEN clear, anything in 0xFB718000..0xFB71FFFF raises a
+     * bus error on the SRI slave interface.
+     *
+     * The four pattern writes to OEC.PAT must be contiguous.  Any other write
+     * to OEC in between, or any deviation in the values, resets the hardware
+     * matcher to its first step - which is why this is one function and not a
+     * sequence a caller can interleave with anything.
+     */
+    static const uint32_t pattern[4] = { 0xA1u, 0x5Eu, 0xA1u, 0x5Eu };
+    uint32_t ostate = 0;
+
+    for (size_t i = 0; i < 4; i++) {
+        const esp_err_t err = dap_probe_write32(DAP_ADDR_OEC_PAT, pattern[i]);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OEC.PAT write %u of 4 failed; matcher is now reset",
+                     (unsigned)(i + 1));
+            return err;
+        }
+    }
+
+    if (dap_probe_read32(DAP_ADDR_OSTATE, &ostate) != ESP_OK) {
+        ESP_LOGE(TAG, "OSTATE unreadable after the enable pattern");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OSTATE = 0x%08" PRIX32 " (OEN=%" PRIu32 ")", ostate, ostate & 1u);
+    if (!(ostate & 1u)) {
+        return ESP_FAIL;
+    }
+
+    /* OC4 with its protection bit: sets OSTATE.EECTRC and routes the core
+     * trace lines to the miniMCDS. */
+    if (dap_probe_write32(DAP_ADDR_OCNTRL, 0x0300u) != ESP_OK) {
+        ESP_LOGW(TAG, "OCNTRL write failed");
+        return ESP_FAIL;
+    }
+
+    /*
+     * Then the module's own clock.  OEN alone leaves the miniMCDS unreadable:
+     * enabling OCDS makes the register space *reachable*, but the block is
+     * still clock-gated, so CLC has to be written to zero to run it.  A CLC
+     * register stays accessible while its module is disabled - that is how a
+     * module gets enabled at all.
+     */
+    if (dap_probe_write32(DAP_ADDR_MCDS_CLC, 0x00000000u) != ESP_OK) {
+        ESP_LOGW(TAG, "miniMCDS CLC write failed");
+    }
+
+    /* CT.SETE unlocks writes to the rest of the miniMCDS space. */
+    return dap_probe_write32(DAP_ADDR_MCDS_CT, 0x8000u);
+}
+
 esp_err_t dap_probe_rate_test(void)
 {
     /*
@@ -1273,6 +1359,42 @@ esp_err_t dap_probe_bringup_report(void)
         if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
             ESP_LOGI(TAG, "   IOINFO after the read: 0x%04" PRIX64, info.reply);
         }
+    }
+
+    /*
+     * Checkpoint 6, Phase 3's exit criterion: enable OCDS and read a miniMCDS
+     * register.  ID reads a known constant when OCDS is on and bus-errors when
+     * it is off, so it distinguishes "enabled" from "wishful thinking".
+     */
+    {
+        uint32_t id = 0;
+        if (dap_probe_read32(DAP_ADDR_MCDS_ID, &id) == ESP_OK) {
+            ESP_LOGI(TAG, "6 miniMCDS ID before enable: 0x%08" PRIX32, id);
+        } else {
+            ESP_LOGI(TAG, "6 miniMCDS ID before enable: no reply (OCDS off)");
+        }
+        dap_probe_clear_error_state();
+
+        if (dap_probe_enable_ocds() == ESP_OK) {
+            ESP_LOGI(TAG, "6 OCDS enabled");
+            uint32_t clc = 0, ct = 0;
+            if (dap_probe_read32(DAP_ADDR_MCDS_CLC, &clc) == ESP_OK) {
+                ESP_LOGI(TAG, "6 miniMCDS CLC = 0x%08" PRIX32 " (DISR=%" PRIu32 ")",
+                         clc, clc & 1u);
+            }
+            if (dap_probe_read32(DAP_ADDR_MCDS_ID, &id) == ESP_OK) {
+                ESP_LOGI(TAG, "6 miniMCDS ID = 0x%08" PRIX32 "%s", id,
+                         id == DAP_MCDS_ID_EXPECT ? "  (expected)" : "  UNEXPECTED");
+            } else {
+                ESP_LOGW(TAG, "6 miniMCDS still unreadable after enable");
+            }
+            if (dap_probe_read32(DAP_ADDR_MCDS_CT, &ct) == ESP_OK) {
+                ESP_LOGI(TAG, "6 miniMCDS CT  = 0x%08" PRIX32, ct);
+            }
+        } else {
+            ESP_LOGW(TAG, "6 OCDS enable did not take");
+        }
+        dap_probe_clear_error_state();
     }
 
     if (!failures) {
