@@ -92,6 +92,15 @@ esp_err_t dap_probe_replay_preamble(void);
 /* The four bring-up frames back to back, with no host work between them. */
 esp_err_t dap_probe_attach_now(dap_exchange_t out[6]);
 
+/* Does the reply trailer length explain the alternation? */
+esp_err_t dap_probe_trailer_sweep(void);
+
+/* How many consecutive syncs the device answers, and what recovers it. */
+esp_err_t dap_probe_sync_health(int attempts);
+
+/* Fresh sync then one candidate second frame, for each candidate. */
+esp_err_t dap_probe_second_frame_matrix(void);
+
 esp_err_t dap_probe_bringup_report(void);
 
 /*

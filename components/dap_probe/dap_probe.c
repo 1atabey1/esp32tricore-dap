@@ -11,14 +11,32 @@
 static const char *TAG = "DAP";
 
 /*
- * IOClient id register: reads 0x0260 on a TC38x Cerberus.
+ * Bits clocked after a reply's CRC, with the target still driving.
  *
- * The instruction is 0xB with size exponent 4, giving the one-byte payload
- * 0x4B.  Not 0xF as this project first assumed - a USB capture of a
- * miniWiggler attach shows payload 0x4B on every client_read it issues, and
- * 0x0260 coming back in the replies.  See tools/usb/.
+ * Replies alternate - every second exchange answers - which is what leaving a
+ * fixed amount of state behind per exchange looks like.  Making this adjustable
+ * turns that into a measurement instead of a guess.
  */
-#define DAP_IO_CLIENT_ID       0xBu
+static size_t s_trailer_bits;   /* zero: measured to be what the device wants */
+
+/*
+ * IOClient registers, by IO instruction nibble.
+ *
+ * CLIENT_ID is instruction 0xF at offset 0x0F, 16 bits wide, hard-wired to
+ * 0x0260: TYPE 0x02 (Cerberus_FPI 32-bit client), VERSION 6, REVISION 0.  A
+ * 16-bit read uses payload 0x4F; a 32-bit read uses 0x5F and the hardware
+ * replicates the halfword, giving 0x02600260.
+ *
+ * This was briefly changed to 0xB on the strength of a USB capture, in which
+ * every client_read the reference probe issued carried payload 0x4B.  That was
+ * a misreading: 0xB is IOINFO at offset 0x0B, so the reference was reading
+ * client info and error status, not the ID.  The target then returned exactly
+ * what was asked for - 0x0020, IOINFO's PWR_DWN bit - which is why the reply
+ * was CRC-valid but not 0x0260.  A capture shows what a tool happened to do,
+ * not what a register requires.
+ */
+#define DAP_IO_CLIENT_ID       0xFu
+#define DAP_IO_INFO            0xBu
 #define DAP_CLIENT_ID_EXPECT   0x0260u
 
 /*
@@ -31,7 +49,33 @@ static const char *TAG = "DAP";
  * of a USB capture of a working attach.  Without it the device answers sync
  * once and ignores everything afterwards.
  */
-#define DAP_CMD_TRAINING       0x02u
+#define DAP_CMD_CLIENT_RESET   0x1Du
+
+/*
+ * Low clocks before every frame.
+ *
+ * The protocol needs no multi-cycle preamble: the device latches any DAP1 = 1
+ * on a rising edge as a start bit.  What it does need is the line settled low
+ * first - the device drives DAP1 = 0 for one cycle after its reply before
+ * releasing the pad, and DAPISC.SISP can hold off start-bit detection for a
+ * further 0 to 3 cycles.  So the floor is 1 + SISP, and 2 covers the default
+ * SISP of 0 with margin.
+ *
+ * Eleven was what the reference probe uses and what this code copied.  Per the
+ * specification that figure is a conservative host-side buffer covering FPGA
+ * clock-domain-crossing latency, not a device requirement - so most of it is
+ * pure overhead for a probe that is already slow.  Nine clocks per frame back
+ * is worth having in the throughput budget.
+ */
+#define DAP_FRAME_LEAD_CLOCKS  2
+
+/*
+ * Recovery: after a CRC error, a lost reply or an aborted block transfer, the
+ * host must clock at least MAXWAIT8 cycles with DAP1 low so the device can
+ * finish any pending reply and fall back to Active::RECEIVE.  A new command
+ * sent before that is not guaranteed to be seen.
+ */
+#define DAP_RESYNC_CLOCKS      DAP_MAXWAIT_RESET_CYCLES
 #define DAP_TRAINING_DATA      0xAAAAAA83u
 
 /* Cold-attach dapisc: signature plus the register value the reference writes. */
@@ -104,6 +148,17 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     out->sent_word = dap_frame_word(frame);
     out->sent_bits = frame->len;
 
+    /*
+     * Idle clocks before every frame, not just the first.
+     *
+     * Measured: a sync preceded by eleven low clocks is answered every time,
+     * while the identical frame sent straight after a previous exchange is
+     * ignored - and that holds for sync itself, so it was never about which
+     * command.  The device needs the idle run to recognise a frame start.
+     * This is the same eleven clocks the reference probe sends before its own
+     * sync, which it turns out are not a one-off attach ritual.
+     */
+    dap_phy_idle_clocks(DAP_FRAME_LEAD_CLOCKS, 0);
     dap_phy_write_frame(frame);
     dap_phy_turnaround_to_read();
 
@@ -114,6 +169,9 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     if (out->wait_cycles < 0) {
         out->timed_out = true;
         dap_phy_turnaround_to_write();
+        /* Flush the device back to Active::RECEIVE before anything else is
+         * attempted; see DAP_RESYNC_CLOCKS. */
+        dap_phy_idle_clocks(DAP_RESYNC_CLOCKS, 0);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -127,8 +185,13 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
      * mid-frame, which would explain why sync answers and every later frame
      * finds the device back in receive and ignoring us.
      */
-    uint8_t trailer[8];
-    dap_phy_read_bits(trailer, sizeof(trailer));
+    uint8_t trailer[24];
+    if (s_trailer_bits > sizeof(trailer)) {
+        s_trailer_bits = sizeof(trailer);
+    }
+    if (s_trailer_bits) {
+        dap_phy_read_bits(trailer, s_trailer_bits);
+    }
     dap_phy_turnaround_to_write();
 
     for (size_t i = 0; i < reply_bits; i++) {
@@ -160,7 +223,6 @@ esp_err_t dap_probe_sync(dap_exchange_t *out)
      * 400 kHz.  An earlier draft used eight clocks held high, which was a
      * guess and is now known to be wrong.
      */
-    dap_phy_idle_clocks(11, 0);
     return exchange(&f, 32, out);
 }
 
@@ -436,19 +498,125 @@ esp_err_t dap_probe_attach_now(dap_exchange_t out[6])
     if (dap_frame_build(&f, DAP_CMD_DAPISC, 48, dapisc, 48)) {
         exchange(&f, 0, &out[1]);
     }
-    /* Complete the training exchange before anything else is attempted. */
-    if (dap_frame_build(&f, DAP_CMD_TRAINING, 32, DAP_TRAINING_DATA, 32)) {
-        exchange(&f, 32, &out[4]);
-    }
-    if (dap_frame_build(&f, DAP_CMD_TRAINING, 32, DAP_TRAINING_DATA, 32)) {
-        exchange(&f, 32, &out[5]);
-    }
     if (dap_frame_build(&f, DAP_CMD_CLIENT_SET, 3, 1, 3)) {
         exchange(&f, 0, &out[2]);
     }
     if (dap_frame_build(&f, DAP_CMD_CLIENT_READ, 7,
                         dap_client_read_payload(DAP_IO_CLIENT_ID, 4), 7)) {
         exchange(&f, 16, &out[3]);
+    }
+    return ESP_OK;
+}
+
+esp_err_t dap_probe_trailer_sweep(void)
+{
+    static const size_t trailers[] = { 0, 1, 2, 4, 8, 18 };
+
+    ESP_LOGW(TAG, "--- trailer sweep: 8 syncs per trailer length ---");
+    for (size_t t = 0; t < sizeof(trailers) / sizeof(trailers[0]); t++) {
+        char   line[16];
+        size_t n = 0;
+
+        s_trailer_bits = trailers[t];
+        for (int i = 0; i < 8; i++) {
+            dap_frame_t    f;
+            dap_exchange_t x;
+
+            dap_phy_idle_clocks(11, 0);
+            if (!dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
+                break;
+            }
+            exchange(&f, 32, &x);
+            line[n++] = (x.reply == DAP_SYNC_EXPECT) ? 'o' : '.';
+        }
+        line[n] = ' ';
+        ESP_LOGW(TAG, "  trailer %2u bits: %s", (unsigned)trailers[t], line);
+    }
+    s_trailer_bits = 0;      /* restore the value that works, not the one tested */
+    return ESP_OK;
+}
+
+esp_err_t dap_probe_sync_health(int attempts)
+{
+    /*
+     * How many syncs in a row does the device answer, and does anything
+     * recover it once it stops?
+     *
+     * The second-frame matrix showed sync answering four times and then
+     * failing, which means the device wedges rather than simply refusing
+     * non-sync commands.  Knowing whether a re-sync, a client_reset or the
+     * idle clocks bring it back narrows down what state it is falling into.
+     */
+    char line[80];
+    size_t n = 0;
+
+    for (int i = 0; i < attempts && n < sizeof(line) - 4; i++) {
+        dap_frame_t    f;
+        dap_exchange_t x;
+
+            if (!dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
+            break;
+        }
+        exchange(&f, 32, &x);
+        line[n++] = (x.reply == DAP_SYNC_EXPECT) ? 'o' : '.';
+
+        /* Every fourth attempt, try a client_reset first and mark it. */
+        if ((i % 4) == 3) {
+            if (dap_frame_build(&f, DAP_CMD_CLIENT_RESET, 0, 0, 0)) {
+                dap_exchange_t r;
+                exchange(&f, 0, &r);
+            }
+            line[n++] = '|';
+        }
+    }
+    line[n] = ' ';
+    ESP_LOGW(TAG, "sync health (o=0xAAAAAAAA, .=no reply, |=client_reset): %s", line);
+    return ESP_OK;
+}
+
+esp_err_t dap_probe_second_frame_matrix(void)
+{
+    /*
+     * One question: can any command other than sync draw a reply?
+     *
+     * Each row does a fresh sync - which is known to answer - and then exactly
+     * one candidate as the second frame.  If every candidate is ignored while
+     * every sync answers, the device is accepting only sync, and the reason
+     * lies in what enables the rest rather than in any frame we build.  The
+     * reference's own order is sync, dapisc, client_set, client_set,
+     * client_read, so these are the frames that should work.
+     */
+    struct { const char *name; uint8_t cmd; uint8_t len; uint64_t data; size_t db; size_t reply; } rows[] = {
+        { "dapisc LEN16",   DAP_CMD_DAPISC,      16, 0, 16, 16 },
+        { "dapisc LEN48",   DAP_CMD_DAPISC,      48,
+          ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE, 48, 0 },
+        { "client_set(1)",  DAP_CMD_CLIENT_SET,   3, 1, 3, 0 },
+        { "client_read ID", DAP_CMD_CLIENT_READ,  7, 0x4B, 7, 16 },
+        { "poll",           0x12,                 0, 0, 0, 8 },
+        { "sync again",     DAP_CMD_SYNC,        63, 0, 0, 32 },
+    };
+
+    ESP_LOGW(TAG, "--- second-frame matrix: fresh sync, then one candidate ---");
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        dap_frame_t    f;
+        dap_exchange_t s1, s2;
+
+        dap_phy_idle_clocks(11, 0);
+        if (!dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
+            continue;
+        }
+        exchange(&f, 32, &s1);
+
+        if (!dap_frame_build(&f, rows[i].cmd, rows[i].len, rows[i].data, rows[i].db)) {
+            continue;
+        }
+        exchange(&f, rows[i].reply, &s2);
+
+        ESP_LOGW(TAG, "  sync %s -> %-15s %s reply 0x%08" PRIX64,
+                 s1.reply == DAP_SYNC_EXPECT ? "ok  " : "FAIL",
+                 rows[i].name,
+                 s2.idle_high ? "idle-high" : (s2.timed_out ? "held-low " : "ANSWERED "),
+                 s2.reply);
     }
     return ESP_OK;
 }
@@ -511,11 +679,14 @@ esp_err_t dap_probe_bringup_report(void)
     /* Measure the real shape of a reply window before trusting any length. */
     dap_probe_dump_sync_reply(120);
 
-    /* And the whole handshake, after the reference's own preamble. */
-    dap_probe_replay_preamble();
+    dap_probe_trailer_sweep();
+    dap_probe_sync_health(12);
+    dap_probe_second_frame_matrix();
+
+    /* And the whole handshake with no host work between frames. */
     {
         static const char *names[6] = { "sync", "dapisc", "client_set(1)",
-                                        "client_read ID", "training 1", "training 2" };
+                                        "client_read ID", "spare", "spare" };
         dap_exchange_t seq[6];
         memset(seq, 0, sizeof(seq));
         dap_probe_attach_now(seq);
@@ -574,6 +745,19 @@ esp_err_t dap_probe_bringup_report(void)
     /* Checkpoint 4: CLIENT_ID.  This is the one that says the probe is real. */
     err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
     log_exchange("4 client_read ID", &x);
+    {
+        /* 32-bit form: the hardware replicates the halfword, so a correct
+         * transport returns 0x02600260 and confirms the width handling too. */
+        dap_exchange_t w;
+        if (dap_probe_client_read(DAP_IO_CLIENT_ID, 5, 32, &w) == ESP_OK) {
+            ESP_LOGI(TAG, "   32-bit CLIENT_ID reads 0x%08" PRIX64 "%s",
+                     w.reply, w.reply == 0x02600260u ? " (expected)" : "");
+        }
+        dap_exchange_t info;
+        if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
+            ESP_LOGI(TAG, "   IOINFO reads 0x%04" PRIX64, info.reply);
+        }
+    }
     if (err != ESP_OK || x.reply != DAP_CLIENT_ID_EXPECT) {
         ESP_LOGE(TAG, "   expected CLIENT_ID 0x%04X", DAP_CLIENT_ID_EXPECT);
         failures++;
