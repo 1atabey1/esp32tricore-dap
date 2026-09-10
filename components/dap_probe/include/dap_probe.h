@@ -62,6 +62,17 @@ esp_err_t dap_probe_init(uint32_t clock_hz);
  */
 esp_err_t dap_probe_sync(dap_exchange_t *out);
 
+/*
+ * Write DAPISC and read back the updated value.  `cold` selects the 66-bit
+ * initialisation telegram with the 0x4ABBAF53 signature, for the
+ * Enabled-to-Active transition; otherwise the short LEN-16 form is used, which
+ * is what an already-Active device accepts.
+ */
+esp_err_t dap_probe_dapisc(uint16_t value, bool cold, dap_exchange_t *out);
+
+/* Adopt the reply-wait window implied by a DAPISC value. */
+void dap_probe_note_dapisc(uint16_t dapisc);
+
 /* Read the DAPISC register.  Does not write it: see the plan on cold attach. */
 esp_err_t dap_probe_dapisc_read(dap_exchange_t *out);
 

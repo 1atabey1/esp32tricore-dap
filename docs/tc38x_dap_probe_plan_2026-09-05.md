@@ -486,6 +486,15 @@ number.
 **Note this only matters for the FPGA path.** An S3-hosted SPI PHY talks to the
 target directly and never crosses this hop at all.
 
+**Inter-frame overhead is small, now that it is measured.** Every frame needs
+the line settled low first, but only by one device turnaround cycle plus
+`DAPISC.SISP` (0-3, default 0) - so two clocks, not the eleven the reference
+probe uses. On a `client_blockread` that overhead is amortised over 256 parcels
+and irrelevant; on single-word register access it is two clocks against a
+26-bit frame plus its reply, so still under 5%. The figure that would have hurt
+is eleven per frame, which this project copied before checking whether the
+device asked for it.
+
 Wide mode, if it is ever used: `DAP1` carries the even bits and `DAP2` the odd
 ones, the start bit is driven on both lines in parallel as an alignment check,
 and any field with an odd bit count is padded by one bit which *is* covered by
@@ -625,6 +634,95 @@ for a 14-bit address, `40` for a 30-bit one - and the address is transmitted
 right-shifted by two, since every block access is word-wide. The 14-bit form
 therefore addresses within a 64 kB window and the 30-bit form the whole space.
 
+### Attach, as it actually works on silicon
+
+Phase 1 is done: four of the five bring-up checkpoints pass on a TC38x, every
+reply CRC-valid, in one sequence with no retries.
+
+```
+1 sync            -> wait 1,  reply 0xAAAAAAAA  residue-ok
+2 dapisc long     -> wait 1,  reply 0x0F00      residue-ok
+3 client_set(1)   -> wait 1,  acknowledge
+4 client_read ID  -> wait 11, reply 0x0260      residue-ok
+   32-bit CLIENT_ID reads 0x02600260, IOINFO reads 0x0020
+```
+
+Every value this document predicted for those steps was right. What it had
+wrong was the *mechanics* around them, and those cost more debugging time than
+the protocol did. Corrections, in the order they bite:
+
+**Idle clocks go before every frame, not just the first.** This document said
+"8 slow clocks, then `sync`", as an attach ritual. In fact the line must be
+settled low before *any* frame; a frame sent straight after the previous
+exchange is silently discarded, and that holds for `sync` itself, which is what
+finally made it obvious. The requirement is small - one device turnaround cycle
+plus `DAPISC.SISP`, which defaults to 0 - so **two low clocks per frame is
+enough**. The reference probe's eleven are a host-side buffer for FPGA
+clock-domain-crossing latency, not a device requirement. Also note the level:
+the clocks are held **low**, not high as an earlier draft assumed.
+
+**`dapisc` needs the long form, and it does reply.** The 66-bit initialisation
+telegram - `LEN` 48, the 16-bit value plus the 32-bit signature `0x4ABBAF53`
+sent LSB-first - is what a TC38x accepts, and it answers with the updated
+register. The short `LEN` 16 form is documented for reconfiguring an already
+active interface, and on this target it is discarded: a `sync` reply does *not*
+mean the device has finished the Enabled-to-Active transition. A discarded
+command produces no reply at all, so a signature shifted the wrong way, a CRC
+error and an unsynchronised attach are indistinguishable from the probe.
+
+**A bare acknowledge carries no CRC.** `client_set`'s reply is the start bit
+and nothing more. Reading six CRC bits after it clocks into the next telegram's
+space and gets the *following* command discarded - which presents as an
+intermittent failure of that command, not of `client_set`. Replies that carry
+data are `[start][RDATA LSB-first][CRC6]`, with no status or ACK field.
+
+**The reply-wait window is configuration, not a constant.** `dapisc` sets
+`MAXWAIT8`; the reference sets it to 15, which is 120 clocks rather than the
+reset 248. A probe that keeps waiting 248 and then flushes 248 more on the
+timeout path turns the first read after a `dapisc` into a failure the next read
+silently recovers from. Re-derive the window from every `dapisc` reply.
+
+**Recovery has a documented primitive.** After a CRC error, a lost reply or an
+aborted block transfer, clock at least `MAXWAIT8` cycles with `DAP1` low to
+return the device to `Active::RECEIVE`. Phase 4's drain loop needs exactly
+this, and this document did not have it.
+
+**`CLIENT_ID`'s instruction is `0xF`, as originally written.** It was changed to
+`0xB` on the strength of a USB capture in which every `client_read` carried
+payload `0x4B` - but `0xB` is `IOINFO` at offset `0x0B`, so the reference was
+reading client info and error status, not the ID. Our target then returned
+exactly the register asked for: `0x0020`, `IOINFO`'s `PWR_DWN` bit, CRC-valid
+and completely correct. A capture shows what a tool happened to do, not what a
+register requires - the same trap as the `0x02`/`0x08` retraction below.
+
+**Two "undocumented commands" were never there.** An earlier draft of this
+document reported `CMD 0x01`, `CMD 0x02` with data `0xAAAAAA83`, and a
+"workhorse" `CMD 0x08, LEN 16, data 0xC10` appearing 107 times, and used the
+repetition as evidence. All of them were CRC false positives. A 6-bit CRC
+passes one alignment in 64, and over 21000 bits of driven stream that is
+hundreds of spurious frames - concentrated, inevitably, inside long alternating
+training patterns, which is where an alternating "payload" like `0xAAAAAA83`
+comes from. Requiring frames to *tile* a write command's bits contiguously
+removes them: only four command types survive, and the reference's attach is
+`sync` -> `dapisc` -> `client_set(1)` -> `client_set(1)` -> `client_read`,
+exactly the order this document already had. The command catalog was never
+incomplete.
+
+**One hardware fact worth more than any of the above.** On this bench the wire
+in `PC04` is the target's reset, and nothing in the stock firmware releases
+GPIO 40 - Black Magic Probe configures it as an output and leaves it low. A
+TC38x then sits powered but never runs its application. The boot-time DAP
+bring-up had been releasing it as a side effect of `dap_phy_init()`, so
+disabling that bring-up to stop unrelated pulsing made the target stop dead.
+`dap_probe_park_idle()` now releases it at every boot regardless of any
+Kconfig. Any probe that drives a target's reset line must park it deliberately,
+not incidentally.
+
+Bring-up is triggered by `GET /api/dap_bringup` rather than at boot, because
+resetting this board disturbs the target: its Port C pins move while the target
+is coming out of reset. Iterating over HTTP costs nothing and leaves the
+application running.
+
 ### Phases
 
 #### Phase 0 - Electrical and pin plan (2-3 days)
@@ -718,6 +816,12 @@ address; 1b's two claims confirmed and written down; and a 1 kB block read
 running through DMA at a measured rate, including one that needed a continuation
 transaction. The CRC6 rule is settled on paper, so a silent target here means a
 framing or timing fault rather than a checksum one.
+
+**Status: 1a is done.** Checkpoints 1 to 4 pass on a TC38x with every reply
+CRC-valid - see "Attach, as it actually works on silicon" for the sequence and
+for the seven corrections it took. Checkpoint 5, a word of target memory, needs
+`IOADDR` and `IO_READ_WORD`, which is Phase 3's access layer. 1b and 1c are
+untouched: the bit-bang PHY was enough to get here.
 
 #### Phase 2 - A second, DAP-only bitstream (2-3 weeks, and possibly deferrable)
 
@@ -1174,16 +1278,17 @@ came off the wire, not out of a document:
 
 **Three corrections it forces.**
 
-- **`CLIENT_ID`'s IO instruction is `0xB`, not `0xF`.** Every `client_read` the
-  reference issues carries payload **`0x4B`** - instruction `0xB`, size
-  exponent 4, so a 16-bit read - and `0x0260` is what comes back. The width
-  table's `0x39`/`0x47`/`0x55` decode consistently under the same layout, so
-  the payload *encoding* was right and only the instruction number for
-  `CLIENT_ID` was wrong.
+- **`CLIENT_ID`'s IO instruction: retracted.** This section claimed it was
+  `0xB` rather than `0xF`, because every `client_read` the reference issues
+  carries payload `0x4B`. But `0xB` is `IOINFO` at offset `0x0B`: the reference
+  was reading client info and error status, not the ID. `0xF` was right all
+  along, and reading `0x4B` on our own target returns `IOINFO`'s `0x0020`,
+  CRC-valid and entirely correct.
 - **`sync` is preceded by eleven clocks with the line low**, as a 3-bit write
   of zeros then an 8-bit one, and it goes out at **400 kHz** - the probe
   explicitly drops the rate to send it. This plan previously guessed eight
-  clocks held *high*.
+  clocks held *high*. Note the eleven are not a device requirement and they
+  apply before *every* frame, not just this one; see the attach section.
 - **`MAXWAIT8` is not left at its reset value.** The `dapisc` register half is
   `0x0F00`, so the reference sets `MAXWAIT8` = 15 with `MW8E` = 0, which is 120
   wait clocks rather than the reset 248.
@@ -1193,9 +1298,15 @@ came off the wire, not out of a document:
 each, reading 30 bytes back, before settling the session at **10 MHz** - so
 10 MHz is demonstrably achievable on this target. Its direction control is bit
 4 of the FT2232's high GPIO byte, and it reads like our `RDnWR`: set means the
-target drives. And the steady-state loop pairs `client_set(1)` with an
-undocumented **`CMD 0x08`, `LEN` 16, data `0xC10`** - 107 of each - so the
-command catalog this project started from is incomplete.
+target drives.
+
+**Retracted.** An earlier version of this section claimed the steady-state loop
+pairs `client_set(1)` with an undocumented `CMD 0x08`, `LEN` 16, data `0xC10`,
+107 of each, and that the command catalog was therefore incomplete. That was
+wrong - see "Attach, as it actually works on silicon". Those frames were CRC
+false positives, and the repetition that made them look real came from scanning
+a long alternating training pattern. Only `sync`, `dapisc`, `client_set` and
+`client_read` are actually present.
 
 **One caveat on method.** A 6-bit CRC passes by chance on one alignment in 64,
 and the driven stream is ~21000 bits, so a few hundred spurious "valid" frames

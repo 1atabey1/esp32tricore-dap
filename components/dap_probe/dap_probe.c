@@ -20,6 +20,19 @@ static const char *TAG = "DAP";
 static size_t s_trailer_bits;   /* zero: measured to be what the device wants */
 
 /*
+ * How long to wait for a reply's start bit, in probe clocks.
+ *
+ * Starts at the DAPISC reset allowance and is re-derived whenever dapisc
+ * reports a new value, because the window is a property of the device's
+ * current configuration rather than a constant.  Getting this wrong is not
+ * harmless: the reference sets MAXWAIT8 to 15, which is 120 clocks, and a
+ * probe still waiting 248 then flushing 248 more on the timeout path turns the
+ * first read after a dapisc into a failure that the *next* read silently
+ * recovers from.
+ */
+static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
+
+/*
  * IOClient registers, by IO instruction nibble.
  *
  * CLIENT_ID is instruction 0xF at offset 0x0F, 16 bits wide, hard-wired to
@@ -76,6 +89,13 @@ static size_t s_trailer_bits;   /* zero: measured to be what the device wants */
  * sent before that is not guaranteed to be seen.
  */
 #define DAP_RESYNC_CLOCKS      DAP_MAXWAIT_RESET_CYCLES
+
+/*
+ * A few clocks past the device's own allowance, to cover the fixed 3-cycle
+ * reply delay and the lead-in, so a reply that arrives at the limit is still
+ * seen rather than counted as a timeout.
+ */
+#define DAP_WAIT_MARGIN        8
 #define DAP_TRAINING_DATA      0xAAAAAA83u
 
 /* Cold-attach dapisc: signature plus the register value the reference writes. */
@@ -162,7 +182,7 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     dap_phy_write_frame(frame);
     dap_phy_turnaround_to_read();
 
-    out->wait_cycles = dap_phy_await_start_bit(DAP_MAXWAIT_RESET_CYCLES);
+    out->wait_cycles = dap_phy_await_start_bit(s_max_wait + DAP_WAIT_MARGIN);
     if (out->wait_cycles == DAP_AWAIT_IDLE_HIGH) {
         out->idle_high = true;
     }
@@ -171,13 +191,25 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
         dap_phy_turnaround_to_write();
         /* Flush the device back to Active::RECEIVE before anything else is
          * attempted; see DAP_RESYNC_CLOCKS. */
-        dap_phy_idle_clocks(DAP_RESYNC_CLOCKS, 0);
+        dap_phy_idle_clocks(s_max_wait, 0);
         return ESP_ERR_TIMEOUT;
     }
 
-    /* The timeout counter is deactivated by the start bit, so from here the
-     * clock may stop anywhere with no consequence. */
-    dap_phy_read_bits(bits, reply_bits + 6);
+    /*
+     * The timeout counter is deactivated by the start bit, so from here the
+     * clock may stop anywhere with no consequence.
+     *
+     * A reply that carries data is [start][RDATA][CRC6]; a bare acknowledge -
+     * client_set's, for one - is the start bit and nothing else.  Clocking six
+     * phantom CRC bits after an acknowledge runs the clock into the next
+     * telegram's space and gets the *following* command discarded, which then
+     * looks like an intermittent failure of that command rather than of this
+     * one.
+     */
+    const size_t to_read = reply_bits ? reply_bits + 6 : 0;
+    if (to_read) {
+        dap_phy_read_bits(bits, to_read);
+    }
     /*
      * Then a short trailer, still with the target driving.  The measured sync
      * window ends around bit 42 while payload plus CRC accounts for 38, so
@@ -197,11 +229,16 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     for (size_t i = 0; i < reply_bits; i++) {
         out->reply |= (uint64_t)(bits[i] & 1u) << i;
     }
-    for (size_t i = 0; i < 6; i++) {
-        out->reply_crc |= (uint8_t)((bits[reply_bits + i] & 1u) << i);
-    }
     out->reply_bits = reply_bits;
-    out->crc_ok = dap_crc6_residue_ok(bits, reply_bits + 6);
+    if (reply_bits) {
+        for (size_t i = 0; i < 6; i++) {
+            out->reply_crc |= (uint8_t)((bits[reply_bits + i] & 1u) << i);
+        }
+        out->crc_ok = dap_crc6_residue_ok(bits, reply_bits + 6);
+    } else {
+        /* Nothing to check: the acknowledge is the start bit itself. */
+        out->crc_ok = true;
+    }
 
     return ESP_OK;
 }
@@ -224,6 +261,60 @@ esp_err_t dap_probe_sync(dap_exchange_t *out)
      * guess and is now known to be wrong.
      */
     return exchange(&f, 32, out);
+}
+
+esp_err_t dap_probe_dapisc(uint16_t value, bool cold, dap_exchange_t *out)
+{
+    dap_frame_t f;
+
+    /*
+     * Two telegram variants, and picking the wrong one gets silence.
+     *
+     * The long form - LEN 48, 66 bits, carrying the 16-bit value plus the
+     * 32-bit signature 0x4ABBAF53 - is the *initialisation* telegram, for use
+     * straight after PORST release or on the Enabled-to-Active transition.
+     * Once the device is Active, which a sync reply proves, the short form
+     * (LEN 16, no signature) is what reconfigures DAP options.
+     *
+     * Either way the device replies with the newly updated 16-bit DAPISC
+     * value, and it drives the start bit exactly 3 DAP0 cycles after the
+     * command's last CRC bit - a fixed delay, not wait stuffing.  A discarded
+     * command produces no reply at all: a CRC failure, a signature shifted the
+     * wrong way round, or an unsynchronised attach all look identical from
+     * here, which is why this code sends sync first and checks it answered.
+     */
+    if (cold) {
+        const uint64_t data = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | value;
+        if (!dap_frame_build(&f, DAP_CMD_DAPISC, 48, data, 48)) {
+            return ESP_FAIL;
+        }
+    } else if (!dap_frame_build(&f, DAP_CMD_DAPISC, 16, value, 16)) {
+        return ESP_FAIL;
+    }
+    const esp_err_t err = exchange(&f, 16, out);
+    if (err == ESP_OK) {
+        dap_probe_note_dapisc((uint16_t)out->reply);
+    }
+    return err;
+}
+
+/*
+ * Adopt the wait window the device is now configured for.
+ *
+ *   T_timeout = MAXWAIT8 * 8 * (1 + MW8E * 15)   DAP0 clocks
+ *
+ * MAXWAIT8 = 0 disables the device's timeout entirely, which means an internal
+ * bus lockup would hang the probe; cap it rather than wait forever.
+ */
+void dap_probe_note_dapisc(uint16_t dapisc)
+{
+    const uint32_t maxwait8 = (dapisc >> 8) & 0x1Fu;
+    const uint32_t mw8e     = (dapisc >> 13) & 1u;
+
+    s_max_wait = maxwait8 ? maxwait8 * 8u * (1u + mw8e * 15u)
+                          : DAP_MAXWAIT_GENEROUS_CYCLES;
+    ESP_LOGI(TAG, "wait window now %" PRIu32 " clocks (MAXWAIT8=%" PRIu32
+                  " MW8E=%" PRIu32 ")", s_max_wait, maxwait8, mw8e);
 }
 
 esp_err_t dap_probe_dapisc_read(dap_exchange_t *out)
@@ -423,7 +514,7 @@ static void log_exchange(const char *step, const dap_exchange_t *x)
                  step, x->sent_word, x->sent_bits,
                  x->idle_high ? "line stayed idle high, nothing driving it"
                               : "line held low, no start bit",
-                 DAP_MAXWAIT_RESET_CYCLES);
+                 s_max_wait);
         return;
     }
     ESP_LOGI(TAG, "%-22s sent 0x%05" PRIX64 " (%zu bits) -> wait %d, reply 0x%08" PRIX64
@@ -722,8 +813,18 @@ esp_err_t dap_probe_bringup_report(void)
             ESP_LOGW(TAG, "  %s", text);
         }
     }
-    err = dap_probe_dapisc_read(&x);
-    log_exchange("2 dapisc write", &x);
+    err = dap_probe_dapisc(DAP_DAPISC_VALUE, false, &x);
+    log_exchange("2 dapisc short", &x);
+    if (err != ESP_OK) {
+        /* Not Active after all?  Try the initialisation telegram. */
+        err = dap_probe_dapisc(DAP_DAPISC_VALUE, true, &x);
+        log_exchange("2 dapisc long ", &x);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "   DAPISC now 0x%04" PRIX64 " (wrote 0x%04X)",
+                 x.reply, DAP_DAPISC_VALUE);
+    }
+
     if (err != ESP_OK) {
         /* Expected: this form takes no reply, so a timeout here is not a
          * failure.  It is logged so a change in behaviour is still visible. */
