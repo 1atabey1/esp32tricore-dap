@@ -14,10 +14,12 @@ menu "Infineon DAP probe"
     config AEL_DAP_BRINGUP_CLOCK_HZ
         int "Bring-up bit rate (Hz)"
         depends on AEL_DAP_BRINGUP_AT_BOOT
-        default 1000000
+        default 400000
         range 100000 4000000
         help
-            Deliberately slow so a scope can follow it. The bit-banged PHY will
-            not reach much past 2 MHz; the GP-SPI path is what goes faster.
+            400 kHz by default because that is the rate the reference
+            miniWiggler drops to for its own sync frame, captured over USB.
+            The bit-banged PHY will not reach much past 2 MHz either way; the
+            GP-SPI path is what goes faster.
 
 endmenu

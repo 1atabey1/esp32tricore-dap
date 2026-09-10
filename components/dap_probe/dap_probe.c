@@ -10,8 +10,15 @@
 
 static const char *TAG = "DAP";
 
-/* IOClient id register, instruction FH, reads 0x0260 on a TC38x Cerberus. */
-#define DAP_IO_CLIENT_ID       0xFu
+/*
+ * IOClient id register: reads 0x0260 on a TC38x Cerberus.
+ *
+ * The instruction is 0xB with size exponent 4, giving the one-byte payload
+ * 0x4B.  Not 0xF as this project first assumed - a USB capture of a
+ * miniWiggler attach shows payload 0x4B on every client_read it issues, and
+ * 0x0260 coming back in the replies.  See tools/usb/.
+ */
+#define DAP_IO_CLIENT_ID       0xBu
 #define DAP_CLIENT_ID_EXPECT   0x0260u
 
 #define DAP_SYNC_EXPECT        0xAAAAAAAAu
@@ -100,8 +107,13 @@ esp_err_t dap_probe_sync(dap_exchange_t *out)
      * `sync` is the one command sent with LEN all ones, as a JTAG-TAP safety
      * measure while the pins may still be shared: the run of ones parks the TAP
      * instead of risking a drift into instruction execution during a hot plug.
+     *
+     * It is preceded by eleven clocks with the line *low*, which is what the
+     * reference probe does - a 3-bit write of zeros then an 8-bit one, at
+     * 400 kHz.  An earlier draft used eight clocks held high, which was a
+     * guess and is now known to be wrong.
      */
-    dap_phy_idle_clocks(8, 1);
+    dap_phy_idle_clocks(11, 0);
     return exchange(&f, 32, out);
 }
 

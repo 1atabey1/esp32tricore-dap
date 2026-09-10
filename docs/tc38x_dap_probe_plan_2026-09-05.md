@@ -1150,6 +1150,59 @@ observation-unit FIFO overflows. Instead: read `FIFONOW`, discard the whole
 paragraph containing it, resume at the next 1 kB boundary with both caches
 zeroed, which is safe because each unit's first message there is uncompressed.
 
+### What the reference probe actually does, from its USB traffic
+
+The miniWiggler V3.1 is an FT2232 behind an Infineon VID, so its USB traffic is
+FTDI MPSSE rather than DAP: opcodes carrying clock counts, bit payloads and GPIO
+writes. That is *lower* level than DAP and therefore more useful - it gives the
+exact bits a working probe drives, every direction change, and the rates it
+uses. `tools/usb/` captures it (`sniff_wiggler.sh`, which drives
+`tas-debug-cli`), reconstructs the driven bit stream (`decode_mpsse.py`), and
+walks command and reply streams together as DAP frames with every CRC6
+recomputed by our own generator (`parse_dap_frames.py`, `dap_transcript.py`).
+
+**Confirmed against a probe that demonstrably attaches.** Every one of these
+came off the wire, not out of a document:
+
+| claim | evidence |
+|---|---|
+| frame layout, LSB-first packing, CRC6 generator | our `sync` frame appears verbatim: 19 bits, `LEN` 63, CRC6 **9**, `0x09FE1` |
+| `dapisc` cold-attach signature | sent with `LEN` 48 and data `0x4ABBAF530F00` - the documented `0x4ABBAF53`, with register value `0x0F00` |
+| `client_set(1)` | `LEN` 3, data 1, exactly as we build it, 107 times |
+| `sync` draws `0xAAAAAAAA` | the pattern is in the reply bit stream |
+| `CLIENT_ID` reads `0x0260` | eight occurrences in the replies, spaced 288 bits apart - a polling loop |
+
+**Three corrections it forces.**
+
+- **`CLIENT_ID`'s IO instruction is `0xB`, not `0xF`.** Every `client_read` the
+  reference issues carries payload **`0x4B`** - instruction `0xB`, size
+  exponent 4, so a 16-bit read - and `0x0260` is what comes back. The width
+  table's `0x39`/`0x47`/`0x55` decode consistently under the same layout, so
+  the payload *encoding* was right and only the instruction number for
+  `CLIENT_ID` was wrong.
+- **`sync` is preceded by eleven clocks with the line low**, as a 3-bit write
+  of zeros then an 8-bit one, and it goes out at **400 kHz** - the probe
+  explicitly drops the rate to send it. This plan previously guessed eight
+  clocks held *high*.
+- **`MAXWAIT8` is not left at its reset value.** The `dapisc` register half is
+  `0x0F00`, so the reference sets `MAXWAIT8` = 15 with `MW8E` = 0, which is 120
+  wait clocks rather than the reset 248.
+
+**Other things worth having.** The probe ladders through 0.4, 6, 5, 7.5 and
+3.75 MHz sending a 344-bit training pattern of repeating `000011111100` at
+each, reading 30 bytes back, before settling the session at **10 MHz** - so
+10 MHz is demonstrably achievable on this target. Its direction control is bit
+4 of the FT2232's high GPIO byte, and it reads like our `RDnWR`: set means the
+target drives. And the steady-state loop pairs `client_set(1)` with an
+undocumented **`CMD 0x08`, `LEN` 16, data `0xC10`** - 107 of each - so the
+command catalog this project started from is incomplete.
+
+**One caveat on method.** A 6-bit CRC passes by chance on one alignment in 64,
+and the driven stream is ~21000 bits, so a few hundred spurious "valid" frames
+are expected. Only values that repeat identically many times, or that match a
+documented constant, are evidence; single sightings of an unknown command are
+not. The counts above are quoted for that reason.
+
 ### Open questions to settle on hardware
 
 Nothing in the protocol is unresolved on paper any more. Answered from the vendor
