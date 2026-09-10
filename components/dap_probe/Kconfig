@@ -12,8 +12,7 @@ menu "Infineon DAP probe"
             also uses.  Enable it while bringing a target up, then turn it off.
 
     config AEL_DAP_BRINGUP_CLOCK_HZ
-        int "Bring-up bit rate (Hz)"
-        depends on AEL_DAP_BRINGUP_AT_BOOT
+        int "DAP bit rate for bring-up (Hz)"
         default 400000
         range 100000 4000000
         help

@@ -177,12 +177,28 @@ void dap_phy_read_bits(uint8_t *bits, size_t nbits)
 
 int dap_phy_await_start_bit(uint32_t max_cycles)
 {
+    bool seen_low = false;
+
+    /*
+     * A reply is busy stuffing - the target holding DAP1 *low* - followed by a
+     * start bit.  So a one is only a start bit if a zero came first.
+     *
+     * Without that rule an idle-high line answers instantly: the first sample
+     * reads 1, the search returns "wait 0", and the caller then clocks in
+     * sixteen more idle bits and reports a confident 0xFFFF.  That is exactly
+     * how three bring-up checkpoints appeared to reply when nothing was
+     * driving the wire at all.
+     */
     for (uint32_t i = 0; i < max_cycles; i++) {
-        if (clock_in_bit()) {
-            return (int)i;   /* wait cycles consumed before the start bit */
+        const int bit = clock_in_bit();
+        if (!bit) {
+            seen_low = true;
+        } else if (seen_low) {
+            return (int)i;              /* wait cycles before the start bit */
         }
     }
-    return -1;
+    return seen_low ? -1                /* stayed low: a real timeout */
+                    : DAP_AWAIT_IDLE_HIGH;
 }
 
 void dap_phy_set_trst(bool asserted)

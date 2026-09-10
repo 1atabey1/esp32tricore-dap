@@ -36,7 +36,22 @@ typedef struct {
     uint8_t  reply_crc;      /* the six CRC bits that followed, if read */
     bool     crc_ok;         /* residue check over payload+CRC */
     bool     timed_out;
+    bool     idle_high;   /* line never went low: nothing was driving it */
 } dap_exchange_t;
+
+/*
+ * Configure the DAP pins and park them in a state that is safe for an attached
+ * target, without sending anything.
+ *
+ * The pin that matters is TRST: on this bench it goes to the target's reset,
+ * and the target holds it high through a pull-up.  Left as an output at its
+ * power-on level it sits *low*, which holds the target in reset - a TC38x then
+ * stays powered but never runs its application.  Black Magic Probe's
+ * platform_init() configures the same pin as an output and leaves it low, so
+ * this has to run after the background tasks start, and it has to run whether
+ * or not any DAP bring-up is enabled.
+ */
+esp_err_t dap_probe_park_idle(void);
 
 /* Bring the PHY up on this board's pins at `clock_hz` (0 for the 1 MHz default). */
 esp_err_t dap_probe_init(uint32_t clock_hz);
@@ -61,6 +76,22 @@ esp_err_t dap_probe_client_read(uint8_t io_instruction, uint8_t size_exponent,
  * Run the whole checkpoint sequence and log each step with its expected value.
  * Returns ESP_OK only if every checkpoint matched.
  */
+/*
+ * Replay the reference probe's pre-sync preamble, byte for byte.
+ *
+ * Taken from a USB capture of a miniWiggler attach: a 43-byte pattern that is
+ * a pure period-12 repeat of 000011111100, then a 56-bit sequence, then a read
+ * window.  The reference sends this at five clock rates before it sends sync,
+ * and this project never did - which is the last structural difference between
+ * a probe that completes an attach and one that gets a single answer to sync
+ * and is then ignored.  0xAAAAAAAA is itself a training pattern, so answering
+ * sync may only mean the device is in a training state rather than attached.
+ */
+esp_err_t dap_probe_replay_preamble(void);
+
+/* The four bring-up frames back to back, with no host work between them. */
+esp_err_t dap_probe_attach_now(dap_exchange_t out[6]);
+
 esp_err_t dap_probe_bringup_report(void);
 
 /*
@@ -75,6 +106,17 @@ esp_err_t dap_probe_bringup_report(void);
  * any combination answered.
  */
 esp_err_t dap_probe_attach_sweep(void);
+
+/*
+ * Send `sync` and clock a long raw window in, logging every bit.
+ *
+ * The upstream frame length is the one thing neither the documentation nor the
+ * captures pinned down: the reference probe clocks 56 bits after sync while
+ * this code clocks 38, and leaving a reply half-clocked would desynchronise
+ * the device - which is exactly the symptom, sync answering and everything
+ * after it going quiet.  Measuring beats guessing.
+ */
+esp_err_t dap_probe_dump_sync_reply(size_t window_bits);
 
 /*
  * Try each Port C pin that can be an output as the clock, with the data line

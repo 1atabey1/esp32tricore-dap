@@ -27,6 +27,7 @@
 #include "../gpio_loopback_test.h"
 #include "../esp32jtag_common.h"
 #include "../port_cfg.h"
+#include "dap_probe.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
@@ -1944,6 +1945,43 @@ esp_err_t reset_to_factory_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/*
+ * GET /api/dap_bringup - run the DAP bring-up checkpoints on demand.
+ *
+ * This exists so a bring-up run costs nothing but an HTTP request.  Doing it
+ * at boot means resetting this board, and resetting this board disturbs the
+ * target: its Port C pins move while the target is coming out of reset, which
+ * was enough to leave a TC38x powered but not running its application.  With
+ * an endpoint the target can stay up across as many attempts as we like.
+ *
+ * Port C must be in SWD/JTAG mode for the pins to reach the connector.
+ */
+static esp_err_t dap_bringup_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board");
+        return ESP_OK;
+    }
+
+    err = dap_probe_bringup_report();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, err == ESP_OK
+        ? "DAP bring-up PASSED - see the serial log for each checkpoint"
+        : "DAP bring-up did not complete - see the serial log for details");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_bringup = {
+    .uri      = "/api/dap_bringup",
+    .method   = HTTP_GET,
+    .handler  = dap_bringup_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_reset_to_factory = {
     .uri       = "/reset_to_factory",
     .method    = HTTP_POST,
@@ -2279,6 +2317,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_log_error);
     httpd_register_uri_handler(*http_handle, &uri_ota_upload);
     httpd_register_uri_handler(*http_handle, &uri_reset_to_factory);
+    httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
     httpd_register_err_handler(*http_handle, HTTPD_404_NOT_FOUND, not_found_handler);
     ESP_ERROR_CHECK(uart_websocket_add_handlers(*http_handle));

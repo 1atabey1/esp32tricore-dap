@@ -21,6 +21,23 @@ static const char *TAG = "DAP";
 #define DAP_IO_CLIENT_ID       0xBu
 #define DAP_CLIENT_ID_EXPECT   0x0260u
 
+/*
+ * The training handshake the reference performs and this project did not.
+ *
+ * After sync and dapisc the device sends an alternating pattern, and the
+ * reference answers with CMD 0x02 carrying 0xAAAAAA83 - itself alternating -
+ * twice, and only then gets real data back.  Neither the command nor the
+ * constant is in the catalog this project started from; both come straight out
+ * of a USB capture of a working attach.  Without it the device answers sync
+ * once and ignores everything afterwards.
+ */
+#define DAP_CMD_TRAINING       0x02u
+#define DAP_TRAINING_DATA      0xAAAAAA83u
+
+/* Cold-attach dapisc: signature plus the register value the reference writes. */
+#define DAP_DAPISC_SIGNATURE   0x4ABBAF53u
+#define DAP_DAPISC_VALUE       0x0F00u
+
 #define DAP_SYNC_EXPECT        0xAAAAAAAAu
 #define DAP_SYNC_WIRE_WORD     0x09FE1u
 
@@ -41,6 +58,24 @@ esp_err_t dap_probe_init(uint32_t clock_hz)
         .clock_hz = clock_hz ? clock_hz : 1000000u,
     };
     return dap_phy_init(&cfg);
+#endif
+}
+
+esp_err_t dap_probe_park_idle(void)
+{
+#if !AEL_BOARD_HAS_DAP_PROBE
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    const esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* dap_phy_init() already parks clock low, data high and TRST released;
+     * say so in the log, because a target that was held in reset coming back
+     * to life at this exact point is the symptom this explains. */
+    ESP_LOGI(TAG, "DAP pins parked: TRST released (GPIO%d high), clock low",
+             AEL_DAP_TRST_PIN);
+    return ESP_OK;
 #endif
 }
 
@@ -73,6 +108,9 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     dap_phy_turnaround_to_read();
 
     out->wait_cycles = dap_phy_await_start_bit(DAP_MAXWAIT_RESET_CYCLES);
+    if (out->wait_cycles == DAP_AWAIT_IDLE_HIGH) {
+        out->idle_high = true;
+    }
     if (out->wait_cycles < 0) {
         out->timed_out = true;
         dap_phy_turnaround_to_write();
@@ -82,6 +120,15 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
     /* The timeout counter is deactivated by the start bit, so from here the
      * clock may stop anywhere with no consequence. */
     dap_phy_read_bits(bits, reply_bits + 6);
+    /*
+     * Then a short trailer, still with the target driving.  The measured sync
+     * window ends around bit 42 while payload plus CRC accounts for 38, so
+     * something follows the CRC; leaving it unclocked risks parking the device
+     * mid-frame, which would explain why sync answers and every later frame
+     * finds the device back in receive and ignoring us.
+     */
+    uint8_t trailer[8];
+    dap_phy_read_bits(trailer, sizeof(trailer));
     dap_phy_turnaround_to_write();
 
     for (size_t i = 0; i < reply_bits; i++) {
@@ -121,10 +168,30 @@ esp_err_t dap_probe_dapisc_read(dap_exchange_t *out)
 {
     dap_frame_t f;
 
-    if (!dap_frame_build(&f, DAP_CMD_DAPISC, 16, 0, 16)) {
+    /*
+     * The cold-attach form: LEN 48, carrying the 16-bit register value in the
+     * bits sent first and the 32-bit signature 0x4ABBAF53 above it.
+     *
+     * A USB capture of a miniWiggler attaching to this target shows exactly
+     * this frame - LEN 48, data 0x4ABBAF530F00 - and the register half 0x0F00
+     * sets MAXWAIT8 to 15 with MW8E clear.  The 16-bit form this code sent
+     * first drew no reply at all, which is consistent with the handshake not
+     * completing without the signature.
+     */
+    const uint64_t data = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE;
+
+    if (!dap_frame_build(&f, DAP_CMD_DAPISC, 48, data, 48)) {
         return ESP_FAIL;
     }
-    return exchange(&f, 16, out);
+    /*
+     * No reply is read back.  Measured on this target, the window after a
+     * LEN-48 dapisc is 200 bits of solid idle high - nothing drives the line -
+     * and the reference capture agrees once read correctly: the alternating
+     * pattern that turns up after its dapisc is sync's late reply, not
+     * dapisc's own.  The plan's "the register echoed back" does not hold for
+     * the cold-attach form.
+     */
+    return exchange(&f, 0, out);
 }
 
 esp_err_t dap_probe_client_set(uint8_t client, dap_exchange_t *out)
@@ -150,6 +217,37 @@ esp_err_t dap_probe_client_read(uint8_t io_instruction, uint8_t size_exponent,
     return exchange(&f, reply_bits, out);
 }
 
+esp_err_t dap_probe_dump_sync_reply(size_t window_bits)
+{
+    uint8_t     bits[160];
+    dap_frame_t f;
+
+    if (window_bits > sizeof(bits)) {
+        window_bits = sizeof(bits);
+    }
+    if (!dap_phy_ready() || !dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
+        return ESP_FAIL;
+    }
+
+    dap_phy_idle_clocks(11, 0);
+    dap_phy_write_frame(&f);
+    dap_phy_turnaround_to_read();
+    dap_phy_read_bits(bits, window_bits);
+    dap_phy_turnaround_to_write();
+
+    /* Print as a bit string: the shape of the window is what matters here,
+     * not any particular field, so do not impose a frame layout on it. */
+    char text[168];
+    size_t n = 0;
+    for (size_t i = 0; i < window_bits && n < sizeof(text) - 1; i++) {
+        text[n++] = bits[i] ? '1' : '0';
+    }
+    text[n] = ' ';
+    ESP_LOGW(TAG, "sync reply window, %u bits raw:", (unsigned)window_bits);
+    ESP_LOGW(TAG, "  %s", text);
+    return ESP_OK;
+}
+
 esp_err_t dap_probe_clock_pin_search(void)
 {
     /*
@@ -162,7 +260,13 @@ esp_err_t dap_probe_clock_pin_search(void)
      */
     static const struct { int pin; const char *label; } candidates[] = {
         { AEL_DAP0_PIN,     "GPIO47 -> PC02, J3 pin 23" },
-        { AEL_DAP_TRST_PIN, "GPIO40 -> PC04, J3 pin 27" },
+        /*
+         * GPIO40 -> PC04 was a candidate until it turned out to be the
+         * target's reset on this bench - measured as the only Port C wire the
+         * target pulls up, and confirmed by the target refusing to run while
+         * it was held low.  Clocking it would reset the target hundreds of
+         * times per attempt, so it is deliberately not tried.
+         */
     };
 
     ESP_LOGI(TAG, "--- clock pin search, data fixed on GPIO%d (PC03) ---", AEL_DAP1_PIN);
@@ -218,14 +322,15 @@ esp_err_t dap_probe_attach_sweep(void)
                     dap_frame_t    f;
                     dap_exchange_t x;
 
-                    if (trst) {
-                        /* A TAP reset pulse, in case the shared JTAG logic is
-                         * parked somewhere that ignores the DAP framing. */
-                        dap_phy_set_trst(true);
-                        dap_phy_idle_clocks(16, 1);
-                        dap_phy_set_trst(false);
-                    }
-                    dap_phy_idle_clocks(idles[i], 1);
+                    /*
+                     * The TRST pulse this loop used to do is gone: that pin is
+                     * the target's reset here, so "try it with a TAP reset"
+                     * meant rebooting the application under test.  If a TAP
+                     * reset is ever needed it belongs behind an explicit
+                     * opt-in, not inside a sweep.
+                     */
+                    (void)trst;
+                    dap_phy_idle_clocks(idles[i], 0);
 
                     if (!dap_frame_build(&f, DAP_CMD_SYNC, lens[l], 0, 0)) {
                         continue;
@@ -252,14 +357,100 @@ esp_err_t dap_probe_attach_sweep(void)
 static void log_exchange(const char *step, const dap_exchange_t *x)
 {
     if (x->timed_out) {
-        ESP_LOGE(TAG, "%-22s sent 0x%05" PRIX64 " (%zu bits) -> no start bit within %d clocks",
-                 step, x->sent_word, x->sent_bits, DAP_MAXWAIT_RESET_CYCLES);
+        ESP_LOGE(TAG, "%-22s sent 0x%05" PRIX64 " (%zu bits) -> %s within %d clocks",
+                 step, x->sent_word, x->sent_bits,
+                 x->idle_high ? "line stayed idle high, nothing driving it"
+                              : "line held low, no start bit",
+                 DAP_MAXWAIT_RESET_CYCLES);
         return;
     }
     ESP_LOGI(TAG, "%-22s sent 0x%05" PRIX64 " (%zu bits) -> wait %d, reply 0x%08" PRIX64
                   " (%zu bits), crc 0x%02X %s",
              step, x->sent_word, x->sent_bits, x->wait_cycles, x->reply,
              x->reply_bits, x->reply_crc, x->crc_ok ? "residue-ok" : "residue-BAD");
+}
+
+esp_err_t dap_probe_replay_preamble(void)
+{
+    /* Verbatim from the capture: 43 bytes, then 7 bytes, clocked LSB first. */
+    static const uint8_t pattern[43] = {
+        0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03,
+        0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0,
+        0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F,
+        0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0xF0, 0x03, 0x3F, 0x70,
+    };
+    static const uint8_t tail[7] = { 0x80, 0x1F, 0x38, 0x70, 0xFC, 0xF8, 0x71 };
+
+    if (!dap_phy_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (size_t i = 0; i < sizeof(pattern); i++) {
+        for (int b = 0; b < 8; b++) {
+            dap_phy_idle_clocks(1, (pattern[i] >> b) & 1);
+        }
+    }
+    for (size_t i = 0; i < sizeof(tail); i++) {
+        for (int b = 0; b < 8; b++) {
+            dap_phy_idle_clocks(1, (tail[i] >> b) & 1);
+        }
+    }
+
+    /* The reference then reads 30 bytes with the target driving. */
+    uint8_t reply[240];
+    dap_phy_turnaround_to_read();
+    dap_phy_read_bits(reply, sizeof(reply));
+    dap_phy_turnaround_to_write();
+
+    int ones = 0;
+    for (size_t i = 0; i < sizeof(reply); i++) {
+        ones += reply[i];
+    }
+    ESP_LOGW(TAG, "preamble replayed; read window %u bits, %d high",
+             (unsigned)sizeof(reply), ones);
+    return ESP_OK;
+}
+
+esp_err_t dap_probe_attach_now(dap_exchange_t out[6])
+{
+    /*
+     * The four frames back to back, with nothing between them.
+     *
+     * The bring-up report logs after every step, which puts milliseconds of
+     * host work between frames.  Gaps are supposed to be free - the timeout
+     * counts probe clocks - but "supposed to" is what this whole exercise
+     * keeps correcting, and the device has answered sync and then ignored
+     * everything after it.  This removes the gaps as a variable.
+     */
+    const uint64_t dapisc = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE;
+    dap_frame_t f;
+
+    if (!dap_phy_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    dap_phy_idle_clocks(11, 0);
+    if (dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
+        exchange(&f, 32, &out[0]);
+    }
+    if (dap_frame_build(&f, DAP_CMD_DAPISC, 48, dapisc, 48)) {
+        exchange(&f, 0, &out[1]);
+    }
+    /* Complete the training exchange before anything else is attempted. */
+    if (dap_frame_build(&f, DAP_CMD_TRAINING, 32, DAP_TRAINING_DATA, 32)) {
+        exchange(&f, 32, &out[4]);
+    }
+    if (dap_frame_build(&f, DAP_CMD_TRAINING, 32, DAP_TRAINING_DATA, 32)) {
+        exchange(&f, 32, &out[5]);
+    }
+    if (dap_frame_build(&f, DAP_CMD_CLIENT_SET, 3, 1, 3)) {
+        exchange(&f, 0, &out[2]);
+    }
+    if (dap_frame_build(&f, DAP_CMD_CLIENT_READ, 7,
+                        dap_client_read_payload(DAP_IO_CLIENT_ID, 4), 7)) {
+        exchange(&f, 16, &out[3]);
+    }
+    return ESP_OK;
 }
 
 esp_err_t dap_probe_bringup_report(void)
@@ -317,11 +508,55 @@ esp_err_t dap_probe_bringup_report(void)
         return ESP_FAIL;
     }
 
-    /* Checkpoint 2: DAPISC read.  Left at its reset 0x1F00 on purpose. */
+    /* Measure the real shape of a reply window before trusting any length. */
+    dap_probe_dump_sync_reply(120);
+
+    /* And the whole handshake, after the reference's own preamble. */
+    dap_probe_replay_preamble();
+    {
+        static const char *names[6] = { "sync", "dapisc", "client_set(1)",
+                                        "client_read ID", "training 1", "training 2" };
+        dap_exchange_t seq[6];
+        memset(seq, 0, sizeof(seq));
+        dap_probe_attach_now(seq);
+        ESP_LOGW(TAG, "--- gapless handshake ---");
+        for (int i = 0; i < 6; i++) {
+            ESP_LOGW(TAG, "  %-15s wait %-5d reply 0x%08" PRIX64 " %s",
+                     names[i], seq[i].wait_cycles, seq[i].reply,
+                     seq[i].idle_high ? "(idle high)"
+                                      : (seq[i].timed_out ? "(held low)" : ""));
+        }
+        if (seq[3].reply == DAP_CLIENT_ID_EXPECT) {
+            ESP_LOGW(TAG, "  CLIENT_ID 0x0260 - the gapless sequence works");
+        }
+    }
+
+    /* Checkpoint 2: DAPISC.  Dump its window first, for the same reason. */
+    {
+        dap_frame_t df;
+        const uint64_t d = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE;
+        if (dap_frame_build(&df, DAP_CMD_DAPISC, 48, d, 48)) {
+            uint8_t raw[200];
+            char    text[208];
+            dap_phy_write_frame(&df);
+            dap_phy_turnaround_to_read();
+            dap_phy_read_bits(raw, sizeof(raw));
+            dap_phy_turnaround_to_write();
+            size_t n = 0;
+            for (size_t i = 0; i < sizeof(raw) && n < sizeof(text) - 1; i++) {
+                text[n++] = raw[i] ? '1' : '0';
+            }
+            text[n] = ' ';
+            ESP_LOGW(TAG, "dapisc reply window, %u bits raw:", (unsigned)sizeof(raw));
+            ESP_LOGW(TAG, "  %s", text);
+        }
+    }
     err = dap_probe_dapisc_read(&x);
-    log_exchange("2 dapisc read", &x);
+    log_exchange("2 dapisc write", &x);
     if (err != ESP_OK) {
-        failures++;
+        /* Expected: this form takes no reply, so a timeout here is not a
+         * failure.  It is logged so a change in behaviour is still visible. */
+        ESP_LOGI(TAG, "   no reply, as expected for the LEN-48 write form");
     } else {
         ESP_LOGI(TAG, "   MAXWAIT8=%u MW8E=%u -> %u wait clocks allowed",
                  (unsigned)((x.reply >> 8) & 0x1Fu), (unsigned)((x.reply >> 13) & 1u),

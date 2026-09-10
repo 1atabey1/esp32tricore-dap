@@ -34,8 +34,8 @@
 #include "gdb_main.h"
 #include "boards/board_profile.h"
 #include "port_cfg.h"
-#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
 #include "dap_probe.h"
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
 #include "dap_phy.h"
 #endif
 #include "xvc_server.h"
@@ -1085,10 +1085,15 @@ static void dap_la_find_pulled_pins(bool restore_portc, bool use_portb, bool use
 {
     ESP_LOGI(TAG, "  pull-up hunt: drive Port C low, tri-state it, see what rises");
 
+    /*
+     * Only the data line is driven low here.  An earlier version pulled all
+     * four Port C pins down, which is how this board stopped the target's
+     * application: one of these wires reaches a pin the target samples at
+     * reset, so a low pulse per boot of ours was rebooting it into another
+     * mode.  Never drive a wire whose target-side function is unknown.
+     */
     dap_phy_force_dir(0);
-    dap_phy_drive_data(0);                 /* PC03 low */
-    gpio_set_level((gpio_num_t)AEL_DAP0_PIN, 0);      /* PC02 low */
-    gpio_set_level((gpio_num_t)AEL_DAP_TRST_PIN, 0);  /* PC04 low */
+    dap_phy_drive_data(0);                 /* PC03 (data) only */
     vTaskDelay(pdMS_TO_TICKS(5));
 
     gbl_sample_rate_reg  = 2;
@@ -1150,7 +1155,10 @@ static void dap_la_capture_test(void)
     /* Then settle what the sync capture only hints at. */
     dap_la_direction_polarity();
     dap_la_release_time();
-    dap_la_find_pulled_pins(true, b_use_portb_cached, b_use_portd_cached);
+    /* restore_portc = false: leave the port high impedance afterwards so the
+     * board holds nothing against the target between sessions. */
+    dap_la_find_pulled_pins(false, b_use_portb_cached, b_use_portd_cached);
+    ESP_LOGW(TAG, "Port C left high impedance; re-enable it before debugging");
 }
 #endif /* CONFIG_AEL_DAP_BRINGUP_AT_BOOT */
 
@@ -1505,6 +1513,18 @@ void app_main(void) {
 #endif
 
     start_background_tasks();
+
+#if AEL_BOARD_HAS_DAP_PROBE
+    /*
+     * After start_background_tasks(), because BMP's platform_init() runs in
+     * there and leaves GPIO 40 - our TRST - low.  On a bench where that pin is
+     * the target's reset, losing this call leaves the target powered but held
+     * in reset, which is exactly what happened when the boot-time bring-up was
+     * disabled: the bring-up had been releasing it as a side effect.
+     */
+    dap_probe_park_idle();
+#endif
+
     if (g_board->has_lcd) {
         draw_port_cfg_info();
     }

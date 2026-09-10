@@ -37,6 +37,14 @@ extern "C" {
  */
 #define DAP_MAXWAIT_RESET_CYCLES 248
 
+/*
+ * A generous window for bring-up.  MW8E=1 raises the device's own limit to
+ * 3968 clocks, and a frame whose reply is still stuffing at 248 looks
+ * identical to a frame that was ignored - the line simply stays low.  Waiting
+ * longer costs microseconds and removes the ambiguity.
+ */
+#define DAP_MAXWAIT_GENEROUS_CYCLES 4096
+
 typedef struct {
     int      clk_pin;      /* DAP0 */
     int      dat_pin;      /* DAP1 */
@@ -83,6 +91,13 @@ void dap_phy_read_bits(uint8_t *bits, size_t nbits);
  * everything after this call is unconstrained in time.
  */
 int dap_phy_await_start_bit(uint32_t max_cycles);
+
+/*
+ * dap_phy_await_start_bit() returns this instead of -1 when the line never
+ * went low during the whole window.  That is not a timeout: it means nothing
+ * was driving the wire, so there was no reply to wait for.
+ */
+#define DAP_AWAIT_IDLE_HIGH (-2)
 
 /* Assert (low) or release TRST, if the board wired it. */
 void dap_phy_set_trst(bool asserted);
