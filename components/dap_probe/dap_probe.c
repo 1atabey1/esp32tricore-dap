@@ -122,6 +122,7 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
  * once and ignores everything afterwards.
  */
 #define DAP_CMD_CLIENT_RESET   0x1Du
+#define DAP_CMD_BLOCKREAD      0x0Au
 
 /*
  * Low clocks before every frame.
@@ -898,6 +899,110 @@ esp_err_t dap_probe_enable_ocds(void)
     return dap_probe_write32(DAP_ADDR_MCDS_CT, 0x8000u);
 }
 
+esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
+{
+    /*
+     * client_blockread: one telegram, many words, and the reason this project
+     * exists.  A single-word read costs a whole frame plus a reply per 4 bytes;
+     * a block read amortises the frame over up to 256 words.
+     *
+     * Telegram 0x0A, with the payload
+     *   bit 0      request the 32-bit block CRC (CRCup) as a final parcel
+     *   bit 1      CRC6 after every parcel, rather than only the last
+     *   bits 9:2   word count, 1..255, with 0 meaning 256 words (1 kB)
+     *   bits 39:10 word-aligned address, shifted right by two
+     * and LEN selecting the address form: 10 for none, 24 for a 14-bit
+     * address, 40 for a 30-bit one.  With an address present the device loads
+     * IOADDR itself, so no separate IO_SET_ADDRESS is needed, and IOADDR
+     * post-increments by four per word.
+     */
+    dap_frame_t f;
+    uint8_t     bits[32];
+
+    if (count == 0 || count > 256 || words == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!dap_phy_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint64_t payload = ((uint64_t)(count & 0xFFu) << 2) |
+                             ((uint64_t)(addr >> 2) << 10);
+    if (!dap_frame_build(&f, DAP_CMD_BLOCKREAD, 40, payload, 40)) {
+        return ESP_FAIL;
+    }
+
+    dap_phy_idle_clocks(DAP_FRAME_LEAD_CLOCKS, 0);
+    dap_phy_write_frame(&f);
+    dap_phy_turnaround_to_read();
+
+    esp_err_t err = ESP_OK;
+    for (size_t w = 0; w < count; w++) {
+        /* The timeout re-arms per parcel, so each one gets its own window. */
+        if (dap_phy_await_start_bit(s_max_wait + DAP_WAIT_MARGIN) < 0) {
+            ESP_LOGW(TAG, "blockread: no parcel %u of %u",
+                     (unsigned)(w + 1), (unsigned)count);
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
+        dap_phy_read_bits(bits, 32);
+        uint32_t v = 0;
+        for (size_t i = 0; i < 32; i++) {
+            v |= (uint32_t)(bits[i] & 1u) << i;
+        }
+        words[w] = v;
+    }
+
+    if (err == ESP_OK) {
+        dap_phy_read_bits(bits, 6);      /* CRC6 on the final parcel only */
+    }
+    dap_phy_turnaround_to_write();
+    if (err != ESP_OK) {
+        dap_phy_idle_clocks(s_max_wait, 0);
+    }
+    return err;
+}
+
+esp_err_t dap_probe_block_throughput(void)
+{
+    /*
+     * The number this project is measured against.
+     *
+     * A miniWiggler through DAS/TAS reads target memory at about 38 kB/s, and
+     * that ceiling is what forced a 12x cut in the trace publish rate.  This
+     * reads 1 kB per telegram - 256 words, the maximum - so the frame cost is
+     * amortised and what is left is wire time plus per-parcel overhead.
+     */
+    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u };
+    static uint32_t buf[256];
+    const int iterations = 8;
+
+    ESP_LOGW(TAG, "--- block read throughput, 1 kB per telegram ---");
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        dap_phy_set_clock(rates[r]);
+
+        int ok = 0;
+        const int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < iterations; i++) {
+            if (dap_probe_blockread(0x70000000u, buf, 256) == ESP_OK) {
+                ok++;
+            } else {
+                dap_probe_clear_error_state();
+            }
+        }
+        const int64_t us = esp_timer_get_time() - t0;
+        if (us > 0 && ok) {
+            const int kbps = (int)((int64_t)ok * 1024 * 1000000 / us / 1024);
+            ESP_LOGW(TAG, "  %7" PRIu32 " Hz: %d/%d blocks, %lld us -> %d kB/s",
+                     rates[r], ok, iterations, (long long)us, kbps);
+        } else {
+            ESP_LOGW(TAG, "  %7" PRIu32 " Hz: no blocks completed", rates[r]);
+        }
+    }
+    dap_phy_set_clock(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    return ESP_OK;
+}
+
 esp_err_t dap_probe_rate_test(void)
 {
     /*
@@ -1397,8 +1502,38 @@ esp_err_t dap_probe_bringup_report(void)
         dap_probe_clear_error_state();
     }
 
+    /* Checkpoint 7: a block read, cross-checked against single-word reads. */
+    {
+        const uint32_t base = DAP_ADDR_MCDS_BASE;   /* readable now OCDS is on */
+        uint32_t blk[8] = {0}, one[8] = {0};
+
+        if (dap_probe_blockread(base, blk, 8) == ESP_OK) {
+            int mismatch = 0;
+            for (size_t i = 0; i < 8; i++) {
+                if (dap_probe_read32(base + 4u * i, &one[i]) != ESP_OK ||
+                    one[i] != blk[i]) {
+                    mismatch++;
+                }
+            }
+            ESP_LOGI(TAG, "7 blockread 8 words from 0x%08" PRIX32 ": %s",
+                     base, mismatch ? "MISMATCH vs single reads" : "matches single reads");
+            for (size_t i = 0; i < 4; i++) {
+                ESP_LOGI(TAG, "   [%u] block 0x%08" PRIX32 "  single 0x%08" PRIX32,
+                         (unsigned)i, blk[i], one[i]);
+            }
+            if (mismatch) {
+                failures++;
+            }
+        } else {
+            ESP_LOGW(TAG, "7 blockread drew no parcels");
+            failures++;
+        }
+        dap_probe_clear_error_state();
+    }
+
     if (!failures) {
         dap_probe_rate_test();
+        dap_probe_block_throughput();
     }
 
     ESP_LOGI(TAG, "=== bring-up %s (%d failure%s) ===",

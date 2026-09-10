@@ -136,6 +136,15 @@ esp_err_t dap_probe_write32(uint32_t addr, uint32_t value);
  */
 esp_err_t dap_probe_enable_ocds(void);
 
+/*
+ * Read `count` words (1..256) in one client_blockread telegram.  The device
+ * loads IOADDR itself from the telegram and post-increments per word.
+ */
+esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count);
+
+/* Block read throughput in kB/s, against the 38 kB/s baseline. */
+esp_err_t dap_probe_block_throughput(void);
+
 /* Single-word read rate, and how far the bit-banged PHY carries. */
 esp_err_t dap_probe_rate_test(void);
 
