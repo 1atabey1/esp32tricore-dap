@@ -115,6 +115,13 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
  * seen rather than counted as a timeout.
  */
 #define DAP_WAIT_MARGIN        8
+
+/*
+ * How late an acknowledge may arrive and still be believed.  The device
+ * replies within a few cycles; this only has to exclude glitches found at the
+ * far end of a 120-cycle window.
+ */
+#define DAP_ACK_MAX_WAIT       32
 #define DAP_TRAINING_DATA      0xAAAAAA83u
 
 /* Cold-attach dapisc: signature plus the register value the reference writes. */
@@ -259,7 +266,61 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
         out->crc_ok = true;
     }
 
+    /*
+     * A reply whose residue fails is not a reply.
+     *
+     * The start-bit search can still be fooled: late in a long wait window a
+     * glitch reads as low-then-high, the caller then clocks in idle-high bits,
+     * and the result is a confident 0xFFFF or 0xFFFFFFFF with a wait count
+     * near the window limit.  That is how four addresses - including a
+     * free-running timer read twice - all came back as 0xFFFFFFFF and were
+     * reported as successful reads.  The CRC is the discriminator and it was
+     * being recorded rather than enforced.
+     */
+    if (!out->crc_ok) {
+        dap_phy_idle_clocks(s_max_wait, 0);      /* flush to Active::RECEIVE */
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    /*
+     * An acknowledge carries no CRC, so it is the one reply that cannot be
+     * checked - and a phantom start bit late in the wait window is
+     * indistinguishable from a real one by content.  It is distinguishable by
+     * *when* it arrives: the device answers within a few cycles of the
+     * command, while a glitch turns up near the limit.  Anything past
+     * DAP_ACK_MAX_WAIT is treated as no acknowledge, which stops a write from
+     * being reported as landed when nothing received it.
+     */
+    if (reply_bits == 0 && out->wait_cycles > DAP_ACK_MAX_WAIT) {
+        out->timed_out = true;
+        dap_phy_idle_clocks(s_max_wait, 0);
+        return ESP_ERR_TIMEOUT;
+    }
+
     return ESP_OK;
+}
+
+esp_err_t dap_probe_attach(dap_exchange_t *out, int attempts)
+{
+    /*
+     * Sync, retrying after a flush.  The first attach following a board reset
+     * regularly fails where the second succeeds, and MAXWAIT8 low clocks is
+     * the documented way to put the device back in Active::RECEIVE, so a
+     * retry is cheaper and more honest than reporting a dead target.
+     */
+    esp_err_t err = ESP_FAIL;
+
+    for (int i = 0; i < attempts; i++) {
+        err = dap_probe_sync(out);
+        if (err == ESP_OK && out->reply == DAP_SYNC_EXPECT) {
+            if (i) {
+                ESP_LOGI(TAG, "sync succeeded on attempt %d", i + 1);
+            }
+            return ESP_OK;
+        }
+        dap_phy_idle_clocks(s_max_wait, 0);
+    }
+    return err == ESP_OK ? ESP_FAIL : err;
 }
 
 esp_err_t dap_probe_sync(dap_exchange_t *out)
@@ -623,18 +684,24 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
                                  dap_exchange_t *out)
 {
     dap_frame_t f;
-    const uint8_t sel = dap_client_read_payload(io_instruction, size_exponent);
 
     /*
-     * A write telegram is the same 4-bit instruction and 3-bit size exponent
-     * as a read, followed by the data - so LEN is 7 plus the data width, and
-     * the whole payload goes out LSB first like every other field.
+     * A write telegram carries no size exponent - unlike a read, where the
+     * 7-bit selector holds one.  The width comes from LEN alone:
+     *
+     *   LEN     = 4 + n          (4-bit IO instruction plus n data bits)
+     *   payload = [instruction][data], both LSB first
+     *
+     * The reply is a bare start bit with no data and no CRC6, unless
+     * DAPISC.RC6 is enabled.
      */
+    (void)size_exponent;
     if (data_bits > 32) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!dap_frame_build(&f, DAP_CMD_CLIENT_WRITE, (uint8_t)(7u + data_bits),
-                         ((uint64_t)data << 7) | sel, 7u + data_bits)) {
+    if (!dap_frame_build(&f, DAP_CMD_CLIENT_WRITE, (uint8_t)(4u + data_bits),
+                         ((uint64_t)data << 4) | (io_instruction & 0x0Fu),
+                         4u + data_bits)) {
         return ESP_FAIL;
     }
     /* Writes acknowledge with a bare start bit, like client_set. */
@@ -647,7 +714,24 @@ esp_err_t dap_probe_set_rw_mode(bool supervisor)
     const uint16_t conf = DAP_IOCONF_MODE_RW |
                           (uint16_t)(supervisor ? DAP_IOCONF_SVM : 0u);
 
-    return dap_probe_client_write(DAP_IO_CONF, 4, conf, 16, &x);
+    const esp_err_t err = dap_probe_client_write(DAP_IO_CONF, 4, conf, 16, &x);
+    ESP_LOGI(TAG, "IOCONF <- 0x%04X: %s after %d cycles", conf,
+             err == ESP_OK ? "acknowledged" : "NOT acknowledged", x.wait_cycles);
+    return err;
+}
+
+esp_err_t dap_probe_clear_error_state(void)
+{
+    dap_exchange_t x;
+
+    /*
+     * A bus error or protection fault puts Cerberus in Error State, where all
+     * IO_READ_* and IO_WRITE_* instructions are silently dropped.  Executing
+     * IO_SUPERVISOR - instruction 0xB, the same one that reads IOINFO - clears
+     * it.  Worth doing before a sequence, because the state survives whatever
+     * caused it, including an earlier session's mistake.
+     */
+    return dap_probe_client_read(DAP_IO_INFO, 4, 16, &x);
 }
 
 esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
@@ -662,9 +746,11 @@ esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
      */
     esp_err_t err = dap_probe_client_write(DAP_IO_SET_ADDRESS, 5, addr, 32, &x);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "IOADDR write for 0x%08" PRIX32 " was not acknowledged", addr);
+        ESP_LOGW(TAG, "IOADDR write for 0x%08" PRIX32 " not acknowledged (%s)",
+                 addr, x.idle_high ? "idle high" : "no start bit in time");
         return err;
     }
+    ESP_LOGD(TAG, "IOADDR write acknowledged after %d cycles", x.wait_cycles);
 
     err = dap_probe_client_read(DAP_IO_READ_WORD, 5, 32, &x);
     if (err != ESP_OK) {
@@ -875,7 +961,7 @@ esp_err_t dap_probe_bringup_report(void)
     (void)idle_high;
 
     /* Checkpoint 1: sync must draw the 0xAAAAAAAA training pattern. */
-    err = dap_probe_sync(&x);
+    err = dap_probe_attach(&x, 3);
     log_exchange("1 sync", &x);
     if (x.sent_word != DAP_SYNC_WIRE_WORD) {
         ESP_LOGE(TAG, "   frame assembly is wrong: expected wire word 0x%05X", DAP_SYNC_WIRE_WORD);
@@ -1005,12 +1091,22 @@ esp_err_t dap_probe_bringup_report(void)
          * OCDS is enabled.
          */
         static const struct { uint32_t addr; const char *what; } probes[] = {
-            { 0xA0000000u, "PFLASH0, non-cached alias" },
-            { 0x80000000u, "PFLASH0, cached alias" },
+            /*
+             * STM0_TIM0 counts continuously, so reading it twice is the only
+             * check here that cannot be faked: identical values mean we are
+             * not really reading, and 0xFFFFFFFF everywhere means a bus error
+             * or an unset IOADDR rather than data.  Erased flash reads all
+             * ones legitimately, which is why the flash aliases alone prove
+             * nothing.
+             */
+            { 0xF0001010u, "STM0_TIM0 (counts up)" },
+            { 0xF0001010u, "STM0_TIM0 again" },
             { 0x70000000u, "CPU0 DSPR" },
+            { 0xA0000000u, "PFLASH0, non-cached alias" },
             { 0xF0000480u, "OSTATE (OCDS block)" },
         };
         uint32_t word = 0;
+        dap_probe_clear_error_state();
         esp_err_t mode = dap_probe_set_rw_mode(true);
         ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
                  mode == ESP_OK ? "acknowledged" : "no acknowledge");
@@ -1025,9 +1121,9 @@ esp_err_t dap_probe_bringup_report(void)
                          probes[i].addr, probes[i].what);
             }
             dap_exchange_t inf;
-            if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &inf) == ESP_OK &&
-                inf.reply != 0x0020u) {
-                ESP_LOGW(TAG, "     IOINFO changed to 0x%04" PRIX64, inf.reply);
+            if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &inf) == ESP_OK) {
+                ESP_LOGI(TAG, "     IOINFO 0x%04" PRIX64 "%s", inf.reply,
+                         (inf.reply & ~0x0020u) ? "  <- bits beyond PWR_DWN" : "");
             }
         }
         if (!reads_ok) {

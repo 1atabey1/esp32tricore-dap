@@ -30,7 +30,14 @@ extern "C" {
 #define DAP_CMD_SYNC          0x10u
 #define DAP_CMD_DAPISC        0x11u
 #define DAP_CMD_CLIENT_READ   0x1Au
-#define DAP_CMD_CLIENT_WRITE  0x1Bu
+/*
+ * client_write is 0x08.  0x1B is client_readwrite - a combined transaction -
+ * and sending it in place of a write makes the device interpret the frame as
+ * read-first and desynchronise, which presents as the write being accepted and
+ * having no effect.
+ */
+#define DAP_CMD_CLIENT_WRITE  0x08u
+#define DAP_CMD_CLIENT_RW     0x1Bu
 #define DAP_CMD_CLIENT_SET    0x1Cu
 
 /* IOClient instructions, 4 bits, paired with a 3-bit size exponent. */

@@ -62,6 +62,9 @@ esp_err_t dap_probe_init(uint32_t clock_hz);
  */
 esp_err_t dap_probe_sync(dap_exchange_t *out);
 
+/* Sync with retries and a flush between them; the first attach often fails. */
+esp_err_t dap_probe_attach(dap_exchange_t *out, int attempts);
+
 /*
  * Write DAPISC and read back the updated value.  `cold` selects the 66-bit
  * initialisation telegram with the 0x4ABBAF53 signature, for the
@@ -113,6 +116,9 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
  * bus rather than COMDATA.  Required before any memory access.
  */
 esp_err_t dap_probe_set_rw_mode(bool supervisor);
+
+/* Clear Cerberus Error State, in which reads and writes are silently dropped. */
+esp_err_t dap_probe_clear_error_state(void);
 
 /* Set IOADDR and read the 32-bit word there. */
 esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value);
