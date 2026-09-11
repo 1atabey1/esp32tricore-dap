@@ -29,6 +29,7 @@
 #include "../esp32jtag_common.h"
 #include "../port_cfg.h"
 #include "dap_probe.h"
+#include "dap_trace.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
@@ -1962,6 +1963,33 @@ esp_err_t reset_to_factory_handler(httpd_req_t *req) {
  */
 #define DAP_CAPTURE_BYTES (96 * 1024)
 
+/*
+ * One socket write per pass of the trace stream loop.  4 kB is four TRAM
+ * paragraphs plus their headers, so a caught-up drain empties in a single
+ * write and a backlog drains without a delay between writes.
+ */
+#define DAP_TRACE_CHUNK_BYTES 4096
+
+/*
+ * How many empty 5 ms passes to wait after the drain stops before closing the
+ * stream.  The drain task may still be finishing a paragraph when the stop
+ * arrives, and cutting the connection there would lose it.
+ */
+#define DAP_TRACE_DRAIN_TAIL_PASSES 20
+
+/*
+ * How many empty 5 ms passes to wait while the drain is still running before
+ * returning anyway.  Half a second of silence means nothing is being traced,
+ * and there is no reason to keep the single-threaded web server occupied.
+ */
+#define DAP_TRACE_IDLE_PASSES 100
+
+/*
+ * Longest a single stream response may run.  esp_http_server handles requests
+ * from one task, so this is how long every other endpoint waits behind it.
+ */
+#define DAP_TRACE_STREAM_MAX_MS 1000
+
 static char           *s_dap_cap;
 static size_t          s_dap_cap_len;
 static vprintf_like_t  s_dap_cap_prev;
@@ -2066,6 +2094,182 @@ static esp_err_t dap_spi_handler(httpd_req_t *req)
         : "\n=== GP-SPI backend did not pass ===\n");
     return ESP_OK;
 }
+
+/*
+ * GET /api/dap_trace/start  - attach, enable OCDS, and start the drain
+ * GET /api/dap_trace/stop
+ * GET /api/dap_trace/stats  - one line of counters
+ * GET /api/dap_trace/stream - the drained stream as it arrives
+ *
+ * The stream is binary and self-framing: every paragraph carries a
+ * dap_trace_record_t header with a magic word, a sequence number, and a gap
+ * flag counting the paragraphs the target overwrote before the probe could
+ * read them.  That last part is the point of the whole exercise - a TRAM lap
+ * produces no ERR message, so a stream without an explicit marker parses as
+ * valid and is quietly wrong.
+ *
+ * Nothing here configures tracing.  The MCDS configuration is the host's
+ * 54-write list; a drain that invented its own would be measuring itself.
+ */
+static esp_err_t dap_trace_start_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board\n");
+        return ESP_OK;
+    }
+
+    /*
+     * The same opening the bring-up uses, because the drain needs exactly what
+     * it establishes: an attached device, the Cerberus IOClient selected, RW
+     * mode for bus access, and OCDS on - without which the whole miniMCDS
+     * register space bus-errors and the FIFO reads come back empty.
+     */
+    dap_capture_begin();
+
+    dap_exchange_t x;
+    err = dap_probe_attach(&x, 3);
+    if (err == ESP_OK) {
+        dap_probe_client_set(1, &x);
+        dap_probe_clear_error_state();
+        dap_probe_set_rw_mode(true);
+        dap_probe_enable_ocds();
+        err = dap_trace_start();
+    }
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== draining ===\n"
+        : "\n=== could not start the drain ===\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stop_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_trace_stop();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "stopped\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stats_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_trace_stats_t st;
+    char line[384];
+
+    dap_trace_get_stats(&st);
+    const int n = snprintf(line, sizeof(line),
+        "running=%d paragraphs=%" PRIu32 " bytes=%" PRIu32 " lost=%" PRIu32
+        " laps=%" PRIu32 " overruns=%" PRIu32 " read_errors=%" PRIu32
+        " fifonow=0x%08" PRIX32 " queue_free=%" PRIu32 " queue_dropped=%" PRIu32
+        " poll_us_max=%" PRIu32 "\n",
+        st.running ? 1 : 0, st.paragraphs, st.bytes, st.lost, st.laps,
+        st.overruns, st.read_errors, st.fifonow, st.queue_free,
+        st.queue_dropped, st.poll_us_max);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    /*
+     * Chunked, and deliberately bounded rather than held open forever.
+     *
+     * esp_http_server services every request from one task, so a handler that
+     * streams until the capture ends blocks the whole web server while it runs
+     * - including /api/dap_trace/stop, which would leave no way to stop the
+     * drain but a reset.  So this returns after DAP_TRACE_STREAM_MAX_MS, or
+     * sooner if the ring goes quiet, and the host reconnects.  The 64 kB ring
+     * covers the gap between requests.
+     *
+     * That bound is also the limit of this transport.  A sustained three-signal
+     * capture is about 400 kB/s, which fills the ring in roughly 160 ms, so a
+     * host that takes longer than that to reconnect loses paragraphs - and they
+     * are reported as gaps rather than lost silently, which is the point of the
+     * record header.  Sustained capture wants a dedicated socket with its own
+     * task; this endpoint is for bring-up and for verifying the framing.
+     */
+    const int64_t deadline = esp_timer_get_time() + DAP_TRACE_STREAM_MAX_MS * 1000;
+
+    uint8_t *buf = heap_caps_malloc(DAP_TRACE_CHUNK_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = heap_caps_malloc(DAP_TRACE_CHUNK_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "no buffer for the stream\n");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    int idle = 0;
+    for (;;) {
+        const size_t n = dap_trace_read(buf, DAP_TRACE_CHUNK_BYTES);
+
+        if (n) {
+            idle = 0;
+            if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
+                break;                  /* the host went away */
+            }
+            if (esp_timer_get_time() >= deadline) {
+                break;                  /* hand the server back; the host returns */
+            }
+            continue;                   /* there may be more waiting already */
+        }
+
+        dap_trace_stats_t st;
+        dap_trace_get_stats(&st);
+        if (!st.running && idle > DAP_TRACE_DRAIN_TAIL_PASSES) {
+            break;                      /* stopped, and the ring has run dry */
+        }
+        if (idle > DAP_TRACE_IDLE_PASSES || esp_timer_get_time() >= deadline) {
+            break;                      /* nothing arriving; do not hold the server */
+        }
+        idle++;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    free(buf);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_trace_start = {
+    .uri      = "/api/dap_trace/start",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_start_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stop = {
+    .uri      = "/api/dap_trace/stop",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stop_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stats = {
+    .uri      = "/api/dap_trace/stats",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stats_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stream = {
+    .uri      = "/api/dap_trace/stream",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stream_handler,
+    .user_ctx = NULL
+};
 
 httpd_uri_t uri_dap_spi = {
     .uri      = "/api/dap_spi",
@@ -2394,7 +2598,13 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     config.prvtkey_pem = prvtkey_buf;
     config.prvtkey_len = prvtkey_len + 1; // Include null terminator
 
-    config.httpd.max_uri_handlers = 30;
+    /*
+     * 33 handlers are registered below, and httpd_register_uri_handler()
+     * returns an error rather than complaining loudly when the table is full -
+     * so a cap set too low takes the *last* endpoints registered off the air
+     * with no sign of it but a 404.  Kept well clear of the count.
+     */
+    config.httpd.max_uri_handlers = 40;
     config.httpd.stack_size = 10240; // Increased stack for SSL operations
 
     ESP_LOGI(TAG, "Starting HTTPS Server on port: '%d'", config.httpd.server_port);
@@ -2417,6 +2627,10 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_ota_upload);
     httpd_register_uri_handler(*http_handle, &uri_reset_to_factory);
     httpd_register_uri_handler(*http_handle, &uri_dap_spi);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_start);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);
     httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
     httpd_register_err_handler(*http_handle, HTTPD_404_NOT_FOUND, not_found_handler);
