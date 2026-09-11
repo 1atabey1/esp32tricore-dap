@@ -56,6 +56,20 @@ extern "C" {
 typedef struct {
     uint8_t bit[DAP_FRAME_MAX_BITS];
     size_t  len;   /* bits actually used */
+
+    /*
+     * The fields the frame was built from, kept alongside the serialised bits.
+     *
+     * A PHY that clocks the frame out itself only needs `bit`; one that hands
+     * the whole exchange to hardware needs the fields back, because the
+     * hardware assembles its own frame from them.  Recovering them by parsing
+     * `bit` would be a second implementation of the frame format, which is the
+     * one thing this file exists to avoid having two of.
+     */
+    uint8_t  cmd;
+    uint8_t  len_field;
+    uint64_t data;
+    size_t   data_bits;
 } dap_frame_t;
 
 /*

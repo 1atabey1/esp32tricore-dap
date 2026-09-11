@@ -6,6 +6,7 @@
 #include "board_profile.h"
 #include "dap_frame.h"
 #include "dap_phy.h"
+#include "dap_phy_fpga.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -284,6 +285,34 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
                           dap_exchange_t *out)
 {
     uint8_t bits[DAP_REPLY_MAX_BITS + 6];
+
+    /*
+     * The fabric does a whole exchange by itself, so when it is driving there
+     * is nothing here to assemble: hand it the frame's fields and take the
+     * answer.  Everything above this - read32, OCDS enable, the GDB target, the
+     * trace drain - is unchanged either way, which is the point of putting the
+     * switch at this level rather than in the PHY.
+     */
+    if (dap_phy_fpga_in_use()) {
+        uint32_t reply = 0;
+        uint16_t waited = 0;
+
+        memset(out, 0, sizeof(*out));
+        out->sent_word = dap_frame_word(frame);
+        out->sent_bits = frame->len;
+
+        const esp_err_t err = dap_phy_fpga_exchange(
+            frame->cmd, frame->len_field, frame->data, frame->data_bits,
+            reply_bits, &reply, &waited);
+
+        out->reply       = reply;
+        out->reply_bits  = reply_bits;
+        out->wait_cycles = (int)waited;
+        out->crc_ok      = (err == ESP_OK);
+        out->timed_out   = (err == ESP_ERR_TIMEOUT);
+        out->idle_high   = (err == ESP_ERR_NOT_FOUND);
+        return err;
+    }
 
     if (!dap_phy_ready()) {
         return ESP_ERR_INVALID_STATE;
@@ -996,6 +1025,18 @@ esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
 
     if (count == 0 || count > 256 || words == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * With the fabric driving, this is the call that stops being a loop.  Here
+     * every parcel costs a start-bit hunt and 32 software-clocked bits; there
+     * the whole block is one command and one burst, and the host never enters
+     * the per-parcel path at all.
+     */
+    if (dap_phy_fpga_in_use()) {
+        const uint64_t payload = ((uint64_t)(count & 0xFFu) << 2) |
+                                 ((uint64_t)(addr >> 2) << 10);
+        return dap_phy_fpga_blockread(payload, 40, words, count);
     }
     if (!dap_phy_ready()) {
         return ESP_ERR_INVALID_STATE;

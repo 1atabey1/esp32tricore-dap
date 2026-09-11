@@ -70,6 +70,13 @@ bool dap_frame_build(dap_frame_t *f, uint8_t cmd, uint8_t len_field,
         return false;
     }
 
+    /* Kept for a PHY that assembles the frame in hardware and needs the fields
+     * rather than the bits; see the note on dap_frame_t. */
+    f->cmd       = cmd;
+    f->len_field = len_field;
+    f->data      = data;
+    f->data_bits = data_bits;
+
     for (size_t i = 0; i < 5; i++) {
         payload[n++] = (uint8_t)((cmd >> i) & 1u);
     }
