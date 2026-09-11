@@ -146,8 +146,16 @@ module tb_dap_top;
         rst = 1'b0;
         repeat (4) @(posedge clk);
 
-        /* Fast bit rate so the test does not take all day. */
-        wr(7'h02, 8'd1);       /* DIV */
+        /*
+         * DIV 5, not 1.  The receiver sees DAP1 through a two-flop
+         * synchroniser, so its sample is two fabric clocks stale; the half
+         * period has to be longer than that or the sample lands in the
+         * neighbouring bit.  DIV 1 gives a two-clock half period and is not a
+         * legal operating point - it produced a testbench that passed against
+         * an unsynchronised design and broke the moment the synchroniser
+         * arrived, which is the test being wrong rather than the design.
+         */
+        wr(7'h02, 8'd5);       /* DIV: 12 fabric clocks per bit */
         wr(7'h07, 8'd1);       /* TRAIL */
         wr(7'h08, 8'd64);      /* MAXWAIT low */
         wr(7'h09, 8'd0);

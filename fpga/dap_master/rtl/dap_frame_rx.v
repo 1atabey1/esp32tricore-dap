@@ -95,6 +95,7 @@ module dap_frame_rx #(
 
     reg [6:0]  nbits_r;
     reg        crc_r;
+    reg [15:0] wait_limit;
     reg [7:0]  trail_r;
     reg [15:0] max_wait_r;
 
@@ -155,6 +156,9 @@ module dap_frame_rx #(
                 crc_r       <= expect_crc;
                 trail_r     <= trail_clocks;
                 max_wait_r  <= max_wait;
+                /* One subtract here, out of the hot path, instead of an add
+                 * and a compare on every clocked bit. */
+                wait_limit  <= (max_wait == 16'd0) ? 16'd0 : max_wait - 1'b1;
                 trail_left  <= trail_clocks;
                 crc_rst     <= 1'b1;
                 busy        <= 1'b1;
@@ -188,7 +192,14 @@ module dap_frame_rx #(
                                 if (nbits_r == 7'd0) begin
                                     crc_ok <= 1'b1;   /* nothing to check */
                                 end
-                            end else if (wait_cycles + 1'b1 >= max_wait_r) begin
+                            /*
+                             * Equality against a limit worked out once at
+                             * start, not "counter + 1 >= limit".  The latter is
+                             * a 16-bit add feeding a 16-bit compare in one
+                             * cycle, and it was the critical path that held the
+                             * whole design to 35 MHz.
+                             */
+                            end else if (wait_cycles == wait_limit) begin
                                 timed_out <= 1'b1;
                                 state     <= S_TRAIL;
                                 trail_left <= 8'd0;

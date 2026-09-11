@@ -20,7 +20,12 @@
 #
 #     PC01 = DAP2, PC02 = DAP0 (clock), PC03 = DAP1 (data), PC04 = TRST
 #
-set_io dap2     34   # IO08 -> PC01
+# dap2 (IO08 -> PC01, package pin 34) is deliberately left unconstrained.  This
+# design has no use for it, and an unconstrained iCE40 pad stays an input -
+# which is what a target line nothing intends to drive should see.  Constraining
+# it to a signal that is never driven would be worse: it would look intentional.
+# set_io dap2   34
+
 set_io dap0     32   # IO09 -> PC02, the clock this master generates
 set_io dap1     31   # IO10 -> PC03, the bidirectional data line
 set_io trst     28   # IO11 -> PC04, target reset on this bench

@@ -53,6 +53,9 @@ module dap_top #(
     output wire dap0,
     inout  wire dap1,
     output reg  trst,
+    /* Left unconnected by the board top: this design has no use for DAP2, and
+     * an unconstrained pad stays an input, which is what a target line nothing
+     * intends to drive should see. */
     output wire dap2
 );
     /* ------------------------------------------------------------------ */
@@ -98,8 +101,14 @@ module dap_top #(
     reg [7:0]  fifo_mem [0:FIFO_DEPTH-1];
     reg [11:0] fifo_wr, fifo_rd;
     reg [11:0] fifo_count;
-    wire       fifo_empty = (fifo_count == 12'd0);
-    wire       fifo_full  = (fifo_count >= FIFO_DEPTH[11:0]);
+    /*
+     * Registered rather than compared combinationally.  A 12-bit magnitude
+     * compare against the depth sits in the middle of the sequencer's decisions
+     * and is the sort of thing that quietly sets the whole design's clock
+     * ceiling; a flip-flop updated alongside the counter costs nothing.
+     */
+    reg        fifo_empty = 1'b1;
+    reg        fifo_full  = 1'b0;
 
     reg        fifo_push;
     reg [7:0]  fifo_din;
@@ -111,6 +120,8 @@ module dap_top #(
             fifo_wr    <= 12'd0;
             fifo_rd    <= 12'd0;
             fifo_count <= 12'd0;
+            fifo_empty <= 1'b1;
+            fifo_full  <= 1'b0;
         end else begin
             if (fifo_push && !fifo_full) begin
                 fifo_mem[fifo_wr] <= fifo_din;
@@ -120,9 +131,17 @@ module dap_top #(
                 fifo_rd <= (fifo_rd == FIFO_DEPTH-1) ? 12'd0 : fifo_rd + 1'b1;
             end
             case ({fifo_push && !fifo_full, fifo_pop && !fifo_empty})
-                2'b10:   fifo_count <= fifo_count + 1'b1;
-                2'b01:   fifo_count <= fifo_count - 1'b1;
-                default: fifo_count <= fifo_count;
+                2'b10: begin
+                    fifo_count <= fifo_count + 1'b1;
+                    fifo_empty <= 1'b0;
+                    fifo_full  <= (fifo_count + 1'b1 == FIFO_DEPTH[11:0]);
+                end
+                2'b01: begin
+                    fifo_count <= fifo_count - 1'b1;
+                    fifo_full  <= 1'b0;
+                    fifo_empty <= (fifo_count == 12'd1);
+                end
+                default: ;
             endcase
         end
     end
@@ -149,8 +168,27 @@ module dap_top #(
     wire drive    = tx_busy ? tx_oe : rx_oe;
     wire dap1_out = tx_dap1;
 
-    assign dap1    = drive ? dap1_out : 1'bz;
-    assign dap1_in = dap1;
+    assign dap1 = drive ? dap1_out : 1'bz;
+
+    /*
+     * Synchronise the target's data before looking at it.
+     *
+     * DAP1 is driven by the target against its own clock domain - our DAP0
+     * paces it, but the pad still changes asynchronously to this fabric clock -
+     * so sampling the pad combinationally is a metastability hazard as well as
+     * a long route: place and route put that path across the whole chip and it
+     * set the design's clock ceiling on its own.
+     *
+     * The cost is two fabric clocks of delay on the sample point, about 42 ns
+     * at 48 MHz, against a bit period of 500 ns at the default divider.  That
+     * is inside the window where the target holds the bit, so it moves where we
+     * look rather than what we see.
+     */
+    reg [1:0] dap1_sync;
+    always @(posedge clk) begin
+        dap1_sync <= {dap1_sync[0], dap1};
+    end
+    assign dap1_in = dap1_sync[1];
     assign dap0    = tx_busy ? tx_dap0 : rx_dap0;
     assign dap2    = 1'bz;              /* not driven by this design */
 
