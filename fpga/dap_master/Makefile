@@ -44,11 +44,14 @@ FABRIC_MHZ := 48
 
 # Pinned, because the placer is randomised and the spread between seeds is
 # several MHz on a design this full - larger than the remaining logic
-# differences - and only a few seeds clear 48 at all.  Seed 24 gives 48.47 MHz
-# and seed 12 gives 48.37; most land between 44 and 47.  A
-# bitstream that only meets timing on a seed nobody recorded is not a design
-# that meets timing.  `bash seedsweep.sh build/board.json <seeds...>` re-checks.
-SEED := 24
+# differences - and only a few seeds clear 48 at all.  Seeds 3 and 12 both give
+# 49.46 MHz and seed 4 gives 49.07; most land between 46 and 48.  A bitstream
+# that only meets timing on a seed nobody recorded is not a design that meets
+# timing.  `bash seedsweep.sh build/board.json <seeds...>` re-checks - and it
+# has to be re-run whenever the netlist changes, since a seed's advantage
+# belongs to the netlist it was found on: the wide-mode datapath left seed 24
+# at 47.92 and failed, having been the best seed before it.
+SEED := 3
 
 bitstream: $(BUILD)/dap_master.bin
 

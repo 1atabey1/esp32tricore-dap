@@ -53,6 +53,19 @@ module dap_frame_tx #(
      * constant here said two, and the next target will have to be swept again.
      */
     input  wire [5:0]            lead,
+    /*
+     * Wide mode: two bits per DAP0 clock, the even bits of the frame on DAP1
+     * and the odd ones on DAP2.
+     *
+     * Sampled once when the frame is loaded rather than used live, so a host
+     * that flips the flag between frames cannot produce half a frame in each
+     * mode.  It changes three things and nothing else: the fields shift two
+     * positions per clock instead of one, every field's last index halves, and
+     * a field with an odd bit count picks up one pad bit.  The pad is whatever
+     * the shift register zero-fills with, which is 0 - required for CMD, and
+     * ignored by the device everywhere else.
+     */
+    input  wire                  wide,
 
     output reg                   busy,
     output reg                   done,       /* one-cycle pulse at the end */
@@ -60,7 +73,11 @@ module dap_frame_tx #(
     /* To the pads.  dat_oe low hands the line to the target. */
     output reg                   dap0,
     output reg                   dap1,
-    output reg                   dat_oe
+    output reg                   dat_oe,
+    /* DAP2 carries the odd bits, and is driven only in wide mode - a line the
+     * design has no use for is better left an input than held at a level. */
+    output reg                   dap2,
+    output reg                   dat2_oe
 );
     localparam [2:0] S_IDLE  = 3'd0,
                      S_LEAD  = 3'd1,   /* the two low clocks before the frame */
@@ -93,12 +110,23 @@ module dap_frame_tx #(
     reg [5:0]  nbits_last;
     reg [5:0]  lead_last;
     reg [62:0] data_r;
+    reg        wide_r;
+
+    /*
+     * Field lengths are counted in clock periods, not bits, so wide mode
+     * halves them: a six-bit field is three periods, and CMD's five bits plus
+     * its pad are three as well.  index therefore still increments by one.
+     */
+    wire [5:0] cmd_last = wide_r ? 6'd2 : 6'd4;
+    wire [5:0] f6_last  = wide_r ? 6'd2 : 6'd5;   /* LEN and CRC, both six */
     /* The finished CRC, latched when the payload runs out and then shifted out
      * like every other field. */
     reg [5:0]  crc_sr;
 
-    /* The bit currently being presented, and whether the CRC should eat it. */
+    /* The bit currently being presented, and whether the CRC should eat it.
+     * In wide mode that is a pair: cur_bit is the even bit, on DAP1. */
     reg        cur_bit;
+    reg        cur_bit2;
     reg        crc_en;
     reg        crc_rst;
     wire [5:0] crc;
@@ -107,7 +135,7 @@ module dap_frame_tx #(
         .clk    (clk),
         .rst    (crc_rst),
         .en     (crc_en),
-        .bit_in (cur_bit), .bit_in2 (1'b0), .wide (1'b0),
+        .bit_in (cur_bit), .bit_in2 (cur_bit2), .wide (wide_r),
         .crc    (crc)
     );
 
@@ -128,12 +156,17 @@ module dap_frame_tx #(
      */
     always @(*) begin
         case (state)
-            S_START: cur_bit = 1'b1;
-            S_CMD:   cur_bit = cmd_r[0];
-            S_LEN:   cur_bit = len_r[0];
-            S_DATA:  cur_bit = data_r[0];
-            S_CRC:   cur_bit = crc_sr[0];
-            default: cur_bit = 1'b0;        /* lead-in and trailing zero */
+            /* The start bit goes out on both lines at once.  It is the only
+             * bit that does, and that is the point of it in wide mode: the
+             * device gets one edge on each line from a known common instant to
+             * align its two capture phases against. */
+            S_START: begin cur_bit = 1'b1;      cur_bit2 = 1'b1;      end
+            S_CMD:   begin cur_bit = cmd_r[0];  cur_bit2 = cmd_r[1];  end
+            S_LEN:   begin cur_bit = len_r[0];  cur_bit2 = len_r[1];  end
+            S_DATA:  begin cur_bit = data_r[0]; cur_bit2 = data_r[1]; end
+            S_CRC:   begin cur_bit = crc_sr[0]; cur_bit2 = crc_sr[1]; end
+            /* lead-in and trailing zero */
+            default: begin cur_bit = 1'b0;      cur_bit2 = 1'b0;      end
         endcase
     end
 
@@ -152,18 +185,58 @@ module dap_frame_tx #(
      * saying, and they mirror the state advance below.
      */
     reg next_bit;
+    reg next_bit2;
+
+    /*
+     * Within a field, "the next slot" is one position along in narrow mode and
+     * two in wide - which is the only place the stride appears, since the
+     * shift registers themselves are shifted by the same amount below.  Naming
+     * the four heads separately keeps that choice a two-way mux on a single
+     * bit rather than a variable shift.
+     */
+    wire cmd_n0  = wide_r ? cmd_r[2]  : cmd_r[1];
+    wire cmd_n1  = cmd_r[3];
+    wire len_n0  = wide_r ? len_r[2]  : len_r[1];
+    wire len_n1  = len_r[3];
+    wire data_n0 = wide_r ? data_r[2] : data_r[1];
+    wire data_n1 = data_r[3];
+    wire crc_n0  = wide_r ? crc_sr[2] : crc_sr[1];
+    wire crc_n1  = crc_sr[3];
 
     always @(*) begin
         case (state)
-            S_LEAD:  next_bit = (index == lead_last) ? 1'b1 : 1'b0;
-            S_START: next_bit = cmd_r[0];
-            S_CMD:   next_bit = (index == 6'd4) ? len_r[0] : cmd_r[1];
-            S_LEN:   next_bit = (index == 6'd5)
-                              ? ((nbits_r == 6'd0) ? crc[0] : data_r[0])
-                              : len_r[1];
-            S_DATA:  next_bit = (index == nbits_last) ? crc[0] : data_r[1];
-            S_CRC:   next_bit = (index == 6'd5) ? 1'b0 : crc_sr[1];
-            default: next_bit = 1'b0;      /* the trailing zero, then idle */
+            S_LEAD: begin
+                next_bit  = (index == lead_last) ? 1'b1 : 1'b0;
+                next_bit2 = next_bit;       /* start bit on both lines */
+            end
+            S_START: begin
+                next_bit  = cmd_r[0];
+                next_bit2 = cmd_r[1];
+            end
+            S_CMD: begin
+                next_bit  = (index == cmd_last) ? len_r[0] : cmd_n0;
+                next_bit2 = (index == cmd_last) ? len_r[1] : cmd_n1;
+            end
+            S_LEN: begin
+                next_bit  = (index == f6_last)
+                          ? ((nbits_r == 6'd0) ? crc[0] : data_r[0])
+                          : len_n0;
+                next_bit2 = (index == f6_last)
+                          ? ((nbits_r == 6'd0) ? crc[1] : data_r[1])
+                          : len_n1;
+            end
+            S_DATA: begin
+                next_bit  = (index == nbits_last) ? crc[0] : data_n0;
+                next_bit2 = (index == nbits_last) ? crc[1] : data_n1;
+            end
+            S_CRC: begin
+                next_bit  = (index == f6_last) ? 1'b0 : crc_n0;
+                next_bit2 = (index == f6_last) ? 1'b0 : crc_n1;
+            end
+            default: begin                 /* the trailing zero, then idle */
+                next_bit  = 1'b0;
+                next_bit2 = 1'b0;
+            end
         endcase
     end
 
@@ -186,11 +259,14 @@ module dap_frame_tx #(
         /* index is loaded at the start of every frame, so it is left out -
          * see the note in the receiver on why this reset list is short. */
         if (rst) begin
-            state  <= S_IDLE;
-            busy   <= 1'b0;
-            dap0   <= 1'b0;
-            dap1   <= 1'b1;      /* parked idle high, probe driving */
-            dat_oe <= 1'b1;
+            state   <= S_IDLE;
+            busy    <= 1'b0;
+            dap0    <= 1'b0;
+            dap1    <= 1'b1;      /* parked idle high, probe driving */
+            dat_oe  <= 1'b1;
+            dap2    <= 1'b1;
+            dat2_oe <= 1'b0;      /* released until a wide frame claims it */
+            wide_r  <= 1'b0;
             tick      <= {DIV_WIDTH{1'b0}};
             tick_done <= (div == {DIV_WIDTH{1'b0}});
             phase     <= 1'b0;
@@ -200,18 +276,25 @@ module dap_frame_tx #(
                 cmd_r   <= cmd;
                 len_r   <= len;
                 nbits_r    <= data_bits;
-                nbits_last <= data_bits - 1'b1;
+                /* One clock per pair in wide mode, so an odd payload and the
+                 * even one above it take the same number of periods - the
+                 * extra slot is the pad bit, and data_r zero-fills it. */
+                nbits_last <= wide ? ((data_bits - 1'b1) >> 1)
+                                   :  (data_bits - 1'b1);
                 lead_r     <= lead;
                 lead_last  <= lead - 1'b1;
                 data_r  <= data;
                 crc_rst <= 1'b1;
                 busy    <= 1'b1;
                 dat_oe  <= 1'b1;
+                wide_r  <= wide;
+                dat2_oe <= wide;
                 /* Zero lead clocks means straight into the start bit. */
                 state   <= (lead == 6'd0) ? S_START : S_LEAD;
                 /* The first bit has to be on the wire before the first rising
                  * edge, which is a whole low phase away. */
                 dap1    <= (lead == 6'd0) ? 1'b1 : 1'b0;
+                dap2    <= (lead == 6'd0) ? 1'b1 : 1'b0;
                 index     <= 6'd0;
                 tick      <= {DIV_WIDTH{1'b0}};
                 tick_done <= (div == {DIV_WIDTH{1'b0}});
@@ -241,6 +324,7 @@ module dap_frame_tx #(
                     dap0  <= 1'b0;
                     phase <= 1'b0;
                     dap1  <= next_bit;   /* changes with the falling edge */
+                    dap2  <= next_bit2;
 
                     /* Advance to the next bit, and the next field when this
                      * one runs out. */
@@ -258,8 +342,9 @@ module dap_frame_tx #(
                             index <= 6'd0;
                         end
                         S_CMD: begin
-                            cmd_r <= {1'b0, cmd_r[4:1]};
-                            if (index == 6'd4) begin
+                            cmd_r <= wide_r ? {2'b0, cmd_r[4:2]}
+                                            : {1'b0, cmd_r[4:1]};
+                            if (index == cmd_last) begin
                                 state <= S_LEN;
                                 index <= 6'd0;
                             end else begin
@@ -267,8 +352,9 @@ module dap_frame_tx #(
                             end
                         end
                         S_LEN: begin
-                            len_r <= {1'b0, len_r[5:1]};
-                            if (index == 6'd5) begin
+                            len_r <= wide_r ? {2'b0, len_r[5:2]}
+                                            : {1'b0, len_r[5:1]};
+                            if (index == f6_last) begin
                                 /* Straight to the CRC when nothing follows -
                                  * which is sync's case, LEN 63 and no data.
                                  * The generator has already absorbed this
@@ -282,7 +368,8 @@ module dap_frame_tx #(
                             end
                         end
                         S_DATA: begin
-                            data_r <= {1'b0, data_r[62:1]};
+                            data_r <= wide_r ? {2'b0, data_r[62:2]}
+                                             : {1'b0, data_r[62:1]};
                             if (index == nbits_last) begin
                                 state  <= S_CRC;
                                 crc_sr <= crc;
@@ -292,8 +379,9 @@ module dap_frame_tx #(
                             end
                         end
                         S_CRC: begin
-                            crc_sr <= {1'b0, crc_sr[5:1]};
-                            if (index == 6'd5) begin
+                            crc_sr <= wide_r ? {2'b0, crc_sr[5:2]}
+                                             : {1'b0, crc_sr[5:1]};
+                            if (index == f6_last) begin
                                 state <= S_TRAIL;
                                 index <= 6'd0;
                             end else begin

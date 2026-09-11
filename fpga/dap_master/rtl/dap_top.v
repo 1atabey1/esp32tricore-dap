@@ -22,13 +22,16 @@
  *   0x07 TRAIL    rw  clocks to issue after a reply
  *   0x08 MAXWAIT  rw  16-bit, low byte first
  *   0x0A PARCELS  rw  block read: parcels minus one, so 0xFF is 256
- *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt)
+ *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt),
+ *                     2 wide mode (DAP1 even bits, DAP2 odd)
  *   0x0C LEAD     rw  idle clocks before each frame
  *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
+ *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
  *   0x10 DATA     rw  64-bit frame payload, low byte first
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
  *   0x25 WAIT     ro  16-bit busy cycle count, low byte first
+ *   0x27 ALIGN    ro  0 DAP2 carried the start bit too (wide mode alignment)
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
  *
  * Everything the device turned out to be fussy about is a register rather than
@@ -55,10 +58,9 @@ module dap_top #(
     output wire dap0,
     inout  wire dap1,
     output reg  trst,
-    /* Left unconnected by the board top: this design has no use for DAP2, and
-     * an unconstrained pad stays an input, which is what a target line nothing
-     * intends to drive should see. */
-    output wire dap2
+    /* Bidirectional in wide mode and an input otherwise: a line the design is
+     * not using is better left undriven than held at a level. */
+    inout  wire dap2
 );
     /* ------------------------------------------------------------------ */
     /* Registers                                                           */
@@ -75,11 +77,29 @@ module dap_top #(
     reg [7:0]  r_parcels;
     reg [63:0] r_data;
     reg        r_no_hunt = 1'b0;  /* FLAGS bit 1: keep the whole reply window */
+    reg        r_wide    = 1'b0;  /* FLAGS bit 2: two bits per DAP0 clock */
+    /*
+     * Per-line capture tap, in fabric clocks back from the sample instant.
+     *
+     * Wide mode needs this and narrow mode does not: the silicon does not
+     * guarantee DAP1 and DAP2 leave the pads together, and at a divider of 0 a
+     * bit period is two fabric clocks, so a skew of one clock between the lines
+     * is half a bit.  A tap per line lets the host sweep the two independently
+     * and keep whichever pair reads sync's 0xAAAAAAAA back correctly - which is
+     * a measurement, not a guess about the board.
+     *
+     * Zero on both is the narrow-mode behaviour exactly, so this costs nothing
+     * until it is used.
+     */
+    reg [1:0]  r_skew1   = 2'd0;
+    reg [1:0]  r_skew2   = 2'd0;
 
     reg [31:0] s_reply;
     reg [5:0]  s_crc;
     reg [15:0] s_wait;
     reg        s_done, s_timed_out, s_idle_high, s_crc_ok, s_overrun;
+    /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
+    reg        s_aligned;
 
     /* ------------------------------------------------------------------ */
     /* SPI                                                                 */
@@ -215,7 +235,8 @@ module dap_top #(
     /* ------------------------------------------------------------------ */
 
     reg         tx_start, rx_start;
-    wire        tx_busy, tx_done, tx_dap0, tx_dap1, tx_oe;
+    wire        tx_busy, tx_done, tx_dap0, tx_dap1, tx_oe, tx_dap2, tx_oe2;
+    wire        rx_aligned;
     wire        rx_busy, rx_done, rx_timed_out, rx_idle_high, rx_crc_ok;
     wire [15:0] rx_wait;
     wire [62:0] rx_payload;
@@ -248,20 +269,38 @@ module dap_top #(
      * is inside the window where the target holds the bit, so it moves where we
      * look rather than what we see.
      */
-    reg [1:0] dap1_sync;
+    /*
+     * Two stages of synchroniser and two more of adjustable delay.
+     *
+     * The first two are the metastability guard and are not optional.  The
+     * extra taps are the per-line capture calibration: r_skew names how many
+     * further clocks back the bit is taken from, so 0 is exactly what narrow
+     * mode always did and 1..3 walk the sample later into the bit.  Delaying
+     * the *sample* rather than advancing the clock is what keeps this out of
+     * the timing path - it is a shift register and a four-way mux on one bit,
+     * nowhere near the frame engines.
+     */
+    reg [4:0] dap1_sync, dap2_sync;
     always @(posedge clk) begin
-        dap1_sync <= {dap1_sync[0], dap1};
+        dap1_sync <= {dap1_sync[3:0], dap1};
+        dap2_sync <= {dap2_sync[3:0], dap2};
     end
-    assign dap1_in = dap1_sync[1];
+    assign dap1_in = dap1_sync[1 + r_skew1];
+    wire   dap2_in = dap2_sync[1 + r_skew2];
+
     assign dap0    = tx_busy ? tx_dap0 : rx_dap0;
-    assign dap2    = 1'bz;              /* not driven by this design */
+    /* DAP2 is an output only while a wide frame is being sent; the reply comes
+     * back on it and every other moment leaves it to the target. */
+    assign dap2    = (tx_busy && tx_oe2) ? tx_dap2 : 1'bz;
 
     dap_frame_tx #(.DIV_WIDTH(8)) u_tx (
         .clk (clk), .rst (rst), .div (r_div),
         .start (tx_start), .cmd (r_cmd), .len (r_len),
         .data_bits (r_dbits), .data (r_data[62:0]), .lead (r_lead),
+        .wide (r_wide),
         .busy (tx_busy), .done (tx_done),
-        .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe)
+        .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe),
+        .dap2 (tx_dap2), .dat2_oe (tx_oe2)
     );
 
     dap_frame_rx #(.DIV_WIDTH(8)) u_rx (
@@ -270,11 +309,13 @@ module dap_top #(
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
+        .wide (r_wide),
+        .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
         .idle_high (rx_idle_high), .crc_ok (rx_crc_ok),
         .payload (rx_payload), .crc (rx_crc),
-        .dap0 (rx_dap0), .dap1_in (dap1_in), .dat_oe (rx_oe)
+        .dap0 (rx_dap0), .dap1_in (dap1_in), .dap2_in (dap2_in), .dat_oe (rx_oe)
     );
 
     /* ------------------------------------------------------------------ */
@@ -332,6 +373,7 @@ module dap_top #(
                         s_timed_out   <= 1'b0;
                         s_idle_high   <= 1'b0;
                         s_crc_ok      <= 1'b0;
+                        s_aligned     <= 1'b0;
                         /*
                          * A block read answers with parcels rather than one
                          * reply: 32 bits each, and a CRC only on the last.
@@ -351,6 +393,7 @@ module dap_top #(
                         s_timed_out <= rx_timed_out;
                         s_idle_high <= rx_idle_high;
                         s_crc_ok    <= rx_crc_ok;
+                        s_aligned   <= rx_aligned;
                         q           <= Q_DONE;
                     end
                 end
@@ -435,6 +478,9 @@ module dap_top #(
         if (rst) begin
             trst      <= 1'b1;         /* released; asserting it resets the target */
             r_no_hunt <= 1'b0;         /* ordinary hunting is the operating mode */
+            r_wide    <= 1'b0;         /* narrow until the host has run DAPISC */
+            r_skew1   <= 2'd0;
+            r_skew2   <= 2'd0;
         end else begin
             if (reg_we) begin
                 case (reg_addr)
@@ -456,6 +502,11 @@ module dap_top #(
                     7'h0B: begin
                         trst      <= ~reg_wdata[0];      /* 1 = assert = drive low */
                         r_no_hunt <=  reg_wdata[1];
+                        r_wide    <=  reg_wdata[2];
+                    end
+                    7'h0F: begin
+                        r_skew1 <= reg_wdata[1:0];
+                        r_skew2 <= reg_wdata[3:2];
                     end
                     7'h10: r_data[7:0]   <= reg_wdata;
                     7'h11: r_data[15:8]  <= reg_wdata;
@@ -529,8 +580,9 @@ module dap_top #(
             4'h8: rd_ctrl = r_maxwait[7:0];
             4'h9: rd_ctrl = r_maxwait[15:8];
             4'hA: rd_ctrl = r_parcels;
-            4'hB: rd_ctrl = {6'd0, r_no_hunt, ~trst};
+            4'hB: rd_ctrl = {5'd0, r_wide, r_no_hunt, ~trst};
             4'hC: rd_ctrl = {2'd0, r_lead};
+            4'hF: rd_ctrl = {4'd0, r_skew2, r_skew1};
             /*
              * How many bytes are waiting.  This is what lets the host drain
              * while the block is still arriving instead of after it: the wire
@@ -568,7 +620,9 @@ module dap_top #(
             3'd4: rd_rep = {2'd0, s_crc};
             3'd5: rd_rep = s_wait[7:0];
             3'd6: rd_rep = s_wait[15:8];
-            default: rd_rep = 8'h00;
+            /* 0x27 ALIGN, in the slot the rep group already spends on a
+             * default - so reading it costs no extra mux level. */
+            default: rd_rep = {7'd0, s_aligned};
         endcase
     end
 

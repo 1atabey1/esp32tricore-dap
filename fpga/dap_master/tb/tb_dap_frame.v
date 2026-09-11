@@ -30,15 +30,18 @@ module tb_dap_frame;
     reg  [5:0]  dbits = 6'd0;
     reg  [62:0] data  = 63'd0;
 
-    wire busy, done, dap0, dap1, dat_oe;
+    reg         wide  = 1'b0;
+
+    wire busy, done, dap0, dap1, dat_oe, dap2, dat2_oe;
 
     dap_frame_tx #(.DIV_WIDTH(8)) dut (
         .clk (clk), .rst (rst),
         .div (8'd1),               /* fast, so the test runs in little time */
         .start (start), .cmd (cmd), .len (len), .data_bits (dbits), .data (data),
-        .lead (6'd2),
+        .lead (6'd2), .wide (wide),
         .busy (busy), .done (done),
-        .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe)
+        .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe),
+        .dap2 (dap2), .dat2_oe (dat2_oe)
     );
 
     /*
@@ -48,16 +51,28 @@ module tb_dap_frame;
      * quietly trimming - a lead-in that went missing is a bug worth failing on.
      */
     reg [95:0] captured;
+    reg [95:0] captured2;
     integer    nbits;
     reg        dap0_d;
 
     always @(posedge clk) begin
         dap0_d <= dap0;
         if (!rst && dap0 && !dap0_d) begin
-            captured[nbits] <= dap1;
-            nbits           <= nbits + 1;
+            captured[nbits]  <= dap1;
+            captured2[nbits] <= dap2;
+            nbits            <= nbits + 1;
         end
     end
+
+    /* Clear both captures and the counter, so a test that forgets one cannot
+     * pass on the previous test's bits. */
+    task restart;
+        begin
+            nbits     = 0;
+            captured  = 96'd0;
+            captured2 = 96'd0;
+        end
+    endtask
 
     /*
      * The same bits, one at a time and two at a time, must land on the same
@@ -150,8 +165,7 @@ module tb_dap_frame;
         $dumpfile("tb_dap_frame.vcd");
         $dumpvars(0, tb_dap_frame);
 
-        nbits    = 0;
-        captured = 96'd0;
+        restart;
         dap0_d   = 1'b0;
 
         repeat (4) @(posedge clk);
@@ -176,8 +190,7 @@ module tb_dap_frame;
         check_eq("crc", (captured >> (LEAD + 12)) & 96'h3F, 64'd9);
 
         $display("LEN 0 frame: CMD 0x10, LEN 0");
-        nbits    = 0;
-        captured = 96'd0;
+        restart;
         len      = 6'd0;
         dbits    = 6'd0;
         @(posedge clk) start = 1'b1;
@@ -198,8 +211,7 @@ module tb_dap_frame;
          * implementations rather than the RTL against itself.
          */
         $display("client_set(1): CMD 0x1C, LEN 3, 3 data bits");
-        nbits    = 0;
-        captured = 96'd0;
+        restart;
         cmd      = 5'h1C;
         len      = 6'd3;
         dbits    = 6'd3;
@@ -212,8 +224,7 @@ module tb_dap_frame;
         check_eq("client_set word", (captured >> LEAD) & 96'h3FFFFF, 64'h1B10F9);
 
         $display("client_read CLIENT_ID: CMD 0x1A, LEN 7, 7 data bits");
-        nbits    = 0;
-        captured = 96'd0;
+        restart;
         cmd      = 5'h1A;
         len      = 6'd7;
         dbits    = 6'd7;
@@ -226,8 +237,7 @@ module tb_dap_frame;
         check_eq("client_read word", (captured >> LEAD) & 96'h3FFFFFF, 64'h1ECF1F5);
 
         $display("client_write IOCONF: CMD 0x08, LEN 16, 16 data bits");
-        nbits    = 0;
-        captured = 96'd0;
+        restart;
         cmd      = 5'h08;
         len      = 6'd16;
         dbits    = 6'd16;
@@ -242,6 +252,92 @@ module tb_dap_frame;
         $display("CRC: one bit per clock against two");
         crc_equivalence;
         check_eq("narrow and wide agree", {58'd0, crc_narrow_result}, {58'd0, c_wide_out});
+
+        /*
+         * Wide mode: the same frames, two bits per clock.
+         *
+         * DAP1 carries the even bits of the frame and DAP2 the odd ones, the
+         * start bit goes out on both lines together, and a field with an odd
+         * bit count picks up one pad bit which the CRC covers.  That last part
+         * is why these CRCs are not the narrow ones: CMD is five bits, so every
+         * frame gains a zero the checksum sees.  Getting the same answer as
+         * narrow would mean the pad was being skipped.
+         *
+         * The expected words come from an independent model of the polynomial
+         * and the interleave, not from running this design and writing down
+         * what it did.
+         */
+        wide = 1'b1;
+
+        $display("wide sync: CMD 0x10, LEN 63, no data");
+        restart;
+        cmd   = 5'h10;
+        len   = 6'd63;
+        dbits = 6'd0;
+        data  = 63'd0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* 1 start + 3 CMD + 3 LEN + 3 CRC + 1 trailing zero. */
+        check_eq("wide sync clocks",  nbits - LEAD, 11);
+        check_eq("wide sync dap1", (captured  >> LEAD) & 96'h7FF, 64'h179);
+        check_eq("wide sync dap2", (captured2 >> LEAD) & 96'h7FF, 64'h371);
+
+        $display("wide client_set(1): CMD 0x1C, LEN 3, 3 data bits");
+        restart;
+        cmd   = 5'h1C;
+        len   = 6'd3;
+        dbits = 6'd3;
+        data  = 63'd1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* An odd payload as well as an odd CMD, so two pad bits. */
+        check_eq("wide client_set clocks", nbits - LEAD, 13);
+        check_eq("wide client_set dap1", (captured  >> LEAD) & 96'h1FFF, 64'h9D);
+        check_eq("wide client_set dap2", (captured2 >> LEAD) & 96'h1FFF, 64'h15);
+
+        $display("wide client_read CLIENT_ID: CMD 0x1A, LEN 7, 7 data bits");
+        restart;
+        cmd   = 5'h1A;
+        len   = 6'd7;
+        dbits = 6'd7;
+        data  = 63'h4F;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("wide client_read clocks", nbits - LEAD, 15);
+        check_eq("wide client_read dap1", (captured  >> LEAD) & 96'h7FFF, 64'h35B9);
+        check_eq("wide client_read dap2", (captured2 >> LEAD) & 96'h7FFF, 64'h1197);
+
+        $display("wide client_write IOCONF: CMD 0x08, LEN 16, 16 data bits");
+        restart;
+        cmd   = 5'h08;
+        len   = 6'd16;
+        dbits = 6'd16;
+        data  = 63'h810;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* An even payload, so the only pad is CMD's. */
+        check_eq("wide client_write clocks", nbits - LEAD, 19);
+        check_eq("wide client_write dap1", (captured  >> LEAD) & 96'h7FFFF, 64'h241);
+        check_eq("wide client_write dap2", (captured2 >> LEAD) & 96'h7FFFF, 64'h9005);
+
+        /* DAP2 is an output only while wide mode is asked for.  Narrow mode
+         * leaves the pad alone, which is the whole reason the enable is
+         * separate from dat_oe. */
+        check_eq("dap2 driven in wide mode", {63'd0, dat2_oe}, 64'd1);
+        wide = 1'b0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("dap2 released in narrow mode", {63'd0, dat2_oe}, 64'd0);
 
         $display("");
         if (errors == 0) begin

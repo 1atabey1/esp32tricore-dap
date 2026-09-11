@@ -75,6 +75,13 @@ module dap_frame_rx #(
      * which is what settled the same question on the CPU path.
      */
     input  wire                  no_hunt,
+    /*
+     * Wide mode: the reply arrives two bits per clock, even bits on DAP1 and
+     * odd ones on DAP2, exactly as the transmitter sends them.
+     *
+     * Latched at start for the same reason the transmitter latches it.
+     */
+    input  wire                  wide,
 
     output reg                   busy,
     output reg                   done,
@@ -83,11 +90,25 @@ module dap_frame_rx #(
     output reg                   timed_out,
     output reg                   idle_high,
     output reg                   crc_ok,
-    output reg  [62:0]           payload,
-    output reg  [5:0]            crc,
+    output wire [62:0]           payload,
+    output wire [5:0]            crc,
+
+    /*
+     * Did DAP2 carry the start bit at the same instant DAP1 did?
+     *
+     * The start bit is the one bit the device drives on both lines together, so
+     * this is the whole alignment check wide mode gets: if the two capture taps
+     * are set right, both lines read 1 at that sample and this comes up.  It is
+     * reported rather than enforced - a reply that fails it is still delivered,
+     * because the point of the bit is to let the host sweep the taps and see
+     * which settings work, and a receiver that refused the frame would hide the
+     * very evidence the sweep needs.
+     */
+    output reg                   start_aligned,
 
     output reg                   dap0,
     input  wire                  dap1_in,
+    input  wire                  dap2_in,
     output reg                   dat_oe        /* low hands the line over */
 );
     localparam [2:0] S_IDLE  = 3'd0,
@@ -130,8 +151,59 @@ module dap_frame_rx #(
     /* A registered copy of (state == S_HUNT), for the busy counter's enable. */
     reg        hunting;
     reg [15:0] max_wait_r;
+    reg        wide_r;
+    /*
+     * index counts bit positions, not samples, and steps by two in wide mode.
+     *
+     * The other way round - counting samples and doubling the index to address
+     * the payload - puts a mux and a shift in front of a 63-bit write decoder,
+     * and that decoder's enables share LUTs with the sample strobe.  It cost
+     * about two and a half megahertz, which wide mode would have handed
+     * straight back.  As a plain register the position reaches the decoder with
+     * nothing in between.
+     */
+    /* Six CRC bits are six samples narrow and three wide. */
+    wire [6:0] crc_last = wide_r ? 7'd2 : 7'd5;
+
+    /*
+     * The two lines are captured into separate registers and interleaved on
+     * the way out, rather than written into one register at a computed
+     * position.
+     *
+     * Both of the obvious ways cost the design its clock.  Making the write
+     * width conditional on wide_r puts the mode flag into all 63 write
+     * enables; addressing one register with `payload[2*index +: 2]` makes
+     * yosys build the position as a carry chain and compare it against every
+     * bit.  Either way the decoder ends up sharing LUTs with the sample
+     * strobe, and the design dropped from 48 MHz to 44.
+     *
+     * Written this way each line has its own fixed single-bit decoder indexed
+     * by a counter that still steps by one - exactly the structure that closed
+     * at 48 before wide mode existed - and the whole mode dependence becomes a
+     * 2:1 mux per bit at the output, which is a clock away from anything and
+     * drives nothing but the top level's reply latch.  The interleave itself
+     * is wiring: DAP1 supplies the even bits and DAP2 the odd ones.
+     */
+    reg [62:0] pay_even;
+    reg [31:0] pay_odd;
+    reg [5:0]  crc_even;    /* six samples narrow, three wide */
+    reg [2:0]  crc_odd;
+
+    genvar g;
+    generate
+        for (g = 0; g < 32; g = g + 1) begin : interleave
+            assign payload[2*g]     = wide_r ? pay_even[g] : pay_even[2*g];
+            if (2*g + 1 < 63)
+                assign payload[2*g+1] = wide_r ? pay_odd[g] : pay_even[2*g+1];
+        end
+        for (g = 0; g < 3; g = g + 1) begin : crc_interleave
+            assign crc[2*g]   = wide_r ? crc_even[g] : crc_even[2*g];
+            assign crc[2*g+1] = wide_r ? crc_odd[g]  : crc_even[2*g+1];
+        end
+    endgenerate
 
     reg        sample;
+    reg        sample2;
     reg        crc_en;
     reg        crc_rst;
     wire       residue_ok;
@@ -140,7 +212,7 @@ module dap_frame_rx #(
         .clk        (clk),
         .rst        (crc_rst),
         .en         (crc_en),
-        .bit_in     (sample), .bit_in2 (1'b0), .wide (1'b0),
+        .bit_in     (sample), .bit_in2 (sample2), .wide (wide_r),
         .residue_ok (residue_ok)
     );
 
@@ -189,13 +261,14 @@ module dap_frame_rx #(
     always @(*) begin
         case (state)
             S_DATA:  index_next = (index == nbits_last) ? 7'd0 : index + 7'd1;
-            S_CRC:   index_next = (index == 7'd5)       ? 7'd0 : index + 7'd1;
+            S_CRC:   index_next = (index == crc_last)   ? 7'd0 : index + 7'd1;
             default: index_next = 7'd0;
         endcase
     end
 
     always @(*) begin
-        sample = dap1_in;
+        sample  = dap1_in;
+        sample2 = dap2_in;
         crc_en = 1'b0;
         if (sample_now && (state == S_DATA || state == S_CRC)) begin
             crc_en = 1'b1;
@@ -238,7 +311,12 @@ module dap_frame_rx #(
                  */
                 dat_oe      <= 1'b0;
                 nbits_r     <= reply_bits;
-                nbits_last  <= reply_bits - 1'b1;
+                /* Samples, not bits: a pair per sample in wide mode, so an
+                 * odd payload and the even one above it take the same count -
+                 * the extra slot is the pad. */
+                nbits_last  <= wide ? ((reply_bits - 1'b1) >> 1)
+                                    :  (reply_bits - 1'b1);
+                wide_r      <= wide;
                 /* No CRC in raw mode: those six clocks are window too. */
                 crc_r       <= expect_crc & ~no_hunt;
                 trail_r     <= trail_clocks;
@@ -270,8 +348,11 @@ module dap_frame_rx #(
                 idle_high   <= 1'b0;
                 crc_ok      <= 1'b0;
                 all_ones    <= 1'b1;
-                payload     <= 63'd0;
-                crc         <= 6'd0;
+                pay_even    <= 63'd0;
+                pay_odd     <= 32'd0;
+                crc_even    <= 6'd0;
+                crc_odd     <= 3'd0;
+                start_aligned <= 1'b0;
             end
         end else begin
             if (!tick_done) begin
@@ -302,6 +383,10 @@ module dap_frame_rx #(
                                 state <= (nbits_r == 7'd0)
                                          ? (has_trail ? S_TRAIL : S_END)
                                          : S_DATA;
+                                /* The one instant both lines carry the same
+                                 * bit, so the one place the taps can be
+                                 * checked against each other. */
+                                start_aligned <= dap2_in;
                                 if (nbits_r == 7'd0) begin
                                     crc_ok <= 1'b1;   /* nothing to check */
                                 end
@@ -321,17 +406,34 @@ module dap_frame_rx #(
                              * - see the note below. */
                         end
                         S_DATA: begin
-                            payload[index[5:0]] <= dap1_in;
-                            all_ones            <= all_ones & dap1_in;
+                            /*
+                             * Two bits every sample, in both modes.
+                             *
+                             * Narrow mode writes DAP2's bit one position ahead
+                             * and then overwrites it on the next sample, so the
+                             * only one that survives is at position nbits -
+                             * outside the payload the caller reads.  Making the
+                             * width conditional instead puts wide_r into all 63
+                             * write enables, which is what the mode flag must
+                             * stay out of.
+                             *
+                             * An odd wide payload picks up one pad bit above
+                             * it, in the same slot the transmitter sends a zero
+                             * into and the caller likewise does not read.
+                             */
+                            pay_even[index[5:0]] <= dap1_in;
+                            pay_odd[index[4:0]]  <= dap2_in;
+                            all_ones <= all_ones & dap1_in & (dap2_in | ~wide_r);
                             if (index == nbits_last) begin
                                 state <= crc_r ? S_CRC
                                        : (has_trail ? S_TRAIL : S_END);
                             end
                         end
                         S_CRC: begin
-                            crc[index[2:0]] <= dap1_in;
-                            all_ones        <= all_ones & dap1_in;
-                            if (index == 7'd5) begin
+                            crc_even[index[2:0]] <= dap1_in;
+                            crc_odd[index[1:0]]  <= dap2_in;
+                            all_ones <= all_ones & dap1_in & (dap2_in | ~wide_r);
+                            if (index == crc_last) begin
                                 state <= has_trail ? S_TRAIL : S_END;
                             end
                         end
