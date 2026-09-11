@@ -19,8 +19,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dap_phy.h"
 #include "dap_probe.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "general.h"
 #include "target.h"
 #include "target_internal.h"
@@ -374,7 +377,16 @@ static void tricore_detach(target_s *target)
 /* Probe                                                                     */
 /* ------------------------------------------------------------------------ */
 
-esp_err_t tricore_bmp_probe(void)
+/*
+ * The DAP opening sequence, used both to probe and to recover after a reset.
+ *
+ * OCDS is enabled through the OEC unlock pattern rather than by resetting the
+ * device, which is measured to work on this part: a hot attach reaches OEN=1,
+ * the miniMCDS ID reads back 0x00D6C007, and a free-running STM reads
+ * differently twice.  A reset is therefore not needed to get *access* - it is
+ * needed for the other reasons in tricore_reset().
+ */
+static esp_err_t attach_dap(void)
 {
     dap_exchange_t x;
 
@@ -395,6 +407,79 @@ esp_err_t tricore_bmp_probe(void)
     if (dap_probe_enable_ocds() != ESP_OK) {
         ESP_LOGE(TAG, "OCDS did not come up; run control needs it");
         return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+/*
+ * Reset the target and take control of it again.
+ *
+ * On this bench the probe's TRST line is wired to the target's reset, so this
+ * restarts the application under test - which is the point.  GDB's `run` asks
+ * for it, and it is the only way to debug anything before main(): a hot attach
+ * lands wherever the application happens to be.
+ *
+ * Everything in the core is gone afterwards, including our triggers, so the
+ * breakpoints BMP believes are set have to be re-armed.  GDB re-inserts them on
+ * the next resume, which is why this does not try to restore them itself - but
+ * the bookkeeping is cleared so nothing claims a trigger that no longer exists.
+ *
+ * What this does *not* do is halt at the reset vector.  The core starts running
+ * the moment reset is released, and re-attaching over DAP takes long enough
+ * that it is well into startup by the time we have control.  Stopping at the
+ * first instruction needs the device's own halt-after-reset request - OSTATE
+ * reports it at bit 8 (HARR) - and the OCNTRL bit that sets it, with its
+ * protection bit, is not something to guess at.
+ */
+static void tricore_reset(target_s *target)
+{
+    (void)target;
+
+    ESP_LOGI(TAG, "resetting the target");
+
+    dap_phy_set_trst(true);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    dap_phy_set_trst(false);
+    /* Let the device come out of reset before expecting it to answer: while it
+     * is resetting the DAP fails every transaction. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* The link is gone with the reset; everything has to be established again. */
+    if (attach_dap() != ESP_OK) {
+        ESP_LOGE(TAG, "the target did not come back after the reset");
+        s_error = true;
+        return;
+    }
+    if (tricore_discover() != ESP_OK) {
+        ESP_LOGE(TAG, "no cores answered after the reset");
+        s_error = true;
+        return;
+    }
+
+    /*
+     * A halt-after-reset trigger left on TR0 by any debugger - including one
+     * the device armed for itself - re-halts the core on every resume.
+     */
+    tricore_disarm_reset_trigger();
+
+    for (int i = 0; i < tricore_core_count(); i++) {
+        const int core = tricore_core_index(i);
+        /* The core's triggers went with the reset; drop our record of them so
+         * nothing claims a slot that is no longer armed. */
+        tricore_bp_clear_kind(core, TRICORE_BP_USER);
+        tricore_bp_clear_kind(core, TRICORE_BP_STEP);
+        tricore_bp_clear_kind(core, TRICORE_BP_WATCH);
+        tricore_bp_clear_kind(core, TRICORE_BP_WATCH_HI);
+        tricore_freeze_timer(core, true);
+    }
+    ESP_LOGI(TAG, "target reset; %d core(s) back", tricore_core_count());
+}
+
+esp_err_t tricore_bmp_probe(void)
+{
+    esp_err_t err = attach_dap();
+    if (err != ESP_OK) {
+        return err;
     }
     err = tricore_discover();
     if (err != ESP_OK) {
@@ -437,11 +522,18 @@ esp_err_t tricore_bmp_probe(void)
         target->breakwatch_clear = tricore_breakwatch_clear;
 
         /*
-         * No reset, no flash.  reset() here would go to the target's reset pin,
-         * which on this bench is shared with the probe's TRST and restarts the
-         * application under test - not something GDB should do implicitly.
-         * Flash needs 64-bit writes through Cerberus, which is untested.
+         * Reset restarts the application under test, because on this bench the
+         * probe's TRST is the target's reset line.  That is what GDB's `run`
+         * means, and what debugging anything before main() requires, so it is
+         * wired up - but it is worth knowing it is not a debug-domain-only
+         * reset: the application really does start again.
+         *
+         * Flash is left unset; it needs 64-bit writes through Cerberus, which
+         * is untested.
          */
+        target->reset = tricore_reset;
+        target->extended_reset = tricore_reset;
+
         ESP_LOGI(TAG, "registered CPU%d as a GDB target", core);
     }
     ESP_LOGI(TAG, "%d core(s) available - attach with GDB on port 4242",
