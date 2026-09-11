@@ -33,6 +33,7 @@
 #include "tricore_bmp.h"
 #include "tricore_flash_probe.h"
 #include "tricore.h"
+#include "dap_phy_fpga.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
@@ -2247,6 +2248,227 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
 }
 
 /*
+ * POST /api/fpga_load - configure the FPGA from an uploaded bitstream.
+ *
+ * Loaded at runtime rather than swapped into the embedded image on purpose.
+ * The DAP-only bitstream replaces the logic analyser, XVC and the Port C
+ * passthrough that the CPU-driven DAP path runs over, so if it is wrong there
+ * is nothing left to debug it with.  Loading it transiently means the boot
+ * default stays the stock image and a reboot is the whole recovery procedure.
+ *
+ *     curl -sk -u admin:admin --data-binary @dap_master.bin \
+ *          https://<board>/api/fpga_load
+ */
+static esp_err_t fpga_load_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    const int total = req->content_len;
+    if (total <= 0 || total > 512 * 1024) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "implausible bitstream size\n");
+        return ESP_OK;
+    }
+
+    /*
+     * Internal DMA-capable RAM, not PSRAM.
+     *
+     * The FPGA is configured by an SPI DMA transfer, and DMA cannot reliably
+     * source from PSRAM - the bitstream that reaches the device is then not the
+     * one that was uploaded, and the only symptom is CDONE failing to come up,
+     * which looks exactly like a bad bitstream.  The embedded image works
+     * because it is sent from flash-mapped rodata.  Cost is ~104 kB of the
+     * ~178 kB of DMA-capable heap, freed as soon as the transfer is done.
+     */
+    /*
+     * PSRAM is fine: the bitstream is bit-banged out a byte at a time by the
+     * CPU, not DMAed, so where it lives does not matter and 104 kB of internal
+     * RAM is not available contiguously anyway.
+     */
+    uint8_t *image = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (image == NULL) {
+        image = heap_caps_malloc(total, MALLOC_CAP_8BIT);
+    }
+    if (image == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "no room for the bitstream\n");
+        return ESP_OK;
+    }
+
+    int got = 0;
+    while (got < total) {
+        const int n = httpd_req_recv(req, (char *)image + got, total - got);
+        if (n <= 0) {
+            free(image);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "upload did not complete\n");
+            return ESP_OK;
+        }
+        got += n;
+    }
+
+    dap_capture_begin();
+    ESP_LOGW(TAG, "configuring the FPGA from %d uploaded bytes", got);
+
+    /*
+     * Whatever the fabric held, it is about to stop holding it.  Without this
+     * the next route check finds the link already "up", skips the probe that
+     * proves the DAP image is loaded, and runs against a register file back at
+     * its reset values - which showed up as sync returning zero on a route
+     * that had worked a minute earlier, with nothing pointing at the reload.
+     */
+    dap_phy_fpga_invalidate();
+
+    /*
+     * Put the configuration pins back under GPIO control first.
+     *
+     * ICE_FPGA_Config bit-bangs the bitstream with gpio_set_level, and a pad
+     * routed to the SPI peripheral ignores that completely - the writes go
+     * nowhere and CDONE simply never comes up, which looks exactly like a bad
+     * bitstream.  At boot this works because ICE_Init() calls
+     * init_gpio_spipins_as_gpio() after bringing SPI2 up; nothing does that for
+     * a load requested later, once SPI2 owns the pads again.
+     *
+     * gpio_config() is what does the work: it resets the pad's IO_MUX function
+     * to GPIO, which re-routing the matrix output alone would not.
+     */
+    const gpio_config_t cfg_out = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    const gpio_config_t cfg_in = {
+        .mode         = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_MISO),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg_out);
+    gpio_config(&cfg_in);
+
+    const uint8_t status = ICE_FPGA_Config(image, (uint32_t)got);
+    free(image);
+
+    /*
+     * A non-zero status means CDONE never came up, which is the FPGA saying it
+     * did not accept the image - a truncated upload, or a bitstream built for
+     * another device.  Worth failing loudly: the board carries on working
+     * either way, and a half-configured FPGA is the sort of thing that would
+     * otherwise be blamed on the protocol later.
+     */
+    char verdict[96];
+    snprintf(verdict, sizeof(verdict),
+             "\n=== FPGA config %s (status %u) ===\n",
+             status == 0 ? "accepted, CDONE up" : "REFUSED", status);
+    dap_capture_end(req, verdict);
+    return ESP_OK;
+}
+
+/*
+ * GET /api/fpga_pins - read the ESP32 side of the FPGA link as plain GPIO.
+ *
+ * For the question a loaded-but-silent bitstream raises: can the fabric drive
+ * these pads as user IO at all once configuration is over?  Loading an image
+ * that holds MISO at a known level and reading it here answers that with one
+ * bit, without trusting the SPI peripheral, the register map or the protocol.
+ */
+static esp_err_t fpga_pins_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    /* Read them as inputs, which costs the SPI routing - restored by the next
+     * dap_phy_fpga_init(), which re-points these pads itself. */
+    gpio_set_direction(AEL_PIN_NUM_MISO, GPIO_MODE_INPUT);
+
+    /*
+     * Drive the clock and data pins by hand and report what comes back, so a
+     * pass-through bitstream can prove which ESP32 pin reaches which FPGA pad.
+     * The MISO mapping was confirmed this way; SCK and MOSI never were, and an
+     * unverified assumption there looks exactly like a slave that ignores the
+     * clock.  gpio_config, not gpio_set_direction: only the former puts the
+     * pad's IO_MUX back to GPIO after the SPI peripheral has had it.
+     */
+    const gpio_config_t drive = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&drive);
+
+    int miso_clk[2], miso_mosi[2];
+    for (int level = 0; level < 2; level++) {
+        gpio_set_level(AEL_PIN_NUM_CLK, level);
+        gpio_set_level(AEL_PIN_NUM_MOSI, 0);
+        esp_rom_delay_us(50);
+        miso_clk[level] = gpio_get_level(AEL_PIN_NUM_MISO);
+
+        gpio_set_level(AEL_PIN_NUM_CLK, 0);
+        gpio_set_level(AEL_PIN_NUM_MOSI, level);
+        esp_rom_delay_us(50);
+        miso_mosi[level] = gpio_get_level(AEL_PIN_NUM_MISO);
+    }
+    gpio_set_level(AEL_PIN_NUM_CLK, 0);
+    gpio_set_level(AEL_PIN_NUM_MOSI, 0);
+
+    char line[224];
+    const int n = snprintf(line, sizeof(line),
+        "miso_gpio%d=%d cdone_gpio42=%d  clk_drive[0,1]->miso[%d,%d]  "
+        "mosi_drive[0,1]->miso[%d,%d]\n",
+        AEL_PIN_NUM_MISO, gpio_get_level(AEL_PIN_NUM_MISO), gpio_get_level(42),
+        miso_clk[0], miso_clk[1], miso_mosi[0], miso_mosi[1]);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
+    return ESP_OK;
+}
+
+httpd_uri_t uri_fpga_pins = {
+    .uri      = "/api/fpga_pins",
+    .method   = HTTP_GET,
+    .handler  = fpga_pins_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_fpga_load = {
+    .uri      = "/api/fpga_load",
+    .method   = HTTP_POST,
+    .handler  = fpga_load_handler,
+    .user_ctx = NULL
+};
+
+/*
+ * GET /api/dap_fpga - bring the fabric DAP master up and prove the route.
+ *
+ * Checked in the order that makes a failure name itself: the register file
+ * answers at all, then a sync frame comes back, then a block read matches what
+ * the CPU path reads from the same address.  The last one is the point - it is
+ * the same data by two independent routes.
+ */
+static esp_err_t dap_fpga_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_capture_begin();
+    const esp_err_t err = dap_probe_fpga_route_check();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== the fabric route works ===\n"
+        : "\n=== the fabric route did not come up ===\n");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_fpga = {
+    .uri      = "/api/dap_fpga",
+    .method   = HTTP_GET,
+    .handler  = dap_fpga_handler,
+    .user_ctx = NULL
+};
+
+/*
  * GET /api/dap_gdb/attach - register the TC3xx as a Black Magic Probe target
  * GET /api/dap_gdb/status
  *
@@ -2695,7 +2917,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
      * so a cap set too low takes the *last* endpoints registered off the air
      * with no sign of it but a 404.  Kept well clear of the count.
      */
-    config.httpd.max_uri_handlers = 40;
+    config.httpd.max_uri_handlers = 56;
     config.httpd.stack_size = 10240; // Increased stack for SSL operations
 
     ESP_LOGI(TAG, "Starting HTTPS Server on port: '%d'", config.httpd.server_port);
@@ -2722,6 +2944,9 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_load);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_pins);
+    httpd_register_uri_handler(*http_handle, &uri_dap_fpga);
     httpd_register_uri_handler(*http_handle, &uri_dap_gdb_attach);
     httpd_register_uri_handler(*http_handle, &uri_dap_flash_probe);
     httpd_register_uri_handler(*http_handle, &uri_dap_gdb_status);

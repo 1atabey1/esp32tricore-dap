@@ -178,6 +178,13 @@ esp_err_t dap_probe_bringup_report(void);
 esp_err_t dap_probe_spi_bringup(void);
 
 /*
+ * Bring the fabric DAP master up and prove the route: the register file
+ * answers, sync comes back, and a block read matches what the CPU path reads
+ * from the same address.  Leaves the backend on the CPU path either way.
+ */
+esp_err_t dap_probe_fpga_route_check(void);
+
+/*
  * Sweep the attach variables that are cheap to vary in software - bit rate,
  * how many idle clocks precede the first frame, whether TRST is pulsed, and
  * which LEN the sync frame carries - and report every combination that draws a

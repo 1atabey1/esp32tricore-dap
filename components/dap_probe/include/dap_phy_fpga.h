@@ -44,6 +44,14 @@ esp_err_t dap_phy_fpga_init(void);
 /* True once init has succeeded and the DAP bitstream answered. */
 bool dap_phy_fpga_ready(void);
 
+/*
+ * Forget the link, so the next dap_phy_fpga_init() probes again.  Call this
+ * whenever the FPGA is reconfigured: the fabric's registers go back to their
+ * reset values and the host's picture of them is stale, which shows up as a
+ * route that worked a moment ago returning zeros.
+ */
+void dap_phy_fpga_invalidate(void);
+
 /* Route exchanges through the fabric (true) or leave them to the CPU (false). */
 void dap_phy_fpga_use(bool enable);
 bool dap_phy_fpga_in_use(void);
@@ -64,8 +72,29 @@ esp_err_t dap_phy_fpga_set_div(uint8_t div);
 esp_err_t dap_phy_fpga_set_trail(uint8_t clocks);
 esp_err_t dap_phy_fpga_set_maxwait(uint16_t clocks);
 
+/*
+ * Idle clocks issued before each frame.  Two by default, which is what the
+ * CPU path settles on - but the notes there record eleven as the value that
+ * was actually measured on this target, so it is swept rather than assumed.
+ */
+esp_err_t dap_phy_fpga_set_lead(uint8_t clocks);
+
 /* Assert (low) or release the target reset line. */
 esp_err_t dap_phy_fpga_set_trst(bool asserted);
+
+/*
+ * Keep the whole reply window instead of hunting for a start bit in it.
+ *
+ * A frame that draws no reply reports one fact - the hunt ran out - and that
+ * cannot separate a line the target is holding low from one nothing is
+ * driving, nor show a start bit that arrived at an unexpected moment.  With
+ * this set, `reply` is the first `reply_bits` clocks of the window verbatim,
+ * first clock in bit 0, and no CRC is read or checked.
+ *
+ * This is the fabric's version of dap_probe_set_raw_window(), which is what
+ * settled the same question on the CPU path.
+ */
+esp_err_t dap_phy_fpga_set_raw_window(bool enable);
 
 /*
  * One command and its reply.  `reply_bits` of zero means a bare acknowledge.
