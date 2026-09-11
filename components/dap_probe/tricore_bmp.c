@@ -424,36 +424,78 @@ static esp_err_t attach_dap(void)
  * the next resume, which is why this does not try to restore them itself - but
  * the bookkeeping is cleared so nothing claims a trigger that no longer exists.
  *
- * What this does *not* do is halt at the reset vector.  The core starts running
- * the moment reset is released, and re-attaching over DAP takes long enough
- * that it is well into startup by the time we have control.  Stopping at the
- * first instruction needs the device's own halt-after-reset request - OSTATE
- * reports it at bit 8 (HARR) - and the OCNTRL bit that sets it, with its
- * protection bit, is not something to guess at.
+ * The cores come back *halted at the entry point*, because OSTATE.HARR asks the
+ * startup software to stop them before any application code runs.  That is the
+ * part a reset pin cannot give on its own: pulsing reset starts the application
+ * immediately, and re-attaching over DAP takes long enough that it is well into
+ * startup before there is anything to halt.
  */
+/* Wait for the device to answer over DAP again, re-establishing the link if it
+ * went down with the reset.  Returns false if it never comes back. */
+static bool wait_for_target(int attempts)
+{
+    for (int i = 0; i < attempts; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (tricore_discover() == ESP_OK) {
+            return true;
+        }
+        dap_probe_clear_error_state();
+        /* An application reset should leave the link up, but a heavier reset
+         * takes it down; rebuilding from sync costs little and covers both. */
+        attach_dap();
+    }
+    return false;
+}
+
 static void tricore_reset(target_s *target)
 {
     (void)target;
 
-    ESP_LOGI(TAG, "resetting the target");
-
-    dap_phy_set_trst(true);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    dap_phy_set_trst(false);
-    /* Let the device come out of reset before expecting it to answer: while it
-     * is resetting the DAP fails every transaction. */
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    /* The link is gone with the reset; everything has to be established again. */
-    if (attach_dap() != ESP_OK) {
-        ESP_LOGE(TAG, "the target did not come back after the reset");
-        s_error = true;
-        return;
+    /*
+     * Ask the startup software to stop the cores before any application code
+     * runs, then restart the application through OCDS.  Order matters: HARR is
+     * read by the boot ROM on its way up, so it has to be set before the reset,
+     * not after it.
+     */
+    const bool halt_armed = (tricore_set_halt_after_reset(true) == ESP_OK);
+    if (!halt_armed) {
+        ESP_LOGW(TAG, "could not arm halt-after-reset; the cores will run on");
     }
-    if (tricore_discover() != ESP_OK) {
-        ESP_LOGE(TAG, "no cores answered after the reset");
-        s_error = true;
-        return;
+
+    tricore_request_application_reset();
+
+    if (!wait_for_target(20)) {
+        /*
+         * The OCDS reset did not bring it back.  Fall back to the reset pin,
+         * which is heavier - it takes the debug domain down too, so OCDS and
+         * the link have to be rebuilt - but it is the one that always works.
+         */
+        ESP_LOGW(TAG, "no answer after the OCDS reset; falling back to the reset pin");
+        dap_phy_set_trst(true);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        dap_phy_set_trst(false);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        if (attach_dap() != ESP_OK || !wait_for_target(10)) {
+            ESP_LOGE(TAG, "the target did not come back after the reset");
+            s_error = true;
+            return;
+        }
+    }
+
+    /*
+     * Clear the request now that it has been served, or the next application
+     * reset - including one the application asks for itself - stops the cores
+     * with no debugger expecting it.
+     */
+    if (halt_armed) {
+        tricore_set_halt_after_reset(false);
+    }
+
+    for (int i = 0; i < tricore_core_count(); i++) {
+        const int core = tricore_core_index(i);
+        ESP_LOGI(TAG, "CPU%d is %s after the reset", core,
+                 tricore_is_halted(core) ? "halted" : "running");
     }
 
     /*

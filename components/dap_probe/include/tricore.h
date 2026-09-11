@@ -128,6 +128,30 @@ esp_err_t tricore_request_resume(int core);
 /* Disarm EXEVT, CREVT and SWEVT, for a session that died mid-pause. */
 void tricore_clear_debug_events(int core);
 
+/*
+ * Reset, through OCDS rather than through a reset pin.
+ *
+ * OCNTRL pairs every writable control bit at an odd position 2n+1 with a
+ * write-protection bit at 2n, and the protection bit must be 1 in the same
+ * write or the hardware ignores the change - a write that looks like it took
+ * and did nothing.
+ *
+ * tricore_set_halt_after_reset() sets OSTATE.HARR, which asks the startup
+ * software to stop the cores after an application reset and before any
+ * application code runs.  It is a request to the SSW, not a hardware halt, so
+ * it only works because the boot ROM honours it - but that is what makes it
+ * land at the entry point rather than wherever a trigger happened to be armed,
+ * and it costs no address trigger.
+ *
+ * tricore_request_application_reset() then restarts the application while
+ * leaving the debug infrastructure up, so the link and the OCDS enable survive
+ * it.  That is the difference from pulsing the reset pin, which takes
+ * everything down and has to be rebuilt from sync onwards.
+ */
+esp_err_t tricore_set_halt_after_reset(bool enable);
+bool      tricore_halt_after_reset_pending(void);
+esp_err_t tricore_request_application_reset(void);
+
 /* Stop this core's STM while the core is halted; see the file comment. */
 esp_err_t tricore_freeze_timer(int core, bool enable);
 

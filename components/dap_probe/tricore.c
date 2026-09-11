@@ -21,7 +21,28 @@ static const char *TAG = "TRICORE";
  * quietly accepts the write and reconfigures CPU0 event routing.
  */
 #define CBS_BASE            0xF0000400u
+#define CBS_OCNTRL          0xF000047Cu
 #define CBS_OSTATE          0xF0000480u
+
+/*
+ * OCNTRL is write-only and paired: every control bit sits at an odd position
+ * 2n+1 with its write-protection bit at 2n, and the protection bit has to be
+ * set in the same write or the change is dropped.  A write missing the key
+ * looks like it succeeded and does nothing, which is the failure mode worth
+ * guarding against - so these are always used together.
+ *
+ * Cross-checked two ways before being trusted: OC4/OC4_P at 9/8 is the 0x0300
+ * that dap_probe_enable_ocds() writes and that was watched enabling the
+ * miniMCDS on silicon, and WDTSUS/WDTSUS_P at 13/12 matches what tas-debug
+ * derived independently on the same part.
+ */
+#define OCNTRL_HARR         (1u << 17)   /* OJC0: halt after reset */
+#define OCNTRL_HARR_P       (1u << 16)
+#define OCNTRL_APPRESET     (1u << 31)   /* OJC7/RSTCL3: application reset */
+#define OCNTRL_APPRESET_P   (1u << 30)
+
+#define OSTATE_OEN          (1u << 0)
+#define OSTATE_HARR         (1u << 8)
 
 /* Trigger routing per core: which line this core's break-in input listens to. */
 #define CBS_TRC(core)       (CBS_BASE + 0x20u + 4u * (core))
@@ -364,6 +385,60 @@ void tricore_clear_debug_events(int core)
     wr(core, OFF_CREVT, 0);
     wr(core, OFF_EXEVT, 0);
     wr(core, OFF_SWEVT, 0);
+}
+
+esp_err_t tricore_set_halt_after_reset(bool enable)
+{
+    /*
+     * The protection bit goes in whether the request is being set or cleared:
+     * it is the key that makes the write land at all, not part of the value.
+     */
+    const uint32_t value = OCNTRL_HARR_P | (enable ? OCNTRL_HARR : 0u);
+
+    const esp_err_t err = dap_probe_write32(CBS_OCNTRL, value);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /*
+     * Read it back from OSTATE rather than trusting the write.  OCNTRL is
+     * write-only, so this is the only way to know the key was accepted - and a
+     * dropped write here would show up much later as a reset that failed to
+     * halt, with nothing to connect it to.
+     */
+    if (tricore_halt_after_reset_pending() != enable) {
+        ESP_LOGE(TAG, "OSTATE.HARR did not follow the OCNTRL write");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+bool tricore_halt_after_reset_pending(void)
+{
+    uint32_t ostate = 0;
+
+    if (dap_probe_read32(CBS_OSTATE, &ostate) != ESP_OK) {
+        dap_probe_clear_error_state();
+        return false;
+    }
+    return (ostate & OSTATE_HARR) != 0;
+}
+
+esp_err_t tricore_request_application_reset(void)
+{
+    /*
+     * An application reset restarts the application and leaves the debug
+     * infrastructure running, so the DAP link and the OCDS enable survive it.
+     * That is what makes this better than pulsing the reset pin, which takes
+     * the whole debug domain down with it and has to be rebuilt from sync.
+     *
+     * No error check on the write: the device is resetting as it lands, so the
+     * acknowledge may never come back.  Whether it worked is answered by what
+     * the target looks like afterwards, not by this transaction.
+     */
+    ESP_LOGI(TAG, "requesting an OCDS application reset");
+    dap_probe_write32(CBS_OCNTRL, OCNTRL_APPRESET_P | OCNTRL_APPRESET);
+    dap_probe_clear_error_state();
+    return ESP_OK;
 }
 
 esp_err_t tricore_freeze_timer(int core, bool enable)
