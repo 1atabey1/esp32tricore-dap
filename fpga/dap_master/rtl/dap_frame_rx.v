@@ -163,7 +163,26 @@ module dap_frame_rx #(
      * the falling edge as the divider shrinks; reading it here puts those two
      * clocks on the useful side and removes the divider floor entirely.
      */
-    wire sample_now = (phase == 1'b1) && tick_done;
+    /*
+     * Which edge to sample on depends on how much of a bit period there is.
+     *
+     * DAP1 arrives two clocks late through the synchroniser, so a sample taken
+     * at fabric time T reports the pad at T-2.  Taking it at the end of the
+     * high phase puts that instant two clocks *into* the bit, which is right
+     * for any half period of two clocks or more.
+     *
+     * At a half period of one clock the whole bit is two clocks, so there is
+     * no instant inside it that is two clocks old - the best available is the
+     * middle of the *previous* bit, which is the end of the low phase.  The
+     * reply then arrives one bit period later than it was sent, and that costs
+     * nothing: the start-bit hunt is delayed by exactly the same amount, so
+     * the payload still lines up behind it and the receiver simply issues one
+     * more clock at the end.  This is the "sample on the opposite edge" the
+     * optimisation guide recommends, arrived at from the synchroniser rather
+     * than from the round trip.
+     */
+    reg  sample_phase;
+    wire sample_now = (phase == sample_phase) && tick_done;
 
     reg [6:0] index_next;
 
@@ -223,6 +242,10 @@ module dap_frame_rx #(
                 /* No CRC in raw mode: those six clocks are window too. */
                 crc_r       <= expect_crc & ~no_hunt;
                 trail_r     <= trail_clocks;
+                /* At a half period of one clock there is no instant inside
+                 * the bit that is two clocks old; the low phase's end is the
+                 * middle of the previous one.  See the note above. */
+                sample_phase <= (div == {DIV_WIDTH{1'b0}}) ? 1'b0 : 1'b1;
                 has_trail   <= (trail_clocks != 8'd0);
                 max_wait_r  <= max_wait;
                 /* One subtract here, out of the hot path, instead of an add
@@ -258,9 +281,8 @@ module dap_frame_rx #(
                 tick      <= {DIV_WIDTH{1'b0}};
                 tick_done <= (div == {DIV_WIDTH{1'b0}});
 
+                /* The clock, generated whichever edge the bit is taken on. */
                 if (phase == 1'b0) begin
-                    /* Raise the clock for the second half.  Nothing is
-                     * sampled here - see the note on the sample point below. */
                     if (state != S_END) begin
                         dap0  <= 1'b1;
                         phase <= 1'b1;
@@ -268,32 +290,10 @@ module dap_frame_rx #(
                 end else begin
                     dap0  <= 1'b0;
                     phase <= 1'b0;
+                end
 
-                    /*
-                     * Sample at the END of the high phase, not the low one.
-                     *
-                     * DAP1 reaches this logic two clocks late, through the
-                     * synchroniser, so whenever it is read the value belongs
-                     * to an instant two clocks earlier.  Reading it at the end
-                     * of the low phase therefore samples the pad (half period
-                     * - 2) clocks after the falling edge, and that distance
-                     * shrinks with the divider: at a half period of two clocks
-                     * it lands on the falling edge itself and returns the
-                     * previous bit.  That is where the "divider must be at
-                     * least 2" rule came from - not from the wire, but from
-                     * choosing to read at the earliest useful moment.
-                     *
-                     * The target holds each bit from its falling edge until
-                     * the next one, so the whole bit period is available and
-                     * the end of the high phase is as valid a point as the end
-                     * of the low one.  Read there and the pad instant is
-                     * (half period + divider - 1) clocks after the falling
-                     * edge - near the middle of the bit, and growing rather
-                     * than shrinking as the divider falls.  A half period of
-                     * two clocks is then fine, which is what lets the DAP
-                     * clock reach a quarter of the fabric clock instead of a
-                     * sixth.
-                     */
+                /* The bit, on whichever edge sample_phase names. */
+                if (phase == sample_phase) begin
                     case (state)
                         S_HUNT: begin
                             if (dap1_in) begin

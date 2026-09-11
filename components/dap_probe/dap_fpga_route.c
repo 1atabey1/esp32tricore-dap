@@ -382,7 +382,7 @@ esp_err_t dap_probe_fpga_route_check(void)
          * silicon still answers at is a separate question from what the
          * fabric can emit, and the answer is the rate, so both go in the log.
          */
-        static const uint8_t divs[] = { 11, 5, 3, 2, 1 };
+        static const uint8_t divs[] = { 11, 5, 3, 2, 1, 0 };
 
         ESP_LOGW(TAG, "--- block read throughput ---");
         for (size_t d = 0; d < sizeof(divs); d++) {

@@ -137,6 +137,36 @@ module dap_frame_tx #(
         endcase
     end
 
+    /*
+     * The bit that becomes current at the end of this one.
+     *
+     * Needed because DAP1 has to change *on* the falling edge of DAP0, not a
+     * clock after it.  Assigning dap1 from cur_bit every cycle leaves only
+     * (half period - 1) clocks of setup before the target latches on the
+     * rising edge, which is fine at a divider of 1 and is zero at a divider of
+     * 0 - so the fastest bit rate the clock generator can produce was
+     * unreachable for want of one clock.
+     *
+     * Within a field this is just the next bit of the shift register, since
+     * the fields shift right as they go out; only the field boundaries need
+     * saying, and they mirror the state advance below.
+     */
+    reg next_bit;
+
+    always @(*) begin
+        case (state)
+            S_LEAD:  next_bit = (index == lead_last) ? 1'b1 : 1'b0;
+            S_START: next_bit = cmd_r[0];
+            S_CMD:   next_bit = (index == 6'd4) ? len_r[0] : cmd_r[1];
+            S_LEN:   next_bit = (index == 6'd5)
+                              ? ((nbits_r == 6'd0) ? crc[0] : data_r[0])
+                              : len_r[1];
+            S_DATA:  next_bit = (index == nbits_last) ? crc[0] : data_r[1];
+            S_CRC:   next_bit = (index == 6'd5) ? 1'b0 : crc_sr[1];
+            default: next_bit = 1'b0;      /* the trailing zero, then idle */
+        endcase
+    end
+
     /* The CRC eats CMD, LEN and DATA only, and only once per bit - on the
      * transition into the second half of the bit period. */
     always @(*) begin
@@ -179,6 +209,9 @@ module dap_frame_tx #(
                 dat_oe  <= 1'b1;
                 /* Zero lead clocks means straight into the start bit. */
                 state   <= (lead == 6'd0) ? S_START : S_LEAD;
+                /* The first bit has to be on the wire before the first rising
+                 * edge, which is a whole low phase away. */
+                dap1    <= (lead == 6'd0) ? 1'b1 : 1'b0;
                 index     <= 6'd0;
                 tick      <= {DIV_WIDTH{1'b0}};
                 tick_done <= (div == {DIV_WIDTH{1'b0}});
@@ -189,9 +222,11 @@ module dap_frame_tx #(
              * One bit per two half-periods: present the bit with dap0 low,
              * then raise dap0 for the second half.  The target latches on that
              * rising edge, so the data is already stable when it arrives.
+             *
+             * DAP1 is driven only at the falling edge below, where the field
+             * registers shift, so the data and the clock change together and
+             * the whole low phase is setup time.
              */
-            dap1 <= cur_bit;
-
             if (!tick_done) begin
                 tick      <= tick + 1'b1;
                 tick_done <= (tick + 1'b1 == div);
@@ -205,6 +240,7 @@ module dap_frame_tx #(
                 end else begin
                     dap0  <= 1'b0;
                     phase <= 1'b0;
+                    dap1  <= next_bit;   /* changes with the falling edge */
 
                     /* Advance to the next bit, and the next field when this
                      * one runs out. */

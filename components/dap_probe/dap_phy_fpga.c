@@ -29,18 +29,28 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define FPGA_SPI_HOST   SPI2_HOST
 
 /*
- * 10 MHz.  The fabric runs at 48 MHz and its SPI slave synchronises an
- * asynchronous SCK, so it needs sysclk >= 4x SCK - a 12 MHz ceiling.  The
- * ESP32 divides 80 MHz, and 80/8 lands exactly on 10 with margin, where asking
- * for 12 would land on 11.4 and leave almost none.  Past the ceiling the slave
- * does not degrade gracefully, it drops bits silently.
+ * 11.4 MHz, which is 80/7 and the last step below the ceiling.
  *
- * This started at 1 MHz, which made the link the bottleneck rather than the
- * wire: draining a 1 kB block took about 8 ms of a 13 ms block, and the whole
- * point of putting the master in fabric is that the host is not in the
- * per-parcel loop.  That measured 75 kB/s, against 453 for the CPU path.
+ * The fabric runs at 48 MHz and its SPI slave oversamples an asynchronous SCK,
+ * so it needs sysclk >= 4x SCK - 12 MHz.  Past that it does not degrade
+ * gracefully, it drops bits silently.
+ *
+ * This is the system's bottleneck, and by some margin.  With the wire at
+ * 24 MHz a 1 kB block spends 0.35 ms on the DAP and 0.72 ms shifting the
+ * answer over this link, so every further doubling of the wire - wide mode
+ * included - buys almost nothing until the slave stops oversampling SCK and
+ * clocks it directly.  It started at 1 MHz, where the drain took 8 ms of a
+ * 13 ms block and the whole thing managed 75 kB/s.
  */
-#define FPGA_SPI_HZ     (10 * 1000 * 1000)
+#define FPGA_SPI_HZ     (11400 * 1000)
+
+/*
+ * Bytes to collect per drain while a block is still arriving.  Each drain is a
+ * transaction of its own, so too small and the per-transaction overhead
+ * outweighs the overlap; too large and the last chunk waits on the whole block
+ * anyway.  Half a block is the compromise.
+ */
+#define DRAIN_CHUNK     512
 
 /* Register map, mirrored from fpga/dap_master/rtl/dap_top.v. */
 #define REG_STATUS      0x00
@@ -57,12 +67,6 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_LEAD        0x0C
 #define REG_LEVEL       0x0D    /* 16-bit, bytes waiting in the reply FIFO */
 
-/*
- * Bytes to collect per drain while a block is still arriving.  Each drain is a
- * transaction of its own, so too small and the overhead outweighs the overlap;
- * too large and the last chunk waits on the whole block anyway.
- */
-#define DRAIN_CHUNK     256
 #define REG_DATA        0x10
 #define REG_REPLY       0x20
 #define REG_RCRC        0x24
@@ -402,22 +406,19 @@ esp_err_t dap_phy_fpga_set_div(uint8_t div)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (div < 1) {
-        /*
-         * One is the floor, and it is the clock generator's rather than the
-         * synchroniser's: a divider of zero is a half period of one fabric
-         * clock, which leaves no room to both raise and lower DAP0.
-         *
-         * This used to refuse anything below 2, because the receiver sampled
-         * DAP1 at the end of the low phase and saw it two clocks late, so the
-         * pad instant it read walked toward the falling edge as the divider
-         * shrank.  The receiver now samples at the end of the high phase,
-         * where those two clocks are headroom instead of a deficit, and the
-         * limit went with it - which is worth a full 50% of the bit rate.
-         */
-        ESP_LOGW(TAG, "divider 0 leaves no room for a clock edge; using 1");
-        div = 1;
-    }
+    /*
+     * Zero is a real setting: a one-clock half period, so DAP0 runs at half
+     * the fabric clock and a bit costs two clocks.  24 MHz on a 48 MHz fabric.
+     *
+     * It took both ends of the bit to get there.  The transmitter used to
+     * change DAP1 a clock *after* the falling edge, which leaves (half period
+     * - 1) clocks of setup - fine at a divider of 1 and nothing at all at 0 -
+     * so the data moved as the target latched it.  And the receiver sees DAP1
+     * two clocks late through its synchroniser, so at a two-clock bit there is
+     * no instant inside the bit that old; it samples the middle of the
+     * previous bit instead and the whole reply simply arrives one bit later,
+     * which costs nothing because the start-bit hunt shifts with it.
+     */
     return reg_write8(REG_DIV, div);
 }
 

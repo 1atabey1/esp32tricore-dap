@@ -14,8 +14,22 @@
 
 module tb_dap_top;
 
+    /*
+     * 50 MHz, near the 48 the hardware runs at, because the timing this bench
+     * is now asked to prove is measured in fabric clocks against a round trip
+     * that does not scale with them.
+     */
     reg clk = 1'b0;
-    always #5 clk = ~clk;          /* 100 MHz fabric */
+    always #10 clk = ~clk;
+
+    /*
+     * What the target's reply costs to get back: FPGA output driver, PCB, the
+     * TC38x pad, and the FPGA input. The guide puts it at 6-12 ns; 8 is the
+     * middle of that. Without it the bench samples an ideal wire and says
+     * nothing about whether the capture point has any margin - which is the
+     * whole question at the highest bit rates.
+     */
+    localparam TARGET_DELAY = 8;
 
     reg rst = 1'b1;
 
@@ -28,7 +42,8 @@ module tb_dap_top;
     /* The fake target drives dap1 only when the master has let go. */
     reg  target_drive = 1'b0;
     reg  target_bit   = 1'b1;
-    assign dap1 = target_drive ? target_bit : 1'bz;
+    wire dap1_driven = target_drive ? target_bit : 1'bz;
+    assign #TARGET_DELAY dap1 = dap1_driven;
 
     dap_top #(.FIFO_DEPTH(64)) dut (
         .clk (clk), .rst (rst),
@@ -375,6 +390,46 @@ module tb_dap_top;
          * which is why the limit went unnoticed in simulation and turned up as
          * a rule in the host instead.
          */
+        /*
+         * ---- the fastest bit rate the clock generator can make ----
+         *
+         * DIV 0 is a one-clock half period: DAP0 at half the fabric clock,
+         * one bit every two clocks.  Both ends of the bit are tight at that
+         * rate, and both were wrong before - the transmitter changed DAP1 a
+         * clock after the falling edge, leaving no setup at all, and the
+         * receiver had no instant inside the bit old enough to sample.  With
+         * an 8 ns round trip modelled, this passing is the claim that the
+         * data really is stable when the target latches it.
+         */
+        $display("the fastest divider: sync at DIV 0");
+        wr(7'h02, 8'd0);
+        wr(7'h03, 8'h10);
+        wr(7'h04, 8'd63);
+        wr(7'h05, 8'd0);
+        wr(7'h06, 8'd32);
+
+        sent_bits = 0;
+        sent      = 96'd0;
+
+        fork
+            wr(7'h01, 8'h01);
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                send_parcel(32'hAAAAAAAA, 1'b1);
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("DIV 0 crc_ok", scratch[4], 1'b1);
+        check("DIV 0 not timed out", scratch[2], 1'b0);
+        rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
+        check("DIV 0 reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
+        /* The frame it sent has to still be the right one at this rate. */
+        check("DIV 0 sync word", (sent >> 2) & 96'h7FFFF, 32'h09FE1);
+
         $display("the lowest divider: sync at DIV 1");
         wr(7'h02, 8'd1);
         wr(7'h03, 8'h10);      /* CMD  = sync */
