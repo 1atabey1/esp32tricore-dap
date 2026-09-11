@@ -20,14 +20,41 @@
 #
 #     PC01 = DAP2, PC02 = DAP0 (clock), PC03 = DAP1 (data), PC04 = TRST
 #
-# The ESP32 link pins are deliberately absent.  The schematic shows both the
-# FPGA configuration SPI and the LCD SPI reaching the ESP32, and the firmware
-# names pins that line up with neither cleanly - ICE_SPI_* on 8/18/14/21
-# against BANK1 labels GPIO14/GPIO38/GPIO21/GPIO09.  Guessing there would put
-# the command link on the wrong pads, so it waits for the same two-way
-# confirmation the pins below already have.
-
 set_io dap2     34   # IO08 -> PC01
 set_io dap0     32   # IO09 -> PC02, the clock this master generates
 set_io dap1     31   # IO10 -> PC03, the bidirectional data line
 set_io trst     28   # IO11 -> PC04, target reset on this bench
+
+# The ESP32 link, which is the FPGA's own configuration SPI reused as user IO
+# once the bitstream is loaded.  That is not a liberty: the stock image already
+# does logic-analyser capture readback over these same pins, so post-config
+# reuse is demonstrated on this board rather than assumed from the datasheet.
+#
+# Confirmed the same two ways as the pins above, plus a third:
+#
+#   * the firmware names one set of pins for both jobs - ICE_SPI_* (the live
+#     #else branch; both board-variant macros are commented out) and
+#     AEL_PIN_NUM_* are the same four GPIOs, so configuration and runtime data
+#     share one bus;
+#   * ICE_CRST_PIN 46 and ICE_CDONE_PIN 42 match the schematic's GPIO46 ->
+#     creset_b and GPIO42 -> CDONE exactly, which independently validates the
+#     schematic reading for this bank;
+#   * all four IOBs carry configuration in the stock bitstream and sit at y=0,
+#     the UP5K bottom edge, which is BANK1 as the schematic shows.
+#
+# The crossover is forced by the roles and does not depend on reading rows off
+# a drawing: the ESP32 is master, so its MOSI reaches the FPGA's slave-in and
+# its MISO comes from the FPGA's slave-out.
+#
+# The FPGA is the slave here: sck, si and ss are inputs, so is the only
+# output.
+set_io spi_sck  16   # <- ESP32 GPIO38
+set_io spi_si   15   # <- ESP32 GPIO14 (its MOSI)
+set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
+set_io spi_ss   17   # <- ESP32 GPIO21 (its CS0)
+
+# Not located yet: CS1..CS3 on ESP32 GPIO13, GPIO11 and GPIO5.  The stock
+# design uses them to address different functions in the fabric.  A DAP-only
+# image needs one chip select, which CS0 already provides, so these are left
+# out rather than guessed at - but they are the obvious place to put a second
+# channel if the command and trace streams ever want separating.
