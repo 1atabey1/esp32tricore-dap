@@ -78,3 +78,13 @@ set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
 # image needs one chip select, which CS0 already provides, so these are left
 # out rather than guessed at - but they are the obvious place to put a second
 # channel if the command and trace streams ever want separating.
+
+# Two clocks now, and they are not the same speed.
+#
+# The SPI slave clocks its shift register straight from SCK rather than
+# oversampling it, so SCK is a real clock domain and nextpnr constrains it like
+# one.  Left to the global --freq it is held to 48 MHz, which it never runs at
+# and cannot quite meet; what it actually has to meet is whatever the host
+# drives, and 30 leaves room above the 24 the ESP32 can produce.
+set_frequency clk 48
+set_frequency spi_sck 30

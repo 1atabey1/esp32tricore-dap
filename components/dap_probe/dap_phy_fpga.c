@@ -42,7 +42,7 @@ extern esp_err_t spi_release_xvc_bus(void);
  * clocks it directly.  It started at 1 MHz, where the drain took 8 ms of a
  * 13 ms block and the whole thing managed 75 kB/s.
  */
-#define FPGA_SPI_HZ     (11400 * 1000)
+#define FPGA_SPI_HZ     (40000 * 1000)
 
 /*
  * Bytes to collect per drain while a block is still arriving.  Each drain is a
