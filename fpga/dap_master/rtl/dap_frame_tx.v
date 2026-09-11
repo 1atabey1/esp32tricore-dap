@@ -107,7 +107,7 @@ module dap_frame_tx #(
         .clk    (clk),
         .rst    (crc_rst),
         .en     (crc_en),
-        .bit_in (cur_bit),
+        .bit_in (cur_bit), .bit_in2 (1'b0), .wide (1'b0),
         .crc    (crc)
     );
 

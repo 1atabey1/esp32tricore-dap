@@ -59,6 +59,74 @@ module tb_dap_frame;
         end
     end
 
+    /*
+     * The same bits, one at a time and two at a time, must land on the same
+     * CRC.
+     *
+     * Wide mode puts the even bits of a frame on DAP1 and the odd ones on DAP2
+     * and sends a pair per clock, so the CRC has to absorb two bits in one
+     * cycle.  That is the same step function applied twice, not a different
+     * polynomial - and this is where that claim is checked, before any of the
+     * datapath is built on top of it.
+     */
+    reg        c_rst = 1'b1, c_en = 1'b0, c_wide = 1'b0;
+    reg        c_b0 = 1'b0, c_b1 = 1'b0;
+    wire [5:0] c_narrow, c_wide_out;
+
+    dap_crc6_gen u_narrow (
+        .clk (clk), .rst (c_rst), .en (c_en & ~c_wide),
+        .bit_in (c_b0), .bit_in2 (1'b0), .wide (1'b0), .crc (c_narrow)
+    );
+    dap_crc6_gen u_wide (
+        .clk (clk), .rst (c_rst), .en (c_en & c_wide),
+        .bit_in (c_b0), .bit_in2 (c_b1), .wide (1'b1), .crc (c_wide_out)
+    );
+
+    /* An awkward pattern rather than a tidy one: alternating bits would hide a
+     * swapped pair, which is the mistake this is looking for. */
+    localparam [15:0] CRC_PATTERN = 16'b1101_0010_1011_0001;
+
+    /* Captured before the wide pass, because both instances share one reset
+     * and the second pass would otherwise wipe the first one's answer. */
+    reg [5:0] crc_narrow_result;
+
+    /*
+     * Stimulus changes on the falling edge, never the rising one.
+     *
+     * Driving it either side of `@(posedge clk)` races the design: both the
+     * task and the DUT's always block wake on that edge, and whether the DUT
+     * reads the old value or the new one is a scheduling detail.  The first
+     * version of this did exactly that, and both CRCs came out wrong - neither
+     * matching a model of the same bits - which is the tell that the bench was
+     * at fault rather than the logic.  There is exactly one rising edge
+     * between two falling ones, so this feeds exactly one bit per step.
+     */
+    task crc_equivalence;
+        integer i;
+        begin
+            c_en = 1'b0;
+            @(negedge clk); c_rst = 1'b1; c_wide = 1'b0;
+            @(negedge clk); c_rst = 1'b0;
+            for (i = 0; i < 16; i = i + 1) begin
+                c_b0 = CRC_PATTERN[i];
+                c_en = 1'b1;
+                @(negedge clk);
+            end
+            c_en = 1'b0;
+            crc_narrow_result = c_narrow;
+
+            @(negedge clk); c_rst = 1'b1; c_wide = 1'b1;
+            @(negedge clk); c_rst = 1'b0;
+            for (i = 0; i < 16; i = i + 2) begin
+                c_b0 = CRC_PATTERN[i];
+                c_b1 = CRC_PATTERN[i + 1];
+                c_en = 1'b1;
+                @(negedge clk);
+            end
+            c_en = 1'b0;
+        end
+    endtask
+
     integer errors = 0;
 
     task check_eq;
@@ -170,6 +238,10 @@ module tb_dap_frame;
         @(posedge clk);
         check_eq("frame length", nbits - LEAD, 35);
         check_eq("client_write word", (captured >> LEAD) & 96'h7FFFFFFFF, 64'h240810411);
+
+        $display("CRC: one bit per clock against two");
+        crc_equivalence;
+        check_eq("narrow and wide agree", {58'd0, crc_narrow_result}, {58'd0, c_wide_out});
 
         $display("");
         if (errors == 0) begin

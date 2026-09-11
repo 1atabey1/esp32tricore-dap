@@ -140,7 +140,7 @@ module dap_frame_rx #(
         .clk        (clk),
         .rst        (crc_rst),
         .en         (crc_en),
-        .bit_in     (sample),
+        .bit_in     (sample), .bit_in2 (1'b0), .wide (1'b0),
         .residue_ok (residue_ok)
     );
 

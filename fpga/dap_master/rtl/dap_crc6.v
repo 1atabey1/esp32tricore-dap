@@ -14,6 +14,14 @@
  *
  * Both are fed one bit per clock with `en` high, LSB of the frame first, which
  * is transmission order.
+ *
+ * Wide mode feeds two bits per clock instead, because it puts the even bits of
+ * the frame on DAP1 and the odd ones on DAP2 and sends a pair per clock.  The
+ * CRC still covers the frame in transmission order, so a pair is absorbed as
+ * bit_in then bit_in2 - the same step function applied twice in one cycle
+ * rather than a different polynomial.  That equivalence is worth stating
+ * because it is testable: the same bits through either path must land on the
+ * same CRC, and tb_dap_frame checks exactly that.
  */
 
 `default_nettype none
@@ -23,6 +31,8 @@ module dap_crc6_gen (
     input  wire       rst,      /* synchronous, reloads the seed */
     input  wire       en,
     input  wire       bit_in,
+    input  wire       bit_in2,  /* the odd bit of the pair, wide mode only */
+    input  wire       wide,
     output wire [5:0] crc
 );
     localparam [5:0] GALOIS_POLY = 6'h30;
@@ -30,15 +40,23 @@ module dap_crc6_gen (
 
     reg [5:0] state;
 
-    wire feedback = state[0] ^ bit_in;
+    /* Shift right, and fold the polynomial back in on a set feedback. */
+    function [5:0] step;
+        input [5:0] s;
+        input       b;
+        begin
+            step = (s[0] ^ b) ? ({1'b0, s[5:1]} ^ GALOIS_POLY)
+                              :  {1'b0, s[5:1]};
+        end
+    endfunction
 
     always @(posedge clk) begin
         if (rst) begin
             state <= GALOIS_SEED;
         end else if (en) begin
-            /* Shift right, and fold the polynomial back in on a set feedback. */
-            state <= feedback ? ({1'b0, state[5:1]} ^ GALOIS_POLY)
-                              :  {1'b0, state[5:1]};
+            /* bit_in is the earlier bit of the pair, so it goes first. */
+            state <= wide ? step(step(state, bit_in), bit_in2)
+                          : step(state, bit_in);
         end
     end
 
@@ -51,6 +69,8 @@ module dap_crc6_check (
     input  wire       rst,
     input  wire       en,
     input  wire       bit_in,
+    input  wire       bit_in2,  /* the odd bit of the pair, wide mode only */
+    input  wire       wide,
     output wire       residue_ok   /* valid once the whole frame has been fed */
 );
     localparam [5:0] FIBO_POLY = 6'h03;
@@ -60,13 +80,20 @@ module dap_crc6_check (
 
     /* The taps named by FIBO_POLY, XORed with the incoming bit and shifted in
      * at the top.  FIBO_POLY is 6'h03, so the taps are bits 0 and 1. */
-    wire feedback = bit_in ^ state[0] ^ state[1];
+    function [5:0] step;
+        input [5:0] s;
+        input       b;
+        begin
+            step = {b ^ s[0] ^ s[1], s[5:1]};
+        end
+    endfunction
 
     always @(posedge clk) begin
         if (rst) begin
             state <= FIBO_SEED;
         end else if (en) begin
-            state <= {feedback, state[5:1]};
+            state <= wide ? step(step(state, bit_in), bit_in2)
+                          : step(state, bit_in);
         end
     end
 
