@@ -650,27 +650,80 @@ reply CRC-valid, in one sequence with no retries.
 === bring-up PASSED (0 failures) ===
 ```
 
-**Phases 1 and 3 are done, and the throughput goal is already met.** Block
-reads run at 116 kB/s from a bit-banged GPIO PHY - three times the 38 kB/s
-miniWiggler ceiling that forced the 12x publish-rate cut - with no FPGA work at
-all:
+**Phases 1 and 3 are done, and the throughput goal is met with room to
+spare.** Block reads run at **453 kB/s** from a bit-banged GPIO PHY - twelve
+times the 38 kB/s miniWiggler ceiling that forced the 12x publish-rate cut -
+with no FPGA work at all:
 
-| bit rate setting | 1 kB blocks | throughput |
-|---|---|---|
-| 400 kHz | 8/8 | 33 kB/s |
-| 1 MHz | 8/8 | 64 kB/s |
-| 2 MHz | 8/8 | 91 kB/s |
-| 4 MHz | 8/8 | **116 kB/s** |
+| bit rate setting | 1 kB blocks | throughput | single-word reads |
+|---|---|---|---|
+| 400 kHz | 8/8 | 40 kB/s | 5 714/s |
+| 1 MHz | 8/8 | 97 kB/s | 12 345/s |
+| 2 MHz | 8/8 | 177 kB/s | 20 408/s |
+| 4 MHz | 8/8 | 302 kB/s | 29 411/s |
+| 6 MHz | 8/8 | 351 kB/s | 32 258/s |
+| 8 MHz | 8/8 | 419 kB/s | 34 482/s |
+| 12 MHz | 8/8 | 440 kB/s | 37 037/s |
+| 16 MHz | 8/8 | **453 kB/s** | 37 037/s |
 
-Single-word register reads, for comparison, run 4739/s at 400 kHz rising to
-14084/s at the 4 MHz setting, 200/200 CRC-valid at every rate.
+200/200 single reads are correct with valid CRCs at every rate, so these are
+not optimistic numbers taken from a marginal wire.
 
-Those numbers also calibrate the rest of the budget. 33.5 us per word against
-33 bits per word puts the *effective* bit rate at about 1 MHz, so the GPIO call
-overhead - not the protocol - is the limit, and the table above is a measurement
-of the bit-bang loop rather than of DAP. A GP-SPI PHY at 20 MHz should give
-about 2.4 MB/s at the pins, which is what this document already predicted, and
-which would cover the six-signal 800 kB/s case without the FPGA.
+The first version of this table stopped at 116 kB/s, and the reason it did is
+worth keeping: `gpio_set_level()` is a function call that re-derives the
+register and the bit for every edge, and 33.5 us per 33-bit word put the
+*effective* bit rate near 1 MHz against a 4 MHz setting. The wire was idle most
+of the time. Driving the two pins through precomputed `out1_w1ts`/`out1_w1tc`
+masks, and subtracting the per-edge cost from the half-period spin, was worth
+4x on its own - more than the FPGA was ever going to be worth for this case.
+
+The curve flattens above 12 MHz, where what is left is loop overhead rather
+than the device or the wire. That is also the honest ceiling of this approach:
+453 kB/s covers the six-signal 800 kB/s trace case only in bursts, and the
+autonomous drain of Phase 4 is what closes that gap rather than a faster PHY.
+
+**The GP-SPI backend does not work, and the shape of the failure is
+informative.** It is in the tree (`dap_phy_spi.c`, selectable at runtime
+through `/api/dap_spi`) and it gets further than it looks: `sync` answers
+0xAAAAAAAA with a valid CRC, `client_set` is acknowledged - and then the
+following `client_read` draws no reply at all. What has been ruled out, each
+with a check that stayed in the code:
+
+- *Bit order and frame length.* A full-duplex echo of the real 19-bit `sync`
+  frame reads back identically, `1000011111111001000`, so the wire carries
+  exactly what the frame layer built, partial trailing byte included.
+- *Clocking.* Sampling the clock pad through its own GPIO input during a
+  1280-bit transfer sees both levels in roughly equal measure.
+- *Pad routing.* Both pads report the SPI signal indices, and a byte written on
+  the data pad reads straight back.
+
+What is left is clock *accounting*. The device is sensitive to how many clocks
+follow a reply: a 48-bit raw dump of `sync`'s window - ten clocks more than the
+reply needs - makes the next command go quiet, on the bit-bang backend too.
+The bit-banged path happens to get this exactly right because it samples
+*before* raising the clock, so it issues `wait+1+n` clocks for an n-bit reply,
+landing precisely on the last CRC bit, and `wait+1` for a bare acknowledge, one
+clock past the start bit. A window of "reply plus fixed slack" cannot reproduce
+both, because the right slack depends on how many busy cycles the device
+inserted, and that differs per command: `sync` answers with none, `client_set`
+with one. The SPI path now sizes its window from a learned wait count for that
+reason, which fixed `sync` and is not yet enough for what follows.
+
+Anyone picking this up should start there, and should not repeat two dead ends
+that cost real time here:
+
+- **SPI3 is not free.** It looks like the LCD's, but the FPGA bitstream loader
+  and every logic-analyser capture go through a device on it as well
+  (`gbl_spi_h1`, added to `SPI_HOST_USED` in `spi_master_init()`). Taking it
+  means the bitstream never loads, the DAP pins never reach the connector, and
+  the target goes silent in a way that looks exactly like a protocol fault. The
+  backend uses SPI2 and asks the application for it through
+  `spi_release_xvc_bus()`, which is safe because XVC is the thing DAP replaces.
+- **`gpio_set_direction(OUTPUT)` unroutes the pad.** It ends by setting
+  `func_out_sel_cfg[pin].func_sel = SIG_GPIO_OUT_IDX`, to guarantee no
+  peripheral is left driving, so calling it *after* wiring an SPI signal
+  quietly undoes the wiring - and `turnaround_to_write()` calls it on every
+  exchange. Direction first, signal second, and re-wire after each turnaround.
 
 Every value this document predicted for those steps was right. What it had
 wrong was the *mechanics* around them, and those cost more debugging time than
@@ -884,11 +937,16 @@ read - see "Attach, as it actually works on silicon". 1b and 1c were never
 needed to get here: the bit-bang PHY carried the whole of Phases 1 and 3, and
 block reads out of it already run at three times the miniWiggler baseline.
 
-**1c is now the highest-value remaining work.** The measured 116 kB/s is limited
-by GPIO call overhead, not by the protocol - about 1 MHz effective against a
-4 MHz setting - so replacing the clocking with GP-SPI and DMA is what buys the
-order of magnitude the trace case needs. 1b's turnaround question is settled by
-the specification and by every exchange since.
+**1c is done, by the other route.** The measured 116 kB/s was limited by GPIO
+call overhead rather than by the protocol, and the fix was to remove that
+overhead rather than to replace the clocking: driving the pins through the GPIO
+registers took block reads to 453 kB/s and single-word reads to 37k/s, all
+CRC-valid. The GP-SPI backend is in the tree and gets as far as `sync` before
+the clock accounting defeats it - see "Attach, as it actually works on silicon"
+for what has been ruled out and where to resume. It is no longer on the
+critical path: nothing in Phases 4 or 5 needs more than 453 kB/s, and the trace
+case needs the autonomous drain, not a faster PHY. 1b's turnaround question is
+settled by the specification and by every exchange since.
 
 #### Phase 2 - A second, DAP-only bitstream (2-3 weeks, and possibly deferrable)
 
