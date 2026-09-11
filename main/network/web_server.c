@@ -30,6 +30,8 @@
 #include "../port_cfg.h"
 #include "dap_probe.h"
 #include "dap_trace.h"
+#include "gdb_rsp.h"
+#include "tricore.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
@@ -2243,6 +2245,76 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * GET /api/dap_gdb/start  - attach and start the TriCore GDB server
+ * GET /api/dap_gdb/stop
+ * GET /api/dap_gdb/status
+ *
+ * Started on request rather than at boot, and on 4243 rather than 4242, because
+ * Black Magic's own GDB server is already listening on 4242 and drives the same
+ * Port C pins.  The two cannot both be attached; having them both start
+ * automatically would mean whichever GDB connected first silently won.
+ */
+static esp_err_t dap_gdb_start_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_capture_begin();
+    const esp_err_t err = gdb_rsp_start(GDB_RSP_DEFAULT_PORT);
+    char verdict[128];
+    snprintf(verdict, sizeof(verdict), "\n=== %s ===\n",
+             err == ESP_OK ? "GDB server listening; target remote <board>:4243"
+                           : "could not start the GDB server");
+    dap_capture_end(req, verdict);
+    return ESP_OK;
+}
+
+static esp_err_t dap_gdb_stop_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    gdb_rsp_stop();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "stopping\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_gdb_status_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    char line[160];
+    const int n = snprintf(line, sizeof(line),
+        "running=%d connected=%d port=%u cores=%d\n",
+        gdb_rsp_running() ? 1 : 0, gdb_rsp_connected() ? 1 : 0,
+        gdb_rsp_port(), tricore_core_count());
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_gdb_start = {
+    .uri      = "/api/dap_gdb/start",
+    .method   = HTTP_GET,
+    .handler  = dap_gdb_start_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_gdb_stop = {
+    .uri      = "/api/dap_gdb/stop",
+    .method   = HTTP_GET,
+    .handler  = dap_gdb_stop_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_gdb_status = {
+    .uri      = "/api/dap_gdb/status",
+    .method   = HTTP_GET,
+    .handler  = dap_gdb_status_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_dap_trace_start = {
     .uri      = "/api/dap_trace/start",
     .method   = HTTP_GET,
@@ -2631,6 +2703,9 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);
+    httpd_register_uri_handler(*http_handle, &uri_dap_gdb_start);
+    httpd_register_uri_handler(*http_handle, &uri_dap_gdb_stop);
+    httpd_register_uri_handler(*http_handle, &uri_dap_gdb_status);
     httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
     httpd_register_err_handler(*http_handle, HTTPD_404_NOT_FOUND, not_found_handler);

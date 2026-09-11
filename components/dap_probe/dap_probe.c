@@ -1458,6 +1458,12 @@ esp_err_t dap_probe_spi_bringup(void)
     }
 
     if (failures) {
+        /*
+         * Print the raw windows before giving up.  A decoded value says a reply
+         * was wrong; only the raw bits say whether the device answered at all,
+         * and where in the window its start bit sat.
+         */
+        dump_raw_attach("GP-SPI");
         dap_probe_set_trailer_bits(0);
         ESP_LOGE(TAG, "=== GP-SPI backend failed %d check%s: reverting to bit-bang ===",
                  failures, failures == 1 ? "" : "s");
@@ -1742,11 +1748,6 @@ esp_err_t dap_probe_bringup_report(void)
          * OJCONF through the IOClient keeps working when the bus is locked or
          * unclocked, which is exactly the shape of what we are seeing.
          */
-        static const struct { uint8_t instr; uint8_t exp; size_t bits; const char *what; } widths[] = {
-            { DAP_IO_READ_BYTE,  3,  8, "IO_READ_BYTE  (0x9)" },
-            { DAP_IO_READ_HWORD, 4, 16, "IO_READ_HWORD (0x7)" },
-            { DAP_IO_READ_WORD,  5, 32, "IO_READ_WORD  (0x5)" },
-        };
         static const struct { uint8_t instr; const char *what; } regs[] = {
             { 0xEu, "OJCONF (0xE)" },
             { 0xBu, "IOINFO (0xB)" },
