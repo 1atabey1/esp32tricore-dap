@@ -127,6 +127,7 @@ module tb_spi_slave;
         $display("read burst from 0x05");
         spi_select;
         spi_byte(8'h05, got);          /* read, addr 0x05 */
+        spi_byte(8'h00, got);          /* the dummy, while the fetch runs */
         spi_byte(8'h00, got); check("read 0x05", got, 8'h11);
         spi_byte(8'h00, got); check("read 0x06", got, 8'h22);
         spi_byte(8'h00, got); check("read 0x07", got, 8'h33);
@@ -136,6 +137,7 @@ module tb_spi_slave;
         $display("burst read of the port address 0x40");
         spi_select;
         spi_byte(8'h40, got);          /* read, addr 0x40 */
+        spi_byte(8'h00, got);          /* the dummy */
         spi_byte(8'h00, got); check("port byte 1", got, 8'hA0);
         spi_byte(8'h00, got); check("port byte 2", got, 8'hA1);
         spi_byte(8'h00, got); check("port byte 3", got, 8'hA2);
@@ -152,6 +154,7 @@ module tb_spi_slave;
 
         spi_select;
         spi_byte(8'h0A, got);
+        spi_byte(8'h00, got);          /* the dummy */
         spi_byte(8'h00, got); check("reread 0x0A", got, 8'h5A);
         spi_deselect;
 

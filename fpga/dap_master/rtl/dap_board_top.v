@@ -35,24 +35,27 @@ module dap_board_top (
     input  wire spi_ss
 );
     /*
-     * 24 MHz, not the 48 the oscillator can give.
+     * 48 MHz, the fastest the oscillator offers.
      *
-     * Place and route closes at about 36 MHz, and running a design above its
-     * static timing because it happens to work on the bench is how a probe
-     * becomes intermittent later.  24 MHz leaves half again in margin.
+     * This was 24 for a long time, because place and route closed at about 36
+     * and running a design above its static timing because it happens to work
+     * on the bench is how a probe becomes intermittent later.  Everything in
+     * this design that is measured in bytes per second is a fraction of this
+     * number twice over - the DAP clock is sysclk/(2*(div+1)) and the host
+     * link is capped at sysclk/4 by the SPI slave's SCK synchroniser - so the
+     * doubling is worth more than anything else available.
      *
-     * What it costs: the SPI slave synchronises an asynchronous SCK and so
-     * needs sysclk >= 4x SCK, which caps the host link at 6 MHz - about
-     * 750 kB/s of readback.  Still well above the 453 kB/s the host-driven path
-     * manages, and the block read wins on round trips rather than on raw link
-     * rate anyway.  Getting to 48 MHz means registering the pad inputs and
-     * outputs in SB_IO; the longest paths are pad-to-fabric routes, not logic.
+     * Getting here took the register-read mux split in two behind a dummy
+     * byte, the half-period strobes and terminal counts registered, the
+     * transmitter shifting instead of indexing, and the reset trimmed to the
+     * registers that actually need it.  It closes just under 50 MHz on a
+     * pinned placer seed; see the Makefile.
      *
      * CLKHFPU and CLKHFEN are the power-up and enable strobes, tied on.
      */
     wire clk;
     SB_HFOSC #(
-        .CLKHF_DIV("0b01")
+        .CLKHF_DIV("0b00")
     ) u_osc (
         .CLKHFPU (1'b1),
         .CLKHFEN (1'b1),
@@ -71,6 +74,17 @@ module dap_board_top (
             rst <= 1'b0;
         end
     end
+
+    /*
+     * Not on a global buffer, though it reaches almost every flip-flop here
+     * and its fanout is most of the critical path's routing.  Tried: putting
+     * it on one costs the flops their dedicated reset input, so the reset has
+     * to be folded back into each one's logic instead, and the design lost
+     * about 8 MHz.  Keeping the net short is done by resetting fewer registers
+     * rather than by driving the net harder - see the receiver and the
+     * transmitter, where anything reloaded at the start of a frame is left out
+     * of the reset entirely.
+     */
 
     /*
      * dap2 is deliberately absent.  The connector has it and the stock image

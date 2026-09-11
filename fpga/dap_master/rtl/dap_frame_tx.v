@@ -44,6 +44,15 @@ module dap_frame_tx #(
     input  wire [5:0]            len,
     input  wire [5:0]            data_bits,
     input  wire [62:0]           data,
+    /*
+     * Clocks with the line low before the frame proper.
+     *
+     * A register rather than a constant, for the same reason TRAIL and MAXWAIT
+     * are: it is the one part of the framing that was found empirically, the
+     * notes on the CPU path record eleven as the measured value while the
+     * constant here said two, and the next target will have to be swept again.
+     */
+    input  wire [5:0]            lead,
 
     output reg                   busy,
     output reg                   done,       /* one-cycle pulse at the end */
@@ -62,12 +71,6 @@ module dap_frame_tx #(
                      S_CRC   = 3'd6,
                      S_TRAIL = 3'd7;
 
-    /* Clocks with the line low that precede every frame.  Two is enough: the
-     * requirement is one device turnaround cycle plus DAPISC.SISP, which
-     * defaults to zero.  The reference probe's eleven are a host-side buffer
-     * for its own latency, not a device requirement. */
-    localparam integer LEAD_CLOCKS = 2;
-
     reg [2:0]           state;
     reg [5:0]           index;      /* bit position within the current field */
     reg [DIV_WIDTH-1:0] tick;
@@ -76,7 +79,23 @@ module dap_frame_tx #(
     reg [4:0]  cmd_r;
     reg [5:0]  len_r;
     reg [5:0]  nbits_r;
+    reg [5:0]  lead_r;
+    /*
+     * The last index of each variable-length field, worked out once when the
+     * frame is loaded.
+     *
+     * Written inline as `index == nbits_r - 1` it is a six-bit subtract feeding
+     * a six-bit compare feeding the index update, every bit - a carry chain in
+     * the middle of the hot path, and the design's critical path once the
+     * register file was pipelined.  The subtraction happens once per frame
+     * instead, where it has a whole bit period to settle.
+     */
+    reg [5:0]  nbits_last;
+    reg [5:0]  lead_last;
     reg [62:0] data_r;
+    /* The finished CRC, latched when the payload runs out and then shifted out
+     * like every other field. */
+    reg [5:0]  crc_sr;
 
     /* The bit currently being presented, and whether the CRC should eat it. */
     reg        cur_bit;
@@ -92,16 +111,28 @@ module dap_frame_tx #(
         .crc    (crc)
     );
 
-    wire tick_done = (tick == div);
+    /* Registered for the same reason as the receiver's: as a comparison it
+     * feeds clock enables, and that is what place and route answered by
+     * putting the enable on a global net. */
+    reg tick_done;
 
-    /* What goes on the wire for the current state and index. */
+    /*
+     * What goes on the wire: always the bottom bit of the field being sent.
+     *
+     * The fields shift right as they go out rather than being indexed by a
+     * counter.  Indexing reads better, but data_r[index] over a 63-bit
+     * register is a 63-to-1 multiplexer feeding the CRC generator, and that
+     * mux was the design's critical path once the enable chains were fixed -
+     * five LUT levels of it.  Shifting costs the same flip-flops and leaves a
+     * four-way choice between five single bits.
+     */
     always @(*) begin
         case (state)
             S_START: cur_bit = 1'b1;
-            S_CMD:   cur_bit = cmd_r[index[2:0]];
-            S_LEN:   cur_bit = len_r[index[2:0]];
-            S_DATA:  cur_bit = data_r[index];
-            S_CRC:   cur_bit = crc[index[2:0]];
+            S_CMD:   cur_bit = cmd_r[0];
+            S_LEN:   cur_bit = len_r[0];
+            S_DATA:  cur_bit = data_r[0];
+            S_CRC:   cur_bit = crc_sr[0];
             default: cur_bit = 1'b0;        /* lead-in and trailing zero */
         endcase
     end
@@ -122,29 +153,36 @@ module dap_frame_tx #(
         crc_rst <= 1'b0;
         done    <= 1'b0;
 
+        /* index is loaded at the start of every frame, so it is left out -
+         * see the note in the receiver on why this reset list is short. */
         if (rst) begin
             state  <= S_IDLE;
             busy   <= 1'b0;
             dap0   <= 1'b0;
             dap1   <= 1'b1;      /* parked idle high, probe driving */
             dat_oe <= 1'b1;
-            tick   <= {DIV_WIDTH{1'b0}};
-            phase  <= 1'b0;
-            index  <= 6'd0;
+            tick      <= {DIV_WIDTH{1'b0}};
+            tick_done <= (div == {DIV_WIDTH{1'b0}});
+            phase     <= 1'b0;
         end else if (state == S_IDLE) begin
             dap0 <= 1'b0;
             if (start) begin
                 cmd_r   <= cmd;
                 len_r   <= len;
-                nbits_r <= data_bits;
+                nbits_r    <= data_bits;
+                nbits_last <= data_bits - 1'b1;
+                lead_r     <= lead;
+                lead_last  <= lead - 1'b1;
                 data_r  <= data;
                 crc_rst <= 1'b1;
                 busy    <= 1'b1;
                 dat_oe  <= 1'b1;
-                state   <= S_LEAD;
-                index   <= 6'd0;
-                tick    <= {DIV_WIDTH{1'b0}};
-                phase   <= 1'b0;
+                /* Zero lead clocks means straight into the start bit. */
+                state   <= (lead == 6'd0) ? S_START : S_LEAD;
+                index     <= 6'd0;
+                tick      <= {DIV_WIDTH{1'b0}};
+                tick_done <= (div == {DIV_WIDTH{1'b0}});
+                phase     <= 1'b0;
             end
         end else begin
             /*
@@ -155,9 +193,11 @@ module dap_frame_tx #(
             dap1 <= cur_bit;
 
             if (!tick_done) begin
-                tick <= tick + 1'b1;
+                tick      <= tick + 1'b1;
+                tick_done <= (tick + 1'b1 == div);
             end else begin
-                tick <= {DIV_WIDTH{1'b0}};
+                tick      <= {DIV_WIDTH{1'b0}};
+                tick_done <= (div == {DIV_WIDTH{1'b0}});
 
                 if (phase == 1'b0) begin
                     dap0  <= 1'b1;
@@ -170,7 +210,7 @@ module dap_frame_tx #(
                      * one runs out. */
                     case (state)
                         S_LEAD: begin
-                            if (index == LEAD_CLOCKS - 1) begin
+                            if (index == lead_last) begin
                                 state <= S_START;
                                 index <= 6'd0;
                             end else begin
@@ -182,6 +222,7 @@ module dap_frame_tx #(
                             index <= 6'd0;
                         end
                         S_CMD: begin
+                            cmd_r <= {1'b0, cmd_r[4:1]};
                             if (index == 6'd4) begin
                                 state <= S_LEN;
                                 index <= 6'd0;
@@ -190,24 +231,32 @@ module dap_frame_tx #(
                             end
                         end
                         S_LEN: begin
+                            len_r <= {1'b0, len_r[5:1]};
                             if (index == 6'd5) begin
                                 /* Straight to the CRC when nothing follows -
-                                 * which is sync's case, LEN 63 and no data. */
-                                state <= (nbits_r == 6'd0) ? S_CRC : S_DATA;
-                                index <= 6'd0;
+                                 * which is sync's case, LEN 63 and no data.
+                                 * The generator has already absorbed this
+                                 * bit - it does that on the phase-0 edge -
+                                 * so `crc` is final and can be latched. */
+                                state  <= (nbits_r == 6'd0) ? S_CRC : S_DATA;
+                                crc_sr <= crc;
+                                index  <= 6'd0;
                             end else begin
                                 index <= index + 1'b1;
                             end
                         end
                         S_DATA: begin
-                            if (index == nbits_r - 1'b1) begin
-                                state <= S_CRC;
-                                index <= 6'd0;
+                            data_r <= {1'b0, data_r[62:1]};
+                            if (index == nbits_last) begin
+                                state  <= S_CRC;
+                                crc_sr <= crc;
+                                index  <= 6'd0;
                             end else begin
                                 index <= index + 1'b1;
                             end
                         end
                         S_CRC: begin
+                            crc_sr <= {1'b0, crc_sr[5:1]};
                             if (index == 6'd5) begin
                                 state <= S_TRAIL;
                                 index <= 6'd0;

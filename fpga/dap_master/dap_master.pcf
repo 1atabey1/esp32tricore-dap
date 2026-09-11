@@ -51,12 +51,27 @@ set_io trst     28   # IO11 -> PC04, target reset on this bench
 # a drawing: the ESP32 is master, so its MOSI reaches the FPGA's slave-in and
 # its MISO comes from the FPGA's slave-out.
 #
-# The FPGA is the slave here: sck, si and ss are inputs, so is the only
-# output.
-set_io spi_sck  16   # <- ESP32 GPIO38
-set_io spi_si   15   # <- ESP32 GPIO14 (its MOSI)
+# The FPGA is the slave here: sck, si and ss are inputs, so is the only output.
+#
+# These are MEASURED, and three of the four are not what the pad names suggest.
+# A bitstream echoing one package pin onto SPI_SO, with the host driving one
+# GPIO at a time, gave:
+#
+#     pkg 14 drives GPIO39          -> the host's MISO
+#     pkg 15 follows GPIO38         -> the host's SCK,  not SPI_SI as named
+#     pkg 16 follows nothing driven -> the host's CS0,  idle high
+#     pkg 17 follows GPIO14         -> the host's MOSI, not SPI_SS as named
+#
+# The earlier guess - sck 16, si 15, ss 17 - was a rotation of this, and it cost
+# a long hunt: configuration works either way, because the config logic is
+# hardwired to these pads whatever a bitstream calls them, so the one thing that
+# looked like proof of the pinout could never have tested it.  The symptom was a
+# slave that saw a select and almost no clock, since the host's clock was
+# arriving on the pin the design was reading as data.
+set_io spi_sck  15   # <- ESP32 GPIO38
+set_io spi_ss   16   # <- ESP32 GPIO21 (its CS0)
+set_io spi_si   17   # <- ESP32 GPIO14 (its MOSI)
 set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
-set_io spi_ss   17   # <- ESP32 GPIO21 (its CS0)
 
 # Not located yet: CS1..CS3 on ESP32 GPIO13, GPIO11 and GPIO5.  The stock
 # design uses them to address different functions in the fabric.  A DAP-only

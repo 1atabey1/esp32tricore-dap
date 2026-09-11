@@ -65,16 +65,70 @@ module tb_dap_top;
         end
     endtask
 
+    /* A read sends a dummy byte after the header, while the register file
+     * fetches - see the note in spi_slave.v on why that byte exists. */
     task rd;
         input  [6:0] addr;
         output [7:0] val;
         begin
             ss = 1'b0; #HALF;
             spi_byte({1'b0, addr}, scratch);
+            spi_byte(8'h00, scratch);
             spi_byte(8'h00, val);
             #HALF; ss = 1'b1; #(HALF*4);
         end
     endtask
+
+    /*
+     * Bursts, which is how the host actually writes.
+     *
+     * Every wr/rd above is one address and one byte, and the host does not do
+     * that: it sets the eight DATA bytes in a single select, and CMD, LEN,
+     * DBITS and RBITS in another.  The single-byte form passing says nothing
+     * about the burst form, and the burst form is what carries the payload.
+     */
+    reg [7:0] burst [0:7];
+    integer   bi;
+
+    task wr_burst;
+        input [6:0]     addr;
+        input integer   n;
+        begin
+            ss = 1'b0; #HALF;
+            spi_byte({1'b1, addr}, scratch);
+            for (bi = 0; bi < n; bi = bi + 1) spi_byte(burst[bi], scratch);
+            #HALF; ss = 1'b1; #(HALF*4);
+        end
+    endtask
+
+    task rd_burst;
+        input [6:0]     addr;
+        input integer   n;
+        begin
+            ss = 1'b0; #HALF;
+            spi_byte({1'b0, addr}, scratch);
+            spi_byte(8'h00, scratch);          /* the dummy */
+            for (bi = 0; bi < n; bi = bi + 1) spi_byte(8'h00, burst[bi]);
+            #HALF; ss = 1'b1; #(HALF*4);
+        end
+    endtask
+
+    /*
+     * What actually went out on the wire, sampled where the target samples it.
+     * Only while the transmitter is driving, so the receiver's own clocks do
+     * not run into the capture.
+     */
+    reg [95:0] sent;
+    integer    sent_bits;
+    reg        dap0_d;
+
+    always @(posedge clk) begin
+        dap0_d <= dap0;
+        if (!rst && dap0 && !dap0_d && dut.u_tx.busy) begin
+            sent[sent_bits] <= dap1;
+            sent_bits       <= sent_bits + 1;
+        end
+    end
 
     /* ---- the fake target ---- */
     task drive_bit;
@@ -146,15 +200,8 @@ module tb_dap_top;
         rst = 1'b0;
         repeat (4) @(posedge clk);
 
-        /*
-         * DIV 5, not 1.  The receiver sees DAP1 through a two-flop
-         * synchroniser, so its sample is two fabric clocks stale; the half
-         * period has to be longer than that or the sample lands in the
-         * neighbouring bit.  DIV 1 gives a two-clock half period and is not a
-         * legal operating point - it produced a testbench that passed against
-         * an unsynchronised design and broke the moment the synchroniser
-         * arrived, which is the test being wrong rather than the design.
-         */
+        /* DIV 5 for the bulk of the run, an ordinary middle setting.  The
+         * lowest legal divider gets its own case at the end. */
         wr(7'h02, 8'd5);       /* DIV: 12 fabric clocks per bit */
         wr(7'h07, 8'd1);       /* TRAIL */
         wr(7'h08, 8'd64);      /* MAXWAIT low */
@@ -187,6 +234,70 @@ module tb_dap_top;
         rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
         check("reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
 
+        /*
+         * ---- a frame that carries a payload, written the way the host
+         * writes it ----
+         *
+         * On hardware every frame with a DATA field drew no reply while sync
+         * and the block read worked, and nothing here could have caught that:
+         * both cases above leave DBITS at zero, so the DATA register and the
+         * serialiser's payload path were never exercised through the register
+         * file at all.
+         *
+         * client_set(1) is the first frame that fails on the bench, and its
+         * wire word is 0x1B10F9 over 22 bits - from the C frame builder, which
+         * is itself checked against the documented vectors.  So this compares
+         * two independent implementations rather than the RTL against itself.
+         *
+         * LEN 3 with three data bits, which is what dap_probe_client_set
+         * actually sends.  A round LEN 4 is a different frame and produces a
+         * different, equally valid-looking vector - checking against that one
+         * proves nothing about the frame the bench is failing on.
+         */
+        $display("payload frame through the register file: client_set(1)");
+
+        burst[0] = 8'h01; burst[1] = 8'h00; burst[2] = 8'h00; burst[3] = 8'h00;
+        burst[4] = 8'h00; burst[5] = 8'h00; burst[6] = 8'h00; burst[7] = 8'h00;
+        wr_burst(7'h10, 8);                    /* DATA = 1 */
+
+        burst[0] = 8'h1C;                      /* CMD   */
+        burst[1] = 8'd3;                       /* LEN   */
+        burst[2] = 8'd3;                       /* DBITS */
+        burst[3] = 8'd0;                       /* RBITS: a bare acknowledge */
+        wr_burst(7'h03, 4);
+
+        /* Did the bytes land where they were addressed? */
+        rd_burst(7'h10, 8);
+        check("DATA reads back", {burst[3], burst[2], burst[1], burst[0]}, 32'd1);
+        rd_burst(7'h03, 4);
+        check("CMD",   burst[0], 32'h1C);
+        check("LEN",   burst[1], 32'd3);
+        check("DBITS", burst[2], 32'd3);
+        check("RBITS", burst[3], 32'd0);
+
+        sent_bits = 0;
+        sent      = 96'd0;
+
+        fork
+            wr(7'h01, 8'h01);                  /* CTRL: start frame */
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                drive_bit(1'b0);
+                drive_bit(1'b1);               /* the acknowledge */
+                target_bit   = 1'b0;
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("acknowledge not timed out", scratch[2], 1'b0);
+
+        /* Two lead-in clocks precede the frame proper. */
+        check("frame length", sent_bits - 2, 22);
+        check("client_set word", (sent >> 2) & 96'h3FFFFF, 32'h1B10F9);
+
         /* ---- a block read of three parcels ---- */
         $display("block read, 3 parcels, one SPI burst to collect");
         wr(7'h01, 8'h08);      /* CTRL: clear the fifo */
@@ -215,11 +326,33 @@ module tb_dap_top;
         check("block did not overrun", scratch[7], 1'b0);
         check("fifo has data", scratch[5], 1'b0);
 
-        /* Drain as the host would: one transaction, address 0x40 held. */
-        $display("draining the fifo in one burst");
+        /*
+         * Drain in two transactions, not one.
+         *
+         * The host drains a block in chunks while the rest of it is still
+         * arriving, so what matters is that a burst can stop and another can
+         * pick up where it left off.  A single burst cannot show that, and
+         * that is exactly what hid a byte going missing at every boundary: a
+         * read fetches one byte ahead, and the fetch at the end of a burst is
+         * for a byte the master never clocks.  Popping on that fetch threw it
+         * away - invisible in one burst, three bytes short of a 1 kB block in
+         * four.
+         */
+        $display("draining the fifo in two bursts");
         ss = 1'b0; #HALF;
         spi_byte(8'h40, scratch);
-        for (p = 0; p < 3; p = p + 1) begin
+        spi_byte(8'h00, scratch);              /* the dummy */
+        spi_byte(8'h00, b0);
+        spi_byte(8'h00, b1);
+        spi_byte(8'h00, b2);
+        spi_byte(8'h00, b3);
+        check("parcel", {b3, b2, b1, b0}, 32'h11223344);
+        #HALF; ss = 1'b1; #(HALF*4);
+
+        ss = 1'b0; #HALF;
+        spi_byte(8'h40, scratch);
+        spi_byte(8'h00, scratch);              /* the dummy */
+        for (p = 1; p < 3; p = p + 1) begin
             spi_byte(8'h00, b0);
             spi_byte(8'h00, b1);
             spi_byte(8'h00, b2);
@@ -230,6 +363,41 @@ module tb_dap_top;
 
         rd(7'h00, scratch);
         check("fifo now empty", scratch[5], 1'b1);
+
+        /*
+         * ---- the lowest divider ----
+         *
+         * DIV 1 is a two-clock half period, which is the same length as the
+         * synchroniser on DAP1 - so this is the case the old sample point
+         * could not survive, and the one the host refused to allow because of
+         * it.  It has to be tested here rather than in tb_dap_rx: that bench
+         * drives dap1_in directly and never sees the synchroniser at all,
+         * which is why the limit went unnoticed in simulation and turned up as
+         * a rule in the host instead.
+         */
+        $display("the lowest divider: sync at DIV 1");
+        wr(7'h02, 8'd1);
+        wr(7'h03, 8'h10);      /* CMD  = sync */
+        wr(7'h04, 8'd63);      /* LEN  = 63 */
+        wr(7'h05, 8'd0);       /* DBITS */
+        wr(7'h06, 8'd32);      /* RBITS */
+
+        fork
+            wr(7'h01, 8'h01);
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                send_parcel(32'hAAAAAAAA, 1'b1);
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("DIV 1 crc_ok", scratch[4], 1'b1);
+        check("DIV 1 not timed out", scratch[2], 1'b0);
+        rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
+        check("DIV 1 reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
 
         $display("");
         if (errors == 0) $display("PASSED (0 failures)");

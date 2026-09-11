@@ -64,6 +64,17 @@ module dap_frame_rx #(
      * shift the whole rest of the block.
      */
     input  wire                  expect_crc,
+    /*
+     * Diagnostic: clock the reply window and keep every bit, instead of
+     * hunting for a start bit first.
+     *
+     * A frame that draws no reply reports one thing - the hunt ran out - and
+     * that single fact cannot tell a line the target is holding low from one
+     * nothing is driving, nor show a start bit that arrived at the wrong
+     * moment.  This is the fabric's version of dap_probe_set_raw_window(),
+     * which is what settled the same question on the CPU path.
+     */
+    input  wire                  no_hunt,
 
     output reg                   busy,
     output reg                   done,
@@ -94,9 +105,30 @@ module dap_frame_rx #(
     reg                 all_ones;
 
     reg [6:0]  nbits_r;
+    /* The last payload index, worked out once at start for the same reason the
+     * transmitter does it: `index + 1 == nbits_r` is an add and a compare in
+     * the per-bit path, and one subtraction per reply replaces both. */
+    reg [6:0]  nbits_last;
     reg        crc_r;
     reg [15:0] wait_limit;
+    /*
+     * "The hunt has run out", as a flip-flop.
+     *
+     * Comparing wait_cycles against wait_limit inline is a 16-bit equality in
+     * the clock enable of the counter it is comparing - a loop through four
+     * LUT levels and a CEN pin, which is what the design's critical path
+     * became once the half-period strobe was registered.  Carried in a flop
+     * and updated alongside the counter, the enable is one bit again.
+     */
+    reg        at_limit;
     reg [7:0]  trail_r;
+    /* "There are trailing clocks to issue", as one bit.  The state machine
+     * asks three times over whether trail_r is zero, and an eight-bit compare
+     * in the next-state logic is what put trail_left's clock enable on the
+     * critical path. */
+    reg        has_trail;
+    /* A registered copy of (state == S_HUNT), for the busy counter's enable. */
+    reg        hunting;
     reg [15:0] max_wait_r;
 
     reg        sample;
@@ -112,11 +144,36 @@ module dap_frame_rx #(
         .residue_ok (residue_ok)
     );
 
-    wire tick_done = (tick == div);
-    /* The target updates DAP1 after the falling edge, so it is stable through
-     * the low phase; sampling at the end of that phase, just before dap0 goes
-     * high again, is the widest margin available. */
-    wire sample_now = (phase == 1'b0) && tick_done;
+    /*
+     * The half-period strobe is a flip-flop, not a comparison.
+     *
+     * As a wire it was `tick == div`, an 8-bit compare feeding the clock
+     * enable of the payload, CRC and all_ones registers - and place and route
+     * answered that by promoting the enable onto a global buffer, which put a
+     * LUT chain plus a global net in series and held the whole design to
+     * 31 MHz.  Computed one cycle early into a register, the enable is a flop
+     * output and the compare moves off the critical path into that flop's own
+     * D input, where it has a full cycle to settle.
+     */
+    reg tick_done;
+    /*
+     * Sampled at the END of the high phase - see the long note in the state
+     * machine below.  DAP1 arrives two clocks late through the synchroniser,
+     * so reading it at the end of the low phase samples the pad ever closer to
+     * the falling edge as the divider shrinks; reading it here puts those two
+     * clocks on the useful side and removes the divider floor entirely.
+     */
+    wire sample_now = (phase == 1'b1) && tick_done;
+
+    reg [6:0] index_next;
+
+    always @(*) begin
+        case (state)
+            S_DATA:  index_next = (index == nbits_last) ? 7'd0 : index + 7'd1;
+            S_CRC:   index_next = (index == 7'd5)       ? 7'd0 : index + 7'd1;
+            default: index_next = 7'd0;
+        endcase
+    end
 
     always @(*) begin
         sample = dap1_in;
@@ -129,18 +186,27 @@ module dap_frame_rx #(
     always @(posedge clk) begin
         crc_rst <= 1'b0;
         done    <= 1'b0;
+        hunting <= (state == S_HUNT);
 
+        /*
+         * Only what has to be right before the first frame.
+         *
+         * timed_out, idle_high, crc_ok and wait_cycles are all loaded again
+         * when a reply starts and are meaningless until one has finished, so
+         * resetting them buys nothing and costs fanout - and this reset net
+         * reaches nearly every flip-flop in the design, which made it most of
+         * the routing on the critical path.  Shortening the net by resetting
+         * fewer registers is the fix that worked; a global buffer for it was
+         * tried and was worse.
+         */
         if (rst) begin
             state       <= S_IDLE;
             busy        <= 1'b0;
             dap0        <= 1'b0;
             dat_oe      <= 1'b1;
             tick        <= {DIV_WIDTH{1'b0}};
+            tick_done   <= (div == {DIV_WIDTH{1'b0}});
             phase       <= 1'b0;
-            timed_out   <= 1'b0;
-            idle_high   <= 1'b0;
-            crc_ok      <= 1'b0;
-            wait_cycles <= 16'd0;
         end else if (state == S_IDLE) begin
             dap0 <= 1'b0;
             if (start) begin
@@ -153,18 +219,28 @@ module dap_frame_rx #(
                  */
                 dat_oe      <= 1'b0;
                 nbits_r     <= reply_bits;
-                crc_r       <= expect_crc;
+                nbits_last  <= reply_bits - 1'b1;
+                /* No CRC in raw mode: those six clocks are window too. */
+                crc_r       <= expect_crc & ~no_hunt;
                 trail_r     <= trail_clocks;
+                has_trail   <= (trail_clocks != 8'd0);
                 max_wait_r  <= max_wait;
                 /* One subtract here, out of the hot path, instead of an add
                  * and a compare on every clocked bit. */
                 wait_limit  <= (max_wait == 16'd0) ? 16'd0 : max_wait - 1'b1;
+                /* wait_cycles starts at zero, so the limit is already reached
+                 * when max_wait allows one clock or none. */
+                at_limit    <= (max_wait <= 16'd1);
                 trail_left  <= trail_clocks;
                 crc_rst     <= 1'b1;
                 busy        <= 1'b1;
-                state       <= S_HUNT;
+                /* Straight into the payload: every clock of the window is a
+                 * bit worth keeping when the question is what is on the wire
+                 * rather than what the reply says. */
+                state       <= no_hunt ? S_DATA : S_HUNT;
                 index       <= 7'd0;
                 tick        <= {DIV_WIDTH{1'b0}};
+                tick_done   <= (div == {DIV_WIDTH{1'b0}});
                 phase       <= 1'b0;
                 wait_cycles <= 16'd0;
                 timed_out   <= 1'b0;
@@ -176,19 +252,56 @@ module dap_frame_rx #(
             end
         end else begin
             if (!tick_done) begin
-                tick <= tick + 1'b1;
+                tick      <= tick + 1'b1;
+                tick_done <= (tick + 1'b1 == div);
             end else begin
-                tick <= {DIV_WIDTH{1'b0}};
+                tick      <= {DIV_WIDTH{1'b0}};
+                tick_done <= (div == {DIV_WIDTH{1'b0}});
 
                 if (phase == 1'b0) begin
-                    /* Sample, then raise the clock for the second half. */
+                    /* Raise the clock for the second half.  Nothing is
+                     * sampled here - see the note on the sample point below. */
+                    if (state != S_END) begin
+                        dap0  <= 1'b1;
+                        phase <= 1'b1;
+                    end
+                end else begin
+                    dap0  <= 1'b0;
+                    phase <= 1'b0;
+
+                    /*
+                     * Sample at the END of the high phase, not the low one.
+                     *
+                     * DAP1 reaches this logic two clocks late, through the
+                     * synchroniser, so whenever it is read the value belongs
+                     * to an instant two clocks earlier.  Reading it at the end
+                     * of the low phase therefore samples the pad (half period
+                     * - 2) clocks after the falling edge, and that distance
+                     * shrinks with the divider: at a half period of two clocks
+                     * it lands on the falling edge itself and returns the
+                     * previous bit.  That is where the "divider must be at
+                     * least 2" rule came from - not from the wire, but from
+                     * choosing to read at the earliest useful moment.
+                     *
+                     * The target holds each bit from its falling edge until
+                     * the next one, so the whole bit period is available and
+                     * the end of the high phase is as valid a point as the end
+                     * of the low one.  Read there and the pad instant is
+                     * (half period + divider - 1) clocks after the falling
+                     * edge - near the middle of the bit, and growing rather
+                     * than shrinking as the divider falls.  A half period of
+                     * two clocks is then fine, which is what lets the DAP
+                     * clock reach a quarter of the fabric clock instead of a
+                     * sixth.
+                     */
                     case (state)
                         S_HUNT: begin
                             if (dap1_in) begin
                                 /* The start bit.  Straight to the payload, or
                                  * to the trailing clocks for an acknowledge. */
-                                state <= (nbits_r == 7'd0) ? S_TRAIL : S_DATA;
-                                index <= 7'd0;
+                                state <= (nbits_r == 7'd0)
+                                         ? (has_trail ? S_TRAIL : S_END)
+                                         : S_DATA;
                                 if (nbits_r == 7'd0) begin
                                     crc_ok <= 1'b1;   /* nothing to check */
                                 end
@@ -199,36 +312,39 @@ module dap_frame_rx #(
                              * cycle, and it was the critical path that held the
                              * whole design to 35 MHz.
                              */
-                            end else if (wait_cycles == wait_limit) begin
-                                timed_out <= 1'b1;
-                                state     <= S_TRAIL;
+                            end else if (at_limit) begin
+                                timed_out  <= 1'b1;
+                                state      <= S_END;
                                 trail_left <= 8'd0;
-                            end else begin
-                                wait_cycles <= wait_cycles + 1'b1;
                             end
+                            /* The counter itself is updated outside this case
+                             * - see the note below. */
                         end
                         S_DATA: begin
                             payload[index[5:0]] <= dap1_in;
                             all_ones            <= all_ones & dap1_in;
-                            if (index + 1'b1 == nbits_r) begin
-                                state <= crc_r ? S_CRC : S_TRAIL;
-                                index <= 7'd0;
-                            end else begin
-                                index <= index + 1'b1;
+                            if (index == nbits_last) begin
+                                state <= crc_r ? S_CRC
+                                       : (has_trail ? S_TRAIL : S_END);
                             end
                         end
                         S_CRC: begin
                             crc[index[2:0]] <= dap1_in;
                             all_ones        <= all_ones & dap1_in;
                             if (index == 7'd5) begin
-                                state <= S_TRAIL;
-                                index <= 7'd0;
-                            end else begin
-                                index <= index + 1'b1;
+                                state <= has_trail ? S_TRAIL : S_END;
                             end
                         end
+                        /*
+                         * Exactly `trail` clocks, no more.  Entering this
+                         * state at all costs one, so a zero count skips it
+                         * rather than passing through - which the old form did
+                         * not, and it is the difference between issuing the
+                         * number of trailing clocks the device was asked for
+                         * and one more than that.
+                         */
                         S_TRAIL: begin
-                            if (trail_left == 8'd0) begin
+                            if (trail_left == 8'd1) begin
                                 state <= S_END;
                             end else begin
                                 trail_left <= trail_left - 1'b1;
@@ -237,16 +353,33 @@ module dap_frame_rx #(
                         default: state <= S_END;
                     endcase
 
-                    if (state != S_END) begin
-                        dap0  <= 1'b1;
-                        phase <= 1'b1;
-                    end
-                end else begin
-                    dap0  <= 1'b0;
-                    phase <= 1'b0;
+                    /*
+                     * The busy-cycle counter, gated on a registered copy of
+                     * "we are hunting" rather than on the state itself.
+                     *
+                     * Inside the case above, its clock enable carries the
+                     * three-bit state decode on top of the two conditions it
+                     * actually needs, and that decode is what the critical
+                     * path kept coming back to.  The copy is one cycle stale,
+                     * which cannot matter here: the state only ever changes at
+                     * one of these sample instants, and the next one is at
+                     * least four clocks away even at the lowest divider.
+                     */
+                    /*
+                     * The bit index, updated on every sample with nothing but
+                     * the half-period strobe in its enable.
+                     *
+                     * Which field is being counted, and whether it has run
+                     * out, decides the *value* - and in the data path that has
+                     * a whole clock to settle.  Inside the case it decided the
+                     * clock enable instead, and that state decode was the
+                     * critical path.
+                     */
+                    index <= index_next;
 
-                    if (state == S_TRAIL && trail_left == 8'd0) begin
-                        state <= S_END;
+                    if (hunting && !dap1_in && !at_limit) begin
+                        wait_cycles <= wait_cycles + 1'b1;
+                        at_limit    <= (wait_cycles + 1'b1 == wait_limit);
                     end
                 end
             end
@@ -261,7 +394,14 @@ module dap_frame_rx #(
                  * CRC-less block parcel are both good if they arrived at all. */
                 crc_ok    <= (nbits_r == 7'd0 || !crc_r) ? ~timed_out
                                                          : (residue_ok & ~timed_out);
-                idle_high <= all_ones & (nbits_r != 7'd0);
+                /*
+                 * Only a window that was actually sampled can be all ones.  A
+                 * hunt that ran out never reaches S_DATA, so all_ones still
+                 * holds its initial 1 and idle_high came up on every timeout -
+                 * naming the wire as undriven when the truth was that it never
+                 * went high at all, which is the opposite fault.
+                 */
+                idle_high <= all_ones & (nbits_r != 7'd0) & ~timed_out;
                 dat_oe    <= 1'b1;        /* take the line back */
                 dap0      <= 1'b0;
                 busy      <= 1'b0;

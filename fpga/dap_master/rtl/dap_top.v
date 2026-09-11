@@ -22,7 +22,9 @@
  *   0x07 TRAIL    rw  clocks to issue after a reply
  *   0x08 MAXWAIT  rw  16-bit, low byte first
  *   0x0A PARCELS  rw  block read: parcels minus one, so 0xFF is 256
- *   0x0B FLAGS    rw  0 TRST asserted
+ *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt)
+ *   0x0C LEAD     rw  idle clocks before each frame
+ *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
  *   0x10 DATA     rw  64-bit frame payload, low byte first
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
@@ -68,9 +70,11 @@ module dap_top #(
     reg [5:0]  r_dbits;
     reg [6:0]  r_rbits;
     reg [7:0]  r_trail  = 8'd1;
+    reg [5:0]  r_lead   = 6'd2;
     reg [15:0] r_maxwait = 16'd256;
     reg [7:0]  r_parcels;
     reg [63:0] r_data;
+    reg        r_no_hunt = 1'b0;  /* FLAGS bit 1: keep the whole reply window */
 
     reg [31:0] s_reply;
     reg [5:0]  s_crc;
@@ -83,14 +87,21 @@ module dap_top #(
 
     wire [6:0] reg_addr;
     wire [7:0] reg_wdata;
-    wire       reg_we, reg_re;
+    wire       reg_we, reg_re, reg_consume;
+    reg        reg_re_d, reg_re_d2;
     reg  [7:0] reg_rdata;
+    /* First pipeline stage of the read: each address group's byte, plus which
+     * group the address is in. */
+    reg  [7:0] q_ctrl, q_dat, q_rep, q_fifo;
+    reg  [2:0] q_grp;
+    reg        q_port;
 
     spi_slave u_spi (
         .clk (clk), .rst (rst),
         .spi_sck (spi_sck), .spi_si (spi_si), .spi_so (spi_so), .spi_ss (spi_ss),
         .reg_addr (reg_addr), .reg_wdata (reg_wdata),
-        .reg_we (reg_we), .reg_re (reg_re), .reg_rdata (reg_rdata),
+        .reg_we (reg_we), .reg_re (reg_re), .reg_consume (reg_consume),
+        .reg_rdata (reg_rdata),
         .selected ()
     );
 
@@ -112,13 +123,64 @@ module dap_top #(
 
     reg        fifo_push;
     reg [7:0]  fifo_din;
-    reg        fifo_pop;
     reg        fifo_clear;
+
+    /*
+     * Popped the moment the byte is shifted out, combinationally rather than a
+     * cycle later.
+     *
+     * The read of the *next* byte is pipelined and latches two cycles after
+     * the fetch, so a pop that took an extra cycle to register would leave the
+     * old head in place when that latch happened and send the same byte twice.
+     * The address does not auto-increment at the port, so reg_addr still reads
+     * 0x40 here.
+     */
+    /*
+     * The port-address test is registered.  Comparing reg_addr here put a
+     * seven-bit compare in front of the FIFO's read address, and the address
+     * does not move during a drain anyway - it is the one register that does
+     * not auto-increment, so a cycle-old answer is the same answer.
+     */
+    reg        at_port;
+    always @(posedge clk) begin
+        at_port <= (reg_addr == 7'h40);
+    end
+
+    wire       fifo_pop = reg_consume && at_port;
+
+    /*
+     * The byte at the read pointer, kept in a register.
+     *
+     * The FIFO port read used to be a memory lookup inside the register
+     * decode - so a host read of 0x40 was a RAM access, the empty-flag mux and
+     * the whole address decoder in one clock, and that became the critical
+     * path once the enable chains and the payload mux were dealt with.  Read
+     * ahead every cycle instead and the decode sees a flip-flop.
+     *
+     * Re-read unconditionally rather than only when the pointer moves: a push
+     * into an empty FIFO changes the byte under a stationary read pointer, and
+     * an update conditioned on the pointer would miss it.
+     */
+    /*
+     * The incremented read pointer is carried in a register rather than
+     * computed here.  As an inline `fifo_rd + 1` it is a twelve-bit carry
+     * chain sitting in front of the FIFO's read address, and that chain became
+     * the critical path; maintained alongside the pointer it costs twelve
+     * flip-flops and leaves a plain two-way mux.
+     */
+    reg  [11:0] fifo_rd_p1;
+    wire [11:0] fifo_rd_next = (fifo_pop && !fifo_empty) ? fifo_rd_p1 : fifo_rd;
+    reg  [7:0]  fifo_head;
+
+    always @(posedge clk) begin
+        fifo_head <= fifo_mem[fifo_rd_next];
+    end
 
     always @(posedge clk) begin
         if (rst || fifo_clear) begin
             fifo_wr    <= 12'd0;
             fifo_rd    <= 12'd0;
+            fifo_rd_p1 <= 12'd1;
             fifo_count <= 12'd0;
             fifo_empty <= 1'b1;
             fifo_full  <= 1'b0;
@@ -128,7 +190,9 @@ module dap_top #(
                 fifo_wr <= (fifo_wr == FIFO_DEPTH-1) ? 12'd0 : fifo_wr + 1'b1;
             end
             if (fifo_pop && !fifo_empty) begin
-                fifo_rd <= (fifo_rd == FIFO_DEPTH-1) ? 12'd0 : fifo_rd + 1'b1;
+                fifo_rd    <= fifo_rd_p1;
+                fifo_rd_p1 <= (fifo_rd_p1 == FIFO_DEPTH-1) ? 12'd0
+                                                           : fifo_rd_p1 + 1'b1;
             end
             case ({fifo_push && !fifo_full, fifo_pop && !fifo_empty})
                 2'b10: begin
@@ -195,7 +259,7 @@ module dap_top #(
     dap_frame_tx #(.DIV_WIDTH(8)) u_tx (
         .clk (clk), .rst (rst), .div (r_div),
         .start (tx_start), .cmd (r_cmd), .len (r_len),
-        .data_bits (r_dbits), .data (r_data[62:0]),
+        .data_bits (r_dbits), .data (r_data[62:0]), .lead (r_lead),
         .busy (tx_busy), .done (tx_done),
         .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe)
     );
@@ -205,6 +269,7 @@ module dap_top #(
         .start (rx_start), .reply_bits (rx_bits),
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
+        .no_hunt (r_no_hunt),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
         .idle_high (rx_idle_high), .crc_ok (rx_crc_ok),
@@ -235,7 +300,6 @@ module dap_top #(
         tx_start   <= 1'b0;
         rx_start   <= 1'b0;
         fifo_push  <= 1'b0;
-        fifo_clear <= 1'b0;
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -247,10 +311,17 @@ module dap_top #(
                     if (start_frame_req || start_block_req) begin
                         is_block      <= start_block_req;
                         parcels_left  <= {1'b0, r_parcels} + 9'd1;
+                        /*
+                         * Only s_done is cleared here.  The three reply flags
+                         * moved to Q_TX: clearing them from the start request
+                         * put that request in the clock enable of every one of
+                         * them, and the chain from start_frame_req through the
+                         * state decode to those enables was the design's
+                         * critical path.  They are set by the receive and read
+                         * after it, so clearing them as the receive begins is
+                         * the same guarantee one state later.
+                         */
                         s_done        <= 1'b0;
-                        s_timed_out   <= 1'b0;
-                        s_idle_high   <= 1'b0;
-                        s_crc_ok      <= 1'b0;
                         tx_start      <= 1'b1;
                         q             <= Q_TX;
                     end
@@ -258,6 +329,9 @@ module dap_top #(
 
                 Q_TX: begin
                     if (tx_done) begin
+                        s_timed_out   <= 1'b0;
+                        s_idle_high   <= 1'b0;
+                        s_crc_ok      <= 1'b0;
                         /*
                          * A block read answers with parcels rather than one
                          * reply: 32 bits each, and a CRC only on the last.
@@ -346,10 +420,21 @@ module dap_top #(
     always @(posedge clk) begin
         start_frame_req <= 1'b0;
         start_block_req <= 1'b0;
-        fifo_pop        <= 1'b0;
+        /*
+         * Defaulted here, with the only code that sets it.
+         *
+         * It used to default to zero in the sequencer and be set here, which
+         * is two always blocks driving one register - and yosys resolves that
+         * by picking one, so CTRL bit 3 was tying fifo_clear to a constant and
+         * clearing the FIFO did nothing at all.  Silent, because a block read
+         * drains the FIFO completely anyway, so nothing had yet depended on
+         * the clear actually happening.
+         */
+        fifo_clear      <= 1'b0;
 
         if (rst) begin
-            trst <= 1'b1;              /* released; asserting it resets the target */
+            trst      <= 1'b1;         /* released; asserting it resets the target */
+            r_no_hunt <= 1'b0;         /* ordinary hunting is the operating mode */
         end else begin
             if (reg_we) begin
                 case (reg_addr)
@@ -367,7 +452,11 @@ module dap_top #(
                     7'h08: r_maxwait[7:0]  <= reg_wdata;
                     7'h09: r_maxwait[15:8] <= reg_wdata;
                     7'h0A: r_parcels <= reg_wdata;
-                    7'h0B: trst      <= ~reg_wdata[0];   /* 1 = assert = drive low */
+                    7'h0C: r_lead    <= reg_wdata[5:0];
+                    7'h0B: begin
+                        trst      <= ~reg_wdata[0];      /* 1 = assert = drive low */
+                        r_no_hunt <=  reg_wdata[1];
+                    end
                     7'h10: r_data[7:0]   <= reg_wdata;
                     7'h11: r_data[15:8]  <= reg_wdata;
                     7'h12: r_data[23:16] <= reg_wdata;
@@ -380,38 +469,110 @@ module dap_top #(
                 endcase
             end
 
-            if (reg_re) begin
-                case (reg_addr)
-                    7'h00: reg_rdata <= {s_overrun, fifo_full, fifo_empty,
-                                         s_crc_ok, s_idle_high, s_timed_out,
-                                         s_done, (q != Q_IDLE)};
-                    7'h02: reg_rdata <= r_div;
-                    7'h03: reg_rdata <= {3'd0, r_cmd};
-                    7'h04: reg_rdata <= {2'd0, r_len};
-                    7'h05: reg_rdata <= {2'd0, r_dbits};
-                    7'h06: reg_rdata <= {1'b0, r_rbits};
-                    7'h07: reg_rdata <= r_trail;
-                    7'h08: reg_rdata <= r_maxwait[7:0];
-                    7'h09: reg_rdata <= r_maxwait[15:8];
-                    7'h0A: reg_rdata <= r_parcels;
-                    7'h20: reg_rdata <= s_reply[7:0];
-                    7'h21: reg_rdata <= s_reply[15:8];
-                    7'h22: reg_rdata <= s_reply[23:16];
-                    7'h23: reg_rdata <= s_reply[31:24];
-                    7'h24: reg_rdata <= {2'd0, s_crc};
-                    7'h25: reg_rdata <= s_wait[7:0];
-                    7'h26: reg_rdata <= s_wait[15:8];
-                    7'h40: begin
-                        /* The port address: one byte out of the FIFO, and the
-                         * address does not move, so a burst drains it. */
-                        reg_rdata <= fifo_empty ? 8'h00 : fifo_mem[fifo_rd];
-                        fifo_pop  <= ~fifo_empty;
-                    end
-                    default: reg_rdata <= 8'h00;
-                endcase
+            /*
+             * Three cycles to answer a fetch, and the decode split in two so
+             * those cycles are worth having.
+             *
+             * Adding a pipeline register after the mux would change nothing:
+             * the path from reg_addr through a five-level mux is still one
+             * clock as far as place and route is concerned, and there is no
+             * multicycle constraint to tell it otherwise.  The mux itself has
+             * to be cut, so the group values are registered first (a short mux
+             * on the low address bits) and the choice between them second.
+             *
+             * Three cycles rather than two because the FIFO's head register
+             * updates a cycle after the pop, so the group stage needs one more
+             * to catch it - otherwise a drain sends each byte twice.  The
+             * dummy byte a read sends gives every fetch a whole byte time, so
+             * three cycles out of thirty-two is slack well spent.
+             */
+            q_ctrl   <= rd_ctrl;
+            q_dat    <= rd_dat;
+            q_rep    <= rd_rep;
+            q_fifo   <= rd_fifo;
+            q_grp    <= reg_addr[6:4];
+            q_port   <= (reg_addr == 7'h40);
+
+            reg_re_d  <= reg_re;
+            reg_re_d2 <= reg_re_d;
+            if (reg_re_d2) begin
+                reg_rdata <= (q_grp == 3'h0) ? q_ctrl :
+                             (q_grp == 3'h1) ? q_dat  :
+                             (q_grp == 3'h2) ? q_rep  :
+                             q_port          ? q_fifo : 8'h00;
             end
         end
     end
+
+    /*
+     * The read mux, grouped by address range rather than written as one case
+     * over all seven address bits.
+     *
+     * Yosys builds the flat version into a six-level LUT chain, and with
+     * everything else on the critical path dealt with that decode was the
+     * design's limit at about 43 MHz - short of the 48 the oscillator can
+     * give.  Split into three small muxes on the low bits and one choice
+     * between them on the high bits, it is three levels for the same result.
+     */
+    reg [7:0] rd_ctrl, rd_dat, rd_rep;
+
+    always @(*) begin
+        case (reg_addr[3:0])
+            4'h0: rd_ctrl = {s_overrun, fifo_full, fifo_empty, s_crc_ok,
+                             s_idle_high, s_timed_out, s_done, (q != Q_IDLE)};
+            4'h2: rd_ctrl = r_div;
+            4'h3: rd_ctrl = {3'd0, r_cmd};
+            4'h4: rd_ctrl = {2'd0, r_len};
+            4'h5: rd_ctrl = {2'd0, r_dbits};
+            4'h6: rd_ctrl = {1'b0, r_rbits};
+            4'h7: rd_ctrl = r_trail;
+            4'h8: rd_ctrl = r_maxwait[7:0];
+            4'h9: rd_ctrl = r_maxwait[15:8];
+            4'hA: rd_ctrl = r_parcels;
+            4'hB: rd_ctrl = {6'd0, r_no_hunt, ~trst};
+            4'hC: rd_ctrl = {2'd0, r_lead};
+            /*
+             * How many bytes are waiting.  This is what lets the host drain
+             * while the block is still arriving instead of after it: the wire
+             * takes about 2 ms for a 1 kB block and the drain about 1.6 ms,
+             * and run one after the other that is most of the cost of a block.
+             */
+            4'hD: rd_ctrl = fifo_count[7:0];
+            4'hE: rd_ctrl = {4'd0, fifo_count[11:8]};
+            default: rd_ctrl = 8'h00;
+        endcase
+
+        /*
+         * DATA reads back.  Without this the host cannot tell a payload that
+         * failed to reach the fabric from one the device simply ignored: the
+         * frame is well formed either way and the only symptom is silence.
+         * Every other writable register was already readable and this one
+         * being write-only was an oversight - it cost a session.
+         */
+        case (reg_addr[2:0])
+            3'd0: rd_dat = r_data[7:0];
+            3'd1: rd_dat = r_data[15:8];
+            3'd2: rd_dat = r_data[23:16];
+            3'd3: rd_dat = r_data[31:24];
+            3'd4: rd_dat = r_data[39:32];
+            3'd5: rd_dat = r_data[47:40];
+            3'd6: rd_dat = r_data[55:48];
+            default: rd_dat = r_data[63:56];
+        endcase
+
+        case (reg_addr[2:0])
+            3'd0: rd_rep = s_reply[7:0];
+            3'd1: rd_rep = s_reply[15:8];
+            3'd2: rd_rep = s_reply[23:16];
+            3'd3: rd_rep = s_reply[31:24];
+            3'd4: rd_rep = {2'd0, s_crc};
+            3'd5: rd_rep = s_wait[7:0];
+            3'd6: rd_rep = s_wait[15:8];
+            default: rd_rep = 8'h00;
+        endcase
+    end
+
+    wire [7:0] rd_fifo = fifo_empty ? 8'h00 : fifo_head;
 endmodule
 
 `default_nettype wire

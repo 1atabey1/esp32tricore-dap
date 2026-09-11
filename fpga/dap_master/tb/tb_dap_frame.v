@@ -36,6 +36,7 @@ module tb_dap_frame;
         .clk (clk), .rst (rst),
         .div (8'd1),               /* fast, so the test runs in little time */
         .start (start), .cmd (cmd), .len (len), .data_bits (dbits), .data (data),
+        .lead (6'd2),
         .busy (busy), .done (done),
         .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe)
     );
@@ -118,6 +119,57 @@ module tb_dap_frame;
 
         /* start + 5 + 6 + 0 + 6 + 1 = 19 bits here too. */
         check_eq("len0 crc", (captured >> (LEAD + 12)) & 96'h3F, 64'd25);
+
+        /*
+         * Frames that carry a DATA field.
+         *
+         * The gap that mattered: everything above has no payload, and on
+         * hardware exactly those worked while every frame with data drew no
+         * reply at all.  The expected words come from the C builder, which is
+         * itself checked against the documented vectors - so this compares two
+         * implementations rather than the RTL against itself.
+         */
+        $display("client_set(1): CMD 0x1C, LEN 3, 3 data bits");
+        nbits    = 0;
+        captured = 96'd0;
+        cmd      = 5'h1C;
+        len      = 6'd3;
+        dbits    = 6'd3;
+        data     = 63'd1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 22);
+        check_eq("client_set word", (captured >> LEAD) & 96'h3FFFFF, 64'h1B10F9);
+
+        $display("client_read CLIENT_ID: CMD 0x1A, LEN 7, 7 data bits");
+        nbits    = 0;
+        captured = 96'd0;
+        cmd      = 5'h1A;
+        len      = 6'd7;
+        dbits    = 6'd7;
+        data     = 63'h4F;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 26);
+        check_eq("client_read word", (captured >> LEAD) & 96'h3FFFFFF, 64'h1ECF1F5);
+
+        $display("client_write IOCONF: CMD 0x08, LEN 16, 16 data bits");
+        nbits    = 0;
+        captured = 96'd0;
+        cmd      = 5'h08;
+        len      = 6'd16;
+        dbits    = 6'd16;
+        data     = 63'h810;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 35);
+        check_eq("client_write word", (captured >> LEAD) & 96'h7FFFFFFFF, 64'h240810411);
 
         $display("");
         if (errors == 0) begin
