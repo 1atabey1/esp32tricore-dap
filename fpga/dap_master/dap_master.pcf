@@ -1,0 +1,33 @@
+# Pin constraints for the DAP-only bitstream, ICE40UP5K SG48.
+#
+# Only the target-facing pins are here, and only because they are confirmed two
+# independent ways:
+#
+#   * the schematic (docs/esp32jtag_sch_v1.4.png) maps FPGA IO08..IO11 through
+#     the 22R network R106 to connector pins PC01..PC04, all in BANK0 on
+#     VIO_VAR;
+#   * the stock bitstream configures exactly those IOBs - iceunpack shows tiles
+#     (13,31), (16,31) and (17,31) carrying IOB configuration, and the bit
+#     counts match the tile sharing: 40 bits where both blocks of a tile are in
+#     use, 20 where only one is.
+#
+# Every one of those package pins is at y=31 in the icebox database, which is
+# the UP5K top edge and therefore BANK0 - so the reading is self-consistent as
+# well as corroborated.
+#
+# Which PC0x pin carries which DAP signal comes from the board profile, which
+# was established on this bench rather than assumed:
+#
+#     PC01 = DAP2, PC02 = DAP0 (clock), PC03 = DAP1 (data), PC04 = TRST
+#
+# The ESP32 link pins are deliberately absent.  The schematic shows both the
+# FPGA configuration SPI and the LCD SPI reaching the ESP32, and the firmware
+# names pins that line up with neither cleanly - ICE_SPI_* on 8/18/14/21
+# against BANK1 labels GPIO14/GPIO38/GPIO21/GPIO09.  Guessing there would put
+# the command link on the wrong pads, so it waits for the same two-way
+# confirmation the pins below already have.
+
+set_io dap2     34   # IO08 -> PC01
+set_io dap0     32   # IO09 -> PC02, the clock this master generates
+set_io dap1     31   # IO10 -> PC03, the bidirectional data line
+set_io trst     28   # IO11 -> PC04, target reset on this bench
