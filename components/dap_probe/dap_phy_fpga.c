@@ -535,12 +535,19 @@ esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
         uint8_t payload[8] = {0};
         reg_read(REG_CMD, regs, sizeof(regs));
         reg_read(REG_DATA, payload, sizeof(payload));
-        ESP_LOGW(TAG, "  no reply; fabric holds cmd=0x%02X len=%u dbits=%u "
+        /*
+         * Debug level, not warning.  A frame drawing no reply is an ordinary
+         * outcome once this path is the default - an address that bus-errors
+         * answers exactly this way - and at warning level it buried the boot
+         * log.  It is the instrument that found the attach fault, so it stays,
+         * behind a log level rather than deleted.
+         */
+        ESP_LOGD(TAG, "  no reply; fabric holds cmd=0x%02X len=%u dbits=%u "
                       "rbits=%u data=%02X%02X%02X%02X%02X%02X%02X%02X",
                  regs[0], regs[1], regs[2], regs[3],
                  payload[7], payload[6], payload[5], payload[4],
                  payload[3], payload[2], payload[1], payload[0]);
-        ESP_LOGW(TAG, "  host asked for  cmd=0x%02X len=%u dbits=%u rbits=%u "
+        ESP_LOGD(TAG, "  host asked for  cmd=0x%02X len=%u dbits=%u rbits=%u "
                       "data=0x%08X%08X", cmd, len_field, (unsigned)data_bits,
                  (unsigned)reply_bits, (unsigned)(data >> 32), (unsigned)data);
     }

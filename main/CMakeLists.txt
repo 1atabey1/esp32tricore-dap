@@ -52,6 +52,9 @@ idf_component_register(
         "web/ez32.svg"
         "web/favicon.ico"
         "ice40up5k/bitstream.bin"
+        # Built from fpga/dap_master; copied in rather than embedded from the
+        # build tree, which is not in the repository, so a fresh clone builds.
+        "ice40up5k/dap_master.bin"
         "cacert.pem"
         "prvtkey.pem"
 )

@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "dap_phy.h"
+#include "dap_phy_fpga.h"
 #include "dap_probe.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -395,12 +396,32 @@ static esp_err_t attach_dap(void)
         ESP_LOGE(TAG, "DAP PHY unavailable on this board");
         return err;
     }
-    err = dap_probe_attach(&x, 3);
-    if (err != ESP_OK || x.reply != 0xAAAAAAAAu) {
-        ESP_LOGE(TAG, "the target did not answer sync");
-        return ESP_ERR_INVALID_STATE;
+
+    /*
+     * Through the fabric when it is there, which by default it is.
+     *
+     * The DAP bitstream replaces the Port C passthrough that the CPU-driven
+     * path runs over, so with it loaded that path reads nothing but 0xFFFFFFFF
+     * - this is not a preference between two working routes, it is the only
+     * one available.  The fabric attach also needs a DAPISC the CPU one does
+     * not, which is why it is a separate call rather than a flag.
+     *
+     * The CPU path stays as the fallback for a board running the stock image.
+     */
+    if (dap_phy_fpga_attach() == ESP_OK) {
+        ESP_LOGI(TAG, "using the fabric DAP master");
+    } else {
+        dap_phy_fpga_use(false);
+        ESP_LOGI(TAG, "no fabric DAP master; using the CPU-driven path");
+
+        err = dap_probe_attach(&x, 3);
+        if (err != ESP_OK || x.reply != 0xAAAAAAAAu) {
+            ESP_LOGE(TAG, "the target did not answer sync");
+            return ESP_ERR_INVALID_STATE;
+        }
+        dap_probe_client_set(1, &x);
     }
-    dap_probe_client_set(1, &x);
+
     dap_probe_clear_error_state();
     dap_probe_set_rw_mode(true);
 

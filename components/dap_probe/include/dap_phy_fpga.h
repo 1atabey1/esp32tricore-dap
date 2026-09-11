@@ -115,6 +115,25 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
 /* Whatever the fabric last reported, for diagnosis. */
 void dap_phy_fpga_log_status(void);
 
+/*
+ * Bring the fabric up and attach the target through it, leaving exchanges
+ * routed to the fabric on success.
+ *
+ * The sequence is not obvious and was expensive to find, so it lives here
+ * rather than in whichever caller needed it first: sync, then the LEN-48
+ * DAPISC clocked without a start-bit hunt, then an error-state clear, a
+ * resync, the client select and CLIENT_ID - retried, because the first attempt
+ * after the FPGA is configured fails about as often as it succeeds.
+ *
+ * Sync alone is not an attach: it is the resynchronisation command and the
+ * device answers it from any state, so it proves much less than it appears to.
+ * Without the DAPISC every later command is ignored; without the error-state
+ * clear, client_set works and client_read times out every time.
+ *
+ * Returns ESP_OK only when the target's hard-wired CLIENT_ID came back.
+ */
+esp_err_t dap_phy_fpga_attach(void);
+
 #ifdef __cplusplus
 }
 #endif

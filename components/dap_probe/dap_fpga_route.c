@@ -261,10 +261,13 @@ static void trail_sweep(void)
     dap_phy_fpga_set_trail(1);
 }
 
-esp_err_t dap_probe_fpga_route_check(void)
+/*
+ * The attach, as everything else uses it.  Declared in dap_phy_fpga.h; it
+ * lives here because this is where it was worked out and where the
+ * diagnostics that explain each step still are.
+ */
+esp_err_t dap_phy_fpga_attach(void)
 {
-    ESP_LOGW(TAG, "=== fabric DAP route ===");
-
     esp_err_t err = dap_phy_fpga_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "the fabric register file did not answer");
@@ -273,37 +276,15 @@ esp_err_t dap_probe_fpga_route_check(void)
 
     dap_phy_fpga_set_div(5);            /* 48 MHz / (2*6) = 4 MHz */
     dap_phy_fpga_set_maxwait(1024);
+    dap_phy_fpga_set_trail(1);
     dap_phy_fpga_use(true);
 
-    /* 1: does the fabric reach the target at all? */
     dap_exchange_t x;
-    dap_phy_fpga_set_trail(1);
-    err = dap_probe_attach(&x, 3);
-    ESP_LOGW(TAG, "  sync -> 0x%08" PRIX64 " wait %d %s", x.reply, x.wait_cycles,
-             (err == ESP_OK && x.reply == 0xAAAAAAAAu) ? "(expected)" : "MISMATCH");
-    if (err != ESP_OK || x.reply != 0xAAAAAAAAu) {
+    if (dap_probe_attach(&x, 3) != ESP_OK || x.reply != 0xAAAAAAAAu) {
+        ESP_LOGE(TAG, "the target did not answer sync through the fabric");
         dap_phy_fpga_use(false);
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_STATE;
     }
-
-    /*
-     * 2: select the client and read its hard-wired ID.
-     *
-     * Sync, then the DAPISC, then the two client frames.
-     *
-     * Sync alone is not an attach.  Sync is the resynchronisation command and
-     * the device answers it from any state - which is why it works here at
-     * every bit rate and every lead-in length, and why it proves much less than
-     * it appears to.  Dropping the DAPISC was tried, on the strength of a
-     * reference FSM that reaches a working bus read without one: over the
-     * fabric client_set then never worked at all, at any bit rate or lead-in.
-     * It is required on this link.
-     *
-     * See send_dapisc() for why it is clocked without a start-bit hunt.
-     */
-    ESP_LOGW(TAG, "--- attach ---");
-    dap_exchange_t id = {0};
-    esp_err_t      id_err = ESP_FAIL;
 
     /*
      * The DAPISC goes out once, before the retry loop rather than inside it.
@@ -312,9 +293,10 @@ esp_err_t dap_probe_fpga_route_check(void)
      * reason - which read as "the handshake never works" rather than "it is
      * being restarted each time".
      */
-    if (dap_probe_attach(&x, 3) == ESP_OK) {
-        send_dapisc();
-    }
+    send_dapisc();
+
+    dap_exchange_t id = {0};
+    esp_err_t      id_err = ESP_FAIL;
 
     for (int attempt = 0; attempt < 4; attempt++) {
         /*
@@ -338,17 +320,25 @@ esp_err_t dap_probe_fpga_route_check(void)
         }
         id_err = dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id);
         if (id_err == ESP_OK && id.reply == CLIENT_ID_EXPECT) {
-            ESP_LOGW(TAG, "  CLIENT_ID 0x%04X on attempt %d (wait %d)",
-                     (unsigned)id.reply, attempt + 1, id.wait_cycles);
-            break;
+            ESP_LOGI(TAG, "attached through the fabric: CLIENT_ID 0x%04X on "
+                          "attempt %d", (unsigned)id.reply, attempt + 1);
+            return ESP_OK;
         }
-        ESP_LOGW(TAG, "  attempt %d: CLIENT_ID 0x%04X (%s)", attempt + 1,
+        ESP_LOGW(TAG, "attach attempt %d: CLIENT_ID 0x%04X (%s)", attempt + 1,
                  (unsigned)id.reply, esp_err_to_name(id_err));
     }
 
-    if (id_err != ESP_OK || id.reply != CLIENT_ID_EXPECT) {
-        ESP_LOGE(TAG, "  CLIENT_ID came back 0x%04X, not 0x%04X",
-                 (unsigned)id.reply, CLIENT_ID_EXPECT);
+    ESP_LOGE(TAG, "CLIENT_ID came back 0x%04X, not 0x%04X",
+             (unsigned)id.reply, CLIENT_ID_EXPECT);
+    return ESP_FAIL;
+}
+
+esp_err_t dap_probe_fpga_route_check(void)
+{
+    ESP_LOGW(TAG, "=== fabric DAP route ===");
+
+    /* 1 and 2: the fabric answers, and the target attaches through it. */
+    if (dap_phy_fpga_attach() != ESP_OK) {
         probe_payload_frame();
         trail_sweep();
         dap_phy_fpga_log_status();

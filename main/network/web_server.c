@@ -2036,7 +2036,16 @@ static void dap_capture_end(httpd_req_t *req, const char *verdict)
     httpd_resp_set_type(req, "text/plain");
     if (s_dap_cap) {
         s_dap_cap[s_dap_cap_len] = '\0';
-        httpd_resp_send_chunk(req, s_dap_cap, s_dap_cap_len);
+        /*
+         * Only if there is something to send.  A zero-length chunk is the
+         * terminator in chunked encoding, so sending the buffer unconditionally
+         * ended the response before the verdict went out - an endpoint that
+         * logged nothing returned 200 with an empty body, which reads exactly
+         * like a handler that crashed.
+         */
+        if (s_dap_cap_len > 0) {
+            httpd_resp_send_chunk(req, s_dap_cap, s_dap_cap_len);
+        }
         free(s_dap_cap);
         s_dap_cap = NULL;
     }
@@ -2297,6 +2306,93 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
  *     curl -sk -u admin:admin --data-binary @dap_master.bin \
  *          https://<board>/api/fpga_load
  */
+/*
+ * GET /api/fpga_image?sel=dap|stock - which bitstream boots, and load it now.
+ *
+ * The two are mutually exclusive: the DAP image replaces the logic analyser,
+ * XVC and the Port C passthrough the CPU-driven DAP path runs over.  DAP is
+ * the default, so this is mainly the way back - and it matters that it exists
+ * without needing a host holding the other bitstream file, which is all
+ * /api/fpga_load can offer.
+ *
+ * With no `sel` it reports the current setting and changes nothing.
+ */
+static esp_err_t fpga_image_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    char query[64] = {0};
+    char sel[16]   = {0};
+    bool have_sel = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "sel", sel, sizeof(sel)) == ESP_OK) {
+        have_sel = true;
+    }
+
+    if (have_sel) {
+        if (strcmp(sel, "dap") != 0 && strcmp(sel, "stock") != 0) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "sel must be dap or stock\n");
+            return ESP_OK;
+        }
+        if (storage_write(FPGA_IMAGE_KEY, sel, strlen(sel) + 1) != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "could not save the setting\n");
+            return ESP_OK;
+        }
+    }
+
+    char *current = NULL;
+    const bool stock = (storage_alloc_and_read(FPGA_IMAGE_KEY, &current) == ESP_OK &&
+                        current && strcmp(current, "stock") == 0);
+    free(current);
+
+    dap_capture_begin();
+
+    if (have_sel) {
+        extern const unsigned char bitstream_bin_start[]  asm("_binary_bitstream_bin_start");
+        extern const unsigned char bitstream_bin_end[]    asm("_binary_bitstream_bin_end");
+        extern const unsigned char dap_master_bin_start[] asm("_binary_dap_master_bin_start");
+        extern const unsigned char dap_master_bin_end[]   asm("_binary_dap_master_bin_end");
+
+        /* The fabric is about to be replaced, so the host's picture of it is
+         * stale either way - see dap_phy_fpga_invalidate(). */
+        dap_phy_fpga_invalidate();
+
+        const gpio_config_t cfg_out = {
+            .mode         = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        const gpio_config_t cfg_in = {
+            .mode         = GPIO_MODE_INPUT,
+            .pin_bit_mask = (1ULL << AEL_PIN_NUM_MISO),
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&cfg_out);
+        gpio_config(&cfg_in);
+
+        const uint8_t status = stock
+            ? ICE_FPGA_Config(bitstream_bin_start,
+                              (uint32_t)(bitstream_bin_end - bitstream_bin_start))
+            : ICE_FPGA_Config(dap_master_bin_start,
+                              (uint32_t)(dap_master_bin_end - dap_master_bin_start));
+        ESP_LOGW(TAG, "loaded the %s bitstream: CDONE %s", stock ? "stock" : "DAP",
+                 status == 0 ? "up" : "DID NOT COME UP");
+    }
+
+    char verdict[96];
+    snprintf(verdict, sizeof(verdict), "\n=== boot bitstream: %s ===\n",
+             stock ? "stock" : "DAP master");
+    dap_capture_end(req, verdict);
+    return ESP_OK;
+}
+
 static esp_err_t fpga_load_handler(httpd_req_t *req)
 {
     if (check_auth(req) != ESP_OK) return ESP_OK;
@@ -2598,6 +2694,13 @@ httpd_uri_t uri_dap_trace_start = {
     .uri      = "/api/dap_trace/start",
     .method   = HTTP_GET,
     .handler  = dap_trace_start_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_fpga_image = {
+    .uri      = "/api/fpga_image",
+    .method   = HTTP_GET,
+    .handler  = fpga_image_handler,
     .user_ctx = NULL
 };
 
@@ -2987,6 +3090,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_dap_spi);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_start);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_selftest);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_image);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);

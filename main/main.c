@@ -35,6 +35,7 @@
 #include "boards/board_profile.h"
 #include "port_cfg.h"
 #include "dap_probe.h"
+#include "tricore_bmp.h"
 #if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
 #include "dap_phy.h"
 #endif
@@ -189,13 +190,40 @@ esp_err_t load_fpga(void)
 
     extern const unsigned char bitstream_bin_start[] asm("_binary_bitstream_bin_start");
     extern const unsigned char bitstream_bin_end[]   asm("_binary_bitstream_bin_end");
-    const size_t sz = (bitstream_bin_end - bitstream_bin_start);
+    extern const unsigned char dap_master_bin_start[] asm("_binary_dap_master_bin_start");
+    extern const unsigned char dap_master_bin_end[]   asm("_binary_dap_master_bin_end");
 
-    ESP_LOGI(TAG, "Configuring FPGA, bin file size=%ld", sz);
+    /*
+     * The DAP master by default, not the stock image.
+     *
+     * The two are mutually exclusive: the DAP bitstream replaces the logic
+     * analyser, XVC and the Port C passthrough the CPU-driven DAP path runs
+     * over.  It is the default because it is what this board is for now - the
+     * fabric master reaches 730 kB/s against the CPU path's 453 - and because
+     * a probe that needs a bitstream uploaded before it works is a probe that
+     * does not work after a power cycle.
+     *
+     * Set fpga_image to "stock" in NVS to get the other one back; that is the
+     * way out that does not need a host holding the bitstream file.
+     */
+    bool  want_stock = false;
+    char *choice     = NULL;
+    if (storage_alloc_and_read(FPGA_IMAGE_KEY, &choice) == ESP_OK && choice) {
+        want_stock = (strcmp(choice, "stock") == 0);
+        free(choice);
+    }
+
+    const unsigned char *image = want_stock ? bitstream_bin_start
+                                            : dap_master_bin_start;
+    const size_t sz = want_stock ? (size_t)(bitstream_bin_end - bitstream_bin_start)
+                                 : (size_t)(dap_master_bin_end - dap_master_bin_start);
+
+    ESP_LOGI(TAG, "Configuring FPGA with the %s bitstream, %u bytes",
+             want_stock ? "stock" : "DAP master", (unsigned)sz);
 
     uint8_t cfg_stat;
     int8_t retry = 3;
-    while ((cfg_stat = ICE_FPGA_Config(bitstream_bin_start, sz)) && (--retry)) {
+    while ((cfg_stat = ICE_FPGA_Config(image, sz)) && (--retry)) {
         ESP_LOGW(TAG, "FPGA configured ERROR - status = %d retry=%d", cfg_stat, retry);
     }
     if (retry)
@@ -1559,6 +1587,25 @@ void app_main(void) {
      * disabled: the bring-up had been releasing it as a side effect.
      */
     dap_probe_park_idle();
+
+    /*
+     * Register the TriCore with BMP's GDB server, so port 4242 has a target
+     * to attach to without anyone first poking an HTTP endpoint.
+     *
+     * After start_background_tasks() for two reasons: platform_init() runs in
+     * there and drives TRST, and target_new() appends to a list BMP owns.
+     *
+     * A failure here is logged and otherwise ignored.  It means no target was
+     * found - no board attached, or powered down - and that is a normal state
+     * for a probe sitting on a desk, not a reason to hold up the rest of the
+     * boot.  /api/dap_gdb/attach retries it once there is something to find.
+     */
+    if (b_use_portc) {
+        if (tricore_bmp_probe() != ESP_OK) {
+            ESP_LOGW(TAG, "no TriCore registered with GDB yet - attach later "
+                          "with /api/dap_gdb/attach");
+        }
+    }
 #endif
 
     if (g_board->has_lcd) {
