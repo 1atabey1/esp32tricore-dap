@@ -103,6 +103,18 @@ bool      tricore_debug_enabled(int core);
  */
 esp_err_t tricore_halt(int core, int line, uint32_t timeout_ms);
 
+/*
+ * The same halt, split so a caller that polls can use it.
+ *
+ * tricore_halt_request() drives the trigger line and returns immediately;
+ * tricore_halt_poll() reports whether the core has stopped and releases the
+ * line once it has.  The release matters and is why this is a pair rather than
+ * one call: a line left driven keeps every core routed to it halted, so it
+ * cannot simply be dropped when the request returns.
+ */
+esp_err_t tricore_halt_request(int core, int line);
+bool      tricore_halt_poll(int core);
+
 /* Clear the halt request and wait for the core to run again. */
 esp_err_t tricore_resume(int core, uint32_t timeout_ms);
 

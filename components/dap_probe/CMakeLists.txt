@@ -6,7 +6,7 @@
 
 idf_component_register(
     SRCS "dap_frame.c" "dap_phy.c" "dap_phy_spi.c" "dap_probe.c" "dap_trace.c"
-         "tricore.c" "gdb_rsp.c"
+         "tricore.c" "tricore_bmp.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_driver_spi esp_hw_support esp_timer lwip platform_include
+    REQUIRES driver esp_driver_spi esp_hw_support esp_timer platform_include blackmagic_esp32
 )

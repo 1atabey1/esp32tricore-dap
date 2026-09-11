@@ -237,16 +237,18 @@ static bool wait_halted(int core, bool want, uint32_t timeout_ms)
 /* Run control                                                               */
 /* ------------------------------------------------------------------------ */
 
-esp_err_t tricore_halt(int core, int line, uint32_t timeout_ms)
+/* The trigger line each core is currently being halted with, and the TLC value
+ * to put back when the line is released.  -1 when no halt is in flight. */
+static int      s_halt_line[TRICORE_MAX_CORES];
+static uint32_t s_halt_tlc[TRICORE_MAX_CORES];
+
+esp_err_t tricore_halt_request(int core, int line)
 {
     if (!core_ok(core)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (line < 1 || line > 7) {
         return ESP_ERR_INVALID_ARG;    /* line 0 does not exist */
-    }
-    if (tricore_is_halted(core)) {
-        return ESP_OK;
     }
 
     /*
@@ -278,13 +280,48 @@ esp_err_t tricore_halt(int core, int line, uint32_t timeout_ms)
     }
     const int shift = 4 * line;
 
-    dap_probe_write32(CBS_TLC,
-                      (control & ~(0xFu << shift)) | (TLSP_FORCE_ACTIVE << shift));
+    s_halt_line[core] = line;
+    s_halt_tlc[core]  = control & ~(0xFu << shift);
+
+    return dap_probe_write32(CBS_TLC,
+                             s_halt_tlc[core] | (TLSP_FORCE_ACTIVE << shift));
+}
+
+bool tricore_halt_poll(int core)
+{
+    if (!core_ok(core)) {
+        return false;
+    }
+    if (!tricore_is_halted(core)) {
+        return false;
+    }
+    if (s_halt_line[core] > 0) {
+        /* Release the line, or every core routed to it stays halted. */
+        dap_probe_write32(CBS_TLC, s_halt_tlc[core]);
+        s_halt_line[core] = 0;
+    }
+    return true;
+}
+
+esp_err_t tricore_halt(int core, int line, uint32_t timeout_ms)
+{
+    if (!core_ok(core)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (tricore_is_halted(core)) {
+        return ESP_OK;
+    }
+    const esp_err_t err = tricore_halt_request(core, line);
+    if (err != ESP_OK) {
+        return err;
+    }
     const bool stopped = wait_halted(core, true, timeout_ms);
 
-    /* Release the line whatever happened, or every core routed to it stays halted. */
-    dap_probe_write32(CBS_TLC, control & ~(0xFu << shift));
-
+    /* Release the line whatever happened. */
+    if (s_halt_line[core] > 0) {
+        dap_probe_write32(CBS_TLC, s_halt_tlc[core]);
+        s_halt_line[core] = 0;
+    }
     return stopped ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
