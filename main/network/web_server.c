@@ -31,6 +31,7 @@
 #include "dap_probe.h"
 #include "dap_trace.h"
 #include "tricore_bmp.h"
+#include "tricore_flash_probe.h"
 #include "tricore.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
@@ -2293,6 +2294,32 @@ static esp_err_t dap_gdb_status_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * GET /api/dap_flash_probe - can this probe load a flash page?
+ *
+ * The one open question standing between GDB `load` and this target.  Writes
+ * nothing to flash; see tricore_flash_probe.c for what it does and why that is
+ * safe.  Needs /api/dap_gdb/attach first, for the cores.
+ */
+static esp_err_t dap_flash_probe_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_capture_begin();
+    const esp_err_t err = tricore_flash_probe_width();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== a page load was accepted; flashing can come across ===\n"
+        : "\n=== no page load was accepted; flashing stays on DAS ===\n");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_flash_probe = {
+    .uri      = "/api/dap_flash_probe",
+    .method   = HTTP_GET,
+    .handler  = dap_flash_probe_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_dap_gdb_attach = {
     .uri      = "/api/dap_gdb/attach",
     .method   = HTTP_GET,
@@ -2696,6 +2723,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);
     httpd_register_uri_handler(*http_handle, &uri_dap_gdb_attach);
+    httpd_register_uri_handler(*http_handle, &uri_dap_flash_probe);
     httpd_register_uri_handler(*http_handle, &uri_dap_gdb_status);
     httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
