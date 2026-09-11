@@ -359,6 +359,30 @@ esp_err_t dap_probe_fpga_route_check(void)
         ESP_LOGW(TAG, "  miniMCDS ID unreadable");
     }
 
+    /*
+     * 3b: does this part allow wide mode at all?
+     *
+     * OIFM.DAPMODE selects the DAP interface's line count, and wide mode is
+     * only reachable if it is set to one of the values that route DAP2 out.
+     * Worth knowing before any of it is built: the whole feature is untestable
+     * on a part whose interface is strapped to two pins.
+     */
+    {
+        uint32_t oifm = 0;
+        if (dap_probe_read32(0xF000040Cu, &oifm) == ESP_OK) {
+            static const char *k_mode[8] = {
+                "2-pin, wide allowed", "reserved", "reserved",
+                "wide allowed", "wide allowed", "reserved",
+                "reserved", "reserved",
+            };
+            const unsigned mode = oifm & 7u;
+            ESP_LOGW(TAG, "  OIFM = 0x%08" PRIX32 ", DAPMODE %u (%s), PADCTL %u",
+                     oifm, mode, k_mode[mode], (unsigned)((oifm >> 12) & 3u));
+        } else {
+            ESP_LOGW(TAG, "  OIFM unreadable");
+        }
+    }
+
     /* 4: a block read, and what it costs. */
     {
         static uint32_t buf[256];
