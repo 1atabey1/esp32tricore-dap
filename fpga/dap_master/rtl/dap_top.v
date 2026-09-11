@@ -100,6 +100,16 @@ module dap_top #(
     reg        s_done, s_timed_out, s_idle_high, s_crc_ok, s_overrun;
     /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
     reg        s_aligned;
+    /*
+     * "The sequencer is running", as a flip-flop rather than a compare.
+     *
+     * STATUS bit 0 was `q != Q_IDLE` written inline, which puts a three-bit
+     * compare on the input of the read mux - and that mux is the design's
+     * critical path now that the frame engines are not.  One cycle stale is
+     * harmless: the host reads this over SPI, which is slower than the fabric
+     * by more than an order of magnitude.
+     */
+    reg        s_busy;
 
     /* ------------------------------------------------------------------ */
     /* SPI                                                                 */
@@ -108,13 +118,18 @@ module dap_top #(
     wire [6:0] reg_addr;
     wire [7:0] reg_wdata;
     wire       reg_we, reg_re, reg_consume;
-    reg        reg_re_d, reg_re_d2;
+    reg        reg_re_d, reg_re_d2, reg_re_d3;
     reg  [7:0] reg_rdata;
     /* First pipeline stage of the read: each address group's byte, plus which
-     * group the address is in. */
+     * group the address is in.  The control group's sixteen bytes are the one
+     * mux too deep to build in a single cycle, so it arrives as two halves and
+     * is chosen from in the second stage. */
+    reg  [7:0] q_ctrl_lo, q_ctrl_hi;
     reg  [7:0] q_ctrl, q_dat, q_rep, q_fifo;
-    reg  [2:0] q_grp;
-    reg        q_port;
+    reg  [7:0] q_dat_d, q_rep_d, q_fifo_d;
+    reg  [2:0] q_grp, q_grp_d;
+    reg        q_port, q_port_d;
+    reg        q_hi;
 
     spi_slave u_spi (
         .clk (clk), .rst (rst),
@@ -280,13 +295,30 @@ module dap_top #(
      * the timing path - it is a shift register and a four-way mux on one bit,
      * nowhere near the frame engines.
      */
-    reg [4:0] dap1_sync, dap2_sync;
+    reg [3:0] dap1_sync, dap2_sync;
+    reg       dap1_tap,  dap2_tap;
     always @(posedge clk) begin
-        dap1_sync <= {dap1_sync[3:0], dap1};
-        dap2_sync <= {dap2_sync[3:0], dap2};
+        dap1_sync <= {dap1_sync[2:0], dap1};
+        dap2_sync <= {dap2_sync[2:0], dap2};
+        /*
+         * The tap choice is registered, not wired into the sample.
+         *
+         * As a plain mux on dap1_in it sat in front of the receiver's
+         * start-bit hunt, and that four-way choice on one bit became the
+         * design's critical path - about two megahertz of it.  Here it feeds
+         * nothing but a flip-flop's D input and has a whole clock to settle.
+         *
+         * Counting from dap1_sync[0] rather than [1] is what keeps tap 0
+         * identical to the two-flop synchroniser this replaced: one stage in
+         * the shift register plus this register is the same two clocks of
+         * delay narrow mode was tuned against.  Taps 1 to 3 walk the sample
+         * one clock later each.
+         */
+        dap1_tap  <= dap1_sync[r_skew1];
+        dap2_tap  <= dap2_sync[r_skew2];
     end
-    assign dap1_in = dap1_sync[1 + r_skew1];
-    wire   dap2_in = dap2_sync[1 + r_skew2];
+    assign dap1_in = dap1_tap;
+    wire   dap2_in = dap2_tap;
 
     assign dap0    = tx_busy ? tx_dap0 : rx_dap0;
     /* DAP2 is an output only while a wide frame is being sent; the reply comes
@@ -341,6 +373,7 @@ module dap_top #(
         tx_start   <= 1'b0;
         rx_start   <= 1'b0;
         fifo_push  <= 1'b0;
+        s_busy     <= (q != Q_IDLE);
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -531,26 +564,46 @@ module dap_top #(
              * to be cut, so the group values are registered first (a short mux
              * on the low address bits) and the choice between them second.
              *
-             * Three cycles rather than two because the FIFO's head register
-             * updates a cycle after the pop, so the group stage needs one more
-             * to catch it - otherwise a drain sends each byte twice.  The
-             * dummy byte a read sends gives every fetch a whole byte time, so
-             * three cycles out of thirty-two is slack well spent.
+             * Four cycles now, not three.  Three was already needed because
+             * the FIFO's head register updates a cycle after the pop, so the
+             * group stage needs one more to catch it - otherwise a drain sends
+             * each byte twice.  The fourth is the control group's sixteen-way
+             * byte mux, which is four LUT levels of routing in one clock and
+             * became the design's critical path once the frame engines were
+             * dealt with and the DAP2 pad tightened the placement.  Split into
+             * two eight-way muxes and a choice between them a cycle later, it
+             * is half that.
+             *
+             * The budget is unchanged: the dummy byte a read sends is eight
+             * SPI clocks, sixteen fabric clocks at the fastest link rate this
+             * board runs, so four is still a quarter of it.
              */
-            q_ctrl   <= rd_ctrl;
+            q_ctrl_lo <= rd_ctrl_lo;
+            q_ctrl_hi <= rd_ctrl_hi;
+            q_hi      <= reg_addr[3];
             q_dat    <= rd_dat;
             q_rep    <= rd_rep;
             q_fifo   <= rd_fifo;
             q_grp    <= reg_addr[6:4];
             q_port   <= (reg_addr == 7'h40);
 
+            /* Second stage: pick the control half, and carry everything else
+             * along so the four groups still arrive together. */
+            q_ctrl   <= q_hi ? q_ctrl_hi : q_ctrl_lo;
+            q_dat_d  <= q_dat;
+            q_rep_d  <= q_rep;
+            q_fifo_d <= q_fifo;
+            q_grp_d  <= q_grp;
+            q_port_d <= q_port;
+
             reg_re_d  <= reg_re;
             reg_re_d2 <= reg_re_d;
-            if (reg_re_d2) begin
-                reg_rdata <= (q_grp == 3'h0) ? q_ctrl :
-                             (q_grp == 3'h1) ? q_dat  :
-                             (q_grp == 3'h2) ? q_rep  :
-                             q_port          ? q_fifo : 8'h00;
+            reg_re_d3 <= reg_re_d2;
+            if (reg_re_d3) begin
+                reg_rdata <= (q_grp_d == 3'h0) ? q_ctrl  :
+                             (q_grp_d == 3'h1) ? q_dat_d :
+                             (q_grp_d == 3'h2) ? q_rep_d :
+                             q_port_d          ? q_fifo_d : 8'h00;
             end
         end
     end
@@ -565,33 +618,35 @@ module dap_top #(
      * give.  Split into three small muxes on the low bits and one choice
      * between them on the high bits, it is three levels for the same result.
      */
-    reg [7:0] rd_ctrl, rd_dat, rd_rep;
+    reg [7:0] rd_ctrl_lo, rd_ctrl_hi, rd_dat, rd_rep;
 
     always @(*) begin
-        case (reg_addr[3:0])
-            4'h0: rd_ctrl = {s_overrun, fifo_full, fifo_empty, s_crc_ok,
-                             s_idle_high, s_timed_out, s_done, (q != Q_IDLE)};
-            4'h2: rd_ctrl = r_div;
-            4'h3: rd_ctrl = {3'd0, r_cmd};
-            4'h4: rd_ctrl = {2'd0, r_len};
-            4'h5: rd_ctrl = {2'd0, r_dbits};
-            4'h6: rd_ctrl = {1'b0, r_rbits};
-            4'h7: rd_ctrl = r_trail;
-            4'h8: rd_ctrl = r_maxwait[7:0];
-            4'h9: rd_ctrl = r_maxwait[15:8];
-            4'hA: rd_ctrl = r_parcels;
-            4'hB: rd_ctrl = {5'd0, r_wide, r_no_hunt, ~trst};
-            4'hC: rd_ctrl = {2'd0, r_lead};
-            4'hF: rd_ctrl = {4'd0, r_skew2, r_skew1};
+        case (reg_addr[2:0])
+            3'h0: rd_ctrl_lo = {s_overrun, fifo_full, fifo_empty, s_crc_ok,
+                                s_idle_high, s_timed_out, s_done, s_busy};
+            3'h2: rd_ctrl_lo = r_div;
+            3'h3: rd_ctrl_lo = {3'd0, r_cmd};
+            3'h4: rd_ctrl_lo = {2'd0, r_len};
+            3'h5: rd_ctrl_lo = {2'd0, r_dbits};
+            3'h6: rd_ctrl_lo = {1'b0, r_rbits};
+            default: rd_ctrl_lo = r_trail;             /* 0x07 */
+        endcase
+
+        case (reg_addr[2:0])
+            3'h0: rd_ctrl_hi = r_maxwait[7:0];         /* 0x08 */
+            3'h1: rd_ctrl_hi = r_maxwait[15:8];
+            3'h2: rd_ctrl_hi = r_parcels;
+            3'h3: rd_ctrl_hi = {5'd0, r_wide, r_no_hunt, ~trst};
+            3'h4: rd_ctrl_hi = {2'd0, r_lead};
+            3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
             /*
              * How many bytes are waiting.  This is what lets the host drain
              * while the block is still arriving instead of after it: the wire
              * takes about 2 ms for a 1 kB block and the drain about 1.6 ms,
              * and run one after the other that is most of the cost of a block.
              */
-            4'hD: rd_ctrl = fifo_count[7:0];
-            4'hE: rd_ctrl = {4'd0, fifo_count[11:8]};
-            default: rd_ctrl = 8'h00;
+            3'h5: rd_ctrl_hi = fifo_count[7:0];
+            default: rd_ctrl_hi = {4'd0, fifo_count[11:8]};   /* 0x0E */
         endcase
 
         /*

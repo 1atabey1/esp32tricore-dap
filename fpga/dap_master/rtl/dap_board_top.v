@@ -26,6 +26,7 @@ module dap_board_top (
     /* Target, through the 22R networks on Port C. */
     output wire dap0,      /* PC02, the clock this master generates */
     inout  wire dap1,      /* PC03, bidirectional data */
+    inout  wire dap2,      /* PC01, the odd bits in wide mode */
     output wire trst,      /* PC04, target reset on this bench */
 
     /* ESP32, on the FPGA configuration SPI reused as user IO. */
@@ -87,10 +88,10 @@ module dap_board_top (
      */
 
     /*
-     * dap2 is deliberately absent.  The connector has it and the stock image
-     * drives it, but this design has no use for it, and an unconstrained iCE40
-     * pad stays an input - which is the right thing to do to a target line
-     * nothing intends to drive.
+     * dap2 is here now, and it is bidirectional for the same reason dap1 is:
+     * wide mode sends the odd bits of a frame on it and the device answers on
+     * it.  Outside a wide frame it is tristated, so a target that is not in
+     * wide mode still sees a line nothing is driving.
      */
     dap_top #(
         .FIFO_DEPTH (1024)          /* exactly one maximum block read */

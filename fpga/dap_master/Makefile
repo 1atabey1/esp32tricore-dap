@@ -44,14 +44,20 @@ FABRIC_MHZ := 48
 
 # Pinned, because the placer is randomised and the spread between seeds is
 # several MHz on a design this full - larger than the remaining logic
-# differences - and only a few seeds clear 48 at all.  Seeds 3 and 12 both give
-# 49.46 MHz and seed 4 gives 49.07; most land between 46 and 48.  A bitstream
-# that only meets timing on a seed nobody recorded is not a design that meets
-# timing.  `bash seedsweep.sh build/board.json <seeds...>` re-checks - and it
-# has to be re-run whenever the netlist changes, since a seed's advantage
-# belongs to the netlist it was found on: the wide-mode datapath left seed 24
-# at 47.92 and failed, having been the best seed before it.
-SEED := 3
+# differences.  Seed 1 gives 50.40 MHz, seed 2 gives 49.81 and seed 8 gives
+# 49.78; seven of the first twelve clear 48.  A bitstream that only meets
+# timing on a seed nobody recorded is not a design that meets timing.
+# `bash seedsweep.sh build/board.json <seeds...>` re-checks - and it has to be
+# re-run whenever the netlist changes, because a seed's advantage belongs to
+# the netlist it was found on.  Wide mode made that concrete: seed 24 was the
+# best seed at 48.47, and on the wide netlist it lands at 47.92 and fails.
+#
+# Use the sweep as a distribution, not a search for one lucky seed.  Only one
+# seed in forty cleared 48 at one point during the wide-mode work, which said
+# the design was over its limit rather than that the seed was good; the fix was
+# to find the two paths responsible - see the capture tap in dap_top and the
+# split control read mux - after which most seeds clear it.
+SEED := 1
 
 bitstream: $(BUILD)/dap_master.bin
 
