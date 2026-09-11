@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -1946,6 +1947,72 @@ esp_err_t reset_to_factory_handler(httpd_req_t *req) {
 }
 
 /*
+ * Tee the log into the HTTP response while a DAP run is in progress.
+ *
+ * The serial console is not a reliable transport for these runs on this bench:
+ * the board reaches WSL over usbip, and a burst of a few hundred log lines
+ * loses most of them (vhci_hcd reports urb->status -104 while it happens),
+ * while the once-per-30s heartbeat survives.  That made a passing bring-up
+ * indistinguishable from a silent one.  Returning the report in the response
+ * body removes the console from the loop entirely.
+ *
+ * Other tasks logging at the same time land in the buffer too, which is
+ * harmless - their lines are tagged - and the hook is removed before the
+ * response is sent.
+ */
+#define DAP_CAPTURE_BYTES (96 * 1024)
+
+static char           *s_dap_cap;
+static size_t          s_dap_cap_len;
+static vprintf_like_t  s_dap_cap_prev;
+
+static int dap_capture_vprintf(const char *format, va_list args)
+{
+    if (s_dap_cap) {
+        va_list copy;
+        va_copy(copy, args);
+        const size_t room = DAP_CAPTURE_BYTES - 1 - s_dap_cap_len;
+        if (room > 1) {
+            const int n = vsnprintf(s_dap_cap + s_dap_cap_len, room, format, copy);
+            if (n > 0) {
+                s_dap_cap_len += ((size_t)n < room) ? (size_t)n : room - 1;
+            }
+        }
+        va_end(copy);
+    }
+    return s_dap_cap_prev ? s_dap_cap_prev(format, args) : 0;
+}
+
+static void dap_capture_begin(void)
+{
+    s_dap_cap_len = 0;
+    s_dap_cap = heap_caps_malloc(DAP_CAPTURE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dap_cap) {
+        return;
+    }
+    s_dap_cap[0] = '\0';
+    s_dap_cap_prev = esp_log_set_vprintf(dap_capture_vprintf);
+}
+
+/* Restore logging and send whatever was captured, with `verdict` on the end. */
+static void dap_capture_end(httpd_req_t *req, const char *verdict)
+{
+    if (s_dap_cap) {
+        esp_log_set_vprintf(s_dap_cap_prev);
+        s_dap_cap_prev = NULL;
+    }
+    httpd_resp_set_type(req, "text/plain");
+    if (s_dap_cap) {
+        s_dap_cap[s_dap_cap_len] = '\0';
+        httpd_resp_send_chunk(req, s_dap_cap, s_dap_cap_len);
+        free(s_dap_cap);
+        s_dap_cap = NULL;
+    }
+    httpd_resp_send_chunk(req, verdict, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/*
  * GET /api/dap_bringup - run the DAP bring-up checkpoints on demand.
  *
  * This exists so a bring-up run costs nothing but an HTTP request.  Doing it
@@ -1967,13 +2034,45 @@ static esp_err_t dap_bringup_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    dap_capture_begin();
     err = dap_probe_bringup_report();
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_sendstr(req, err == ESP_OK
-        ? "DAP bring-up PASSED - see the serial log for each checkpoint"
-        : "DAP bring-up did not complete - see the serial log for details");
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== DAP bring-up PASSED ===\n"
+        : "\n=== DAP bring-up did not complete ===\n");
     return ESP_OK;
 }
+
+/*
+ * GET /api/dap_spi - Phase 1c: run the same checkpoints with GP-SPI clocking,
+ * then measure both backends.  Separate from /api/dap_bringup because the
+ * bit-bang result is the reference the SPI numbers are compared against, and
+ * because a failed SPI experiment reverts rather than sticking.
+ */
+static esp_err_t dap_spi_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board");
+        return ESP_OK;
+    }
+
+    dap_capture_begin();
+    err = dap_probe_spi_bringup();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== GP-SPI backend PASSED ===\n"
+        : "\n=== GP-SPI backend did not pass ===\n");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_spi = {
+    .uri      = "/api/dap_spi",
+    .method   = HTTP_GET,
+    .handler  = dap_spi_handler,
+    .user_ctx = NULL
+};
 
 httpd_uri_t uri_dap_bringup = {
     .uri      = "/api/dap_bringup",
@@ -2317,6 +2416,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_log_error);
     httpd_register_uri_handler(*http_handle, &uri_ota_upload);
     httpd_register_uri_handler(*http_handle, &uri_reset_to_factory);
+    httpd_register_uri_handler(*http_handle, &uri_dap_spi);
     httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
     httpd_register_err_handler(*http_handle, HTTPD_404_NOT_FOUND, not_found_handler);

@@ -117,6 +117,17 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
  */
 esp_err_t dap_probe_set_rw_mode(bool supervisor);
 
+/*
+ * Clocks to issue after a reply, with the target still driving.  Zero suits
+ * the bit-banged backend, which issues one implicitly through its sampling
+ * offset; the SPI backend has no such offset and needs the real number.
+ */
+/* Dump raw reply bits instead of decoding, for diagnosis.  0 turns it off. */
+void   dap_probe_set_raw_window(size_t bits);
+
+void   dap_probe_set_trailer_bits(size_t n);
+size_t dap_probe_get_trailer_bits(void);
+
 /* Log an IOINFO value with its bits named. */
 void dap_probe_log_ioinfo(uint16_t v);
 
@@ -158,6 +169,13 @@ esp_err_t dap_probe_sync_health(int attempts);
 esp_err_t dap_probe_second_frame_matrix(void);
 
 esp_err_t dap_probe_bringup_report(void);
+
+/*
+ * Phase 1c: switch the clocking to GP-SPI, prove it on the same checkpoints
+ * the bit-bang path passes, then measure both.  Reverts to bit-bang and
+ * re-verifies it if any check fails.
+ */
+esp_err_t dap_probe_spi_bringup(void);
 
 /*
  * Sweep the attach variables that are cheap to vary in software - bit rate,

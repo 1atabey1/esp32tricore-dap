@@ -227,6 +227,42 @@ static spi_device_handle_t spi_device_1_manual_handle;
 static spi_device_handle_t spi_device_2_hw_handle;
 static spi_device_handle_t spi_device_3_hw_handle;
 static spi_device_handle_t spi_device_4_hw_handle;
+/*
+ * Release SPI2 so the DAP probe can clock with hardware instead of GPIO.
+ *
+ * SPI2 carries the XVC devices, and SPI3 carries the FPGA bitstream loader,
+ * every logic-analyser capture and the LCD - so SPI2 is the only one of the
+ * two that can be given away without breaking the pin path the probe itself
+ * depends on.  XVC is JTAG over the network, which is exactly the thing DAP
+ * replaces, so nothing that matters is lost; a reboot brings it back.
+ *
+ * Called from the DAP backend when it finds SPI2 already initialised.  The XVC
+ * task is only started when the port configuration selects FPGA+XVC, and DAP
+ * needs Port C in SWD/JTAG mode instead, so in the configuration this runs in
+ * there is no task holding these handles.
+ */
+esp_err_t spi_release_xvc_bus(void)
+{
+    spi_device_handle_t *devs[3] = {
+        &spi_device_2_hw_handle, &spi_device_3_hw_handle, &spi_device_4_hw_handle
+    };
+
+    if (g_board->has_xvc && gbl_pd_cfg == PD_FPGA_XVC) {
+        ESP_LOGE(TAG, "refusing to free SPI2: the XVC server is using it");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (*devs[i]) {
+            spi_bus_remove_device(*devs[i]);
+            *devs[i] = NULL;
+        }
+    }
+    const esp_err_t err = spi_bus_free(XVC_SPI_HOST);
+    ESP_LOGW(TAG, "released SPI2 from XVC for the DAP probe: %s", esp_err_to_name(err));
+    return err;
+}
+
 esp_err_t spi_master_init(void){
     if (!g_board->has_fpga) {
         ESP_LOGI(TAG, "SPI/FPGA fabric init skipped for board '%s'", g_board->name);

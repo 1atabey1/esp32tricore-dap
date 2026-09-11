@@ -19,6 +19,7 @@ static const char *TAG = "DAP";
  * turns that into a measurement instead of a guess.
  */
 static size_t s_trailer_bits;   /* zero: measured to be what the device wants */
+static size_t s_raw_window;     /* non-zero: dump this many raw reply bits */
 
 /*
  * How long to wait for a reply's start bit, in probe clocks.
@@ -185,6 +186,34 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
 /* Widest reply this layer reads in one go: start bit is consumed separately. */
 #define DAP_REPLY_MAX_BITS     64
 
+/*
+ * How many clocks to issue after a reply, with the target still driving.
+ *
+ * Zero is right for the bit-banged backend, which issues one implicitly: it
+ * samples before raising the clock, so it is always one clock ahead of the
+ * cells it has looked at.  The SPI backend samples on the edge and has no such
+ * offset, so what the device needs after a reply becomes an explicit number
+ * here rather than an accident of how the sampling loop is written.
+ */
+/*
+ * Dump `bits` raw reply bits instead of decoding, for every exchange until it
+ * is set back to zero.  The frames sent are the real ones - that is the point.
+ */
+void dap_probe_set_raw_window(size_t bits)
+{
+    s_raw_window = bits;
+}
+
+void dap_probe_set_trailer_bits(size_t n)
+{
+    s_trailer_bits = n;
+}
+
+size_t dap_probe_get_trailer_bits(void)
+{
+    return s_trailer_bits;
+}
+
 esp_err_t dap_probe_init(uint32_t clock_hz)
 {
 #if !AEL_BOARD_HAS_DAP_PROBE
@@ -255,14 +284,27 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
      * This is the same eleven clocks the reference probe sends before its own
      * sync, which it turns out are not a one-off attach ritual.
      */
-    dap_phy_idle_clocks(DAP_FRAME_LEAD_CLOCKS, 0);
-    dap_phy_write_frame(frame);
+    dap_phy_write_frame_with_lead(frame, DAP_FRAME_LEAD_CLOCKS);
     dap_phy_turnaround_to_read();
 
-    out->wait_cycles = dap_phy_await_start_bit(s_max_wait + DAP_WAIT_MARGIN);
-    if (out->wait_cycles == DAP_AWAIT_IDLE_HIGH) {
-        out->idle_high = true;
+    if (s_raw_window) {
+        uint8_t raw[96];
+        char    text[104];
+        size_t  n = s_raw_window > sizeof(raw) ? sizeof(raw) : s_raw_window;
+
+        dap_phy_read_bits(raw, n);
+        dap_phy_turnaround_to_write();
+        size_t k = 0;
+        for (size_t i = 0; i < n && k < sizeof(text) - 1; i++) {
+            text[k++] = raw[i] ? '1' : '0';
+        }
+        text[k] = '\0';
+        ESP_LOGW(TAG, "  raw CMD 0x%02X: %s", frame->bit[1] | (frame->bit[2] << 1) |
+                 (frame->bit[3] << 2) | (frame->bit[4] << 3) | (frame->bit[5] << 4), text);
+        return ESP_OK;
     }
+
+    out->wait_cycles = dap_phy_read_reply(bits, reply_bits, s_max_wait + DAP_WAIT_MARGIN);
     if (out->wait_cycles < 0) {
         out->timed_out = true;
         dap_phy_turnaround_to_write();
@@ -285,7 +327,18 @@ static esp_err_t exchange(const dap_frame_t *frame, size_t reply_bits,
      */
     const size_t to_read = reply_bits ? reply_bits + 6 : 0;
     if (to_read) {
-        dap_phy_read_bits(bits, to_read);
+        /*
+         * All ones, CRC included, is not a reply - it is an undriven wire read
+         * as a reply.  This is where that is visible: the start-bit search
+         * cannot tell a floating high line from a legitimate start bit, and
+         * should not try, because requiring a leading zero broke the SPI
+         * backend's alignment.
+         */
+        size_t ones = 0;
+        for (size_t i = 0; i < to_read; i++) {
+            ones += bits[i] ? 1u : 0u;
+        }
+        out->idle_high = (ones == to_read);
     }
     /*
      * Then a short trailer, still with the target driving.  The measured sync
@@ -526,7 +579,7 @@ esp_err_t dap_probe_dump_sync_reply(size_t window_bits)
     for (size_t i = 0; i < window_bits && n < sizeof(text) - 1; i++) {
         text[n++] = bits[i] ? '1' : '0';
     }
-    text[n] = ' ';
+    text[n] = '\0';
     ESP_LOGW(TAG, "sync reply window, %u bits raw:", (unsigned)window_bits);
     ESP_LOGW(TAG, "  %s", text);
     return ESP_OK;
@@ -973,7 +1026,14 @@ esp_err_t dap_probe_block_throughput(void)
      * reads 1 kB per telegram - 256 words, the maximum - so the frame cost is
      * amortised and what is left is wire time plus per-parcel overhead.
      */
-    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u };
+    /*
+     * Up to 16 MHz now that the pins are driven through the GPIO registers.
+     * The old ceiling was the driver call overhead rather than the wire or the
+     * device, so the rates above 4 MHz are new ground and the point where the
+     * target stops agreeing is a number this project has never had.
+     */
+    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u,
+                                      6000000u, 8000000u, 12000000u, 16000000u };
     static uint32_t buf[256];
     const int iterations = 8;
 
@@ -1016,7 +1076,14 @@ esp_err_t dap_probe_rate_test(void)
      * plan's Phase 1 numbers - "150-250 kB/s at ~4 MHz" - were an estimate and
      * have never been measured.
      */
-    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u };
+    /*
+     * Up to 16 MHz now that the pins are driven through the GPIO registers.
+     * The old ceiling was the driver call overhead rather than the wire or the
+     * device, so the rates above 4 MHz are new ground and the point where the
+     * target stops agreeing is a number this project has never had.
+     */
+    static const uint32_t rates[] = { 400000u, 1000000u, 2000000u, 4000000u,
+                                      6000000u, 8000000u, 12000000u, 16000000u };
     const int reads = 200;
 
     ESP_LOGW(TAG, "--- rate test: %d CLIENT_ID reads per rate ---", reads);
@@ -1075,7 +1142,7 @@ esp_err_t dap_probe_trailer_sweep(void)
             exchange(&f, 32, &x);
             line[n++] = (x.reply == DAP_SYNC_EXPECT) ? 'o' : '.';
         }
-        line[n] = ' ';
+        line[n] = '\0';
         ESP_LOGW(TAG, "  trailer %2u bits: %s", (unsigned)trailers[t], line);
     }
     s_trailer_bits = 0;      /* restore the value that works, not the one tested */
@@ -1115,7 +1182,7 @@ esp_err_t dap_probe_sync_health(int attempts)
             line[n++] = '|';
         }
     }
-    line[n] = ' ';
+    line[n] = '\0';
     ESP_LOGW(TAG, "sync health (o=0xAAAAAAAA, .=no reply, |=client_reset): %s", line);
     return ESP_OK;
 }
@@ -1165,6 +1232,287 @@ esp_err_t dap_probe_second_frame_matrix(void)
                  s2.reply);
     }
     return ESP_OK;
+}
+
+/*
+ * Phase 1c: bring the GP-SPI backend up and prove it against the bit-banged
+ * one on the same wire.
+ *
+ * The bit-bang path is correct and slow for a measured reason: 33.5 us per
+ * 33-bit word is about 1 MHz effective against a 4 MHz setting, so nearly all
+ * of that time is gpio_set_level() and cycle-counter spinning rather than wire
+ * time.  The frame layer is untouched by this; only the clocking changes.
+ *
+ * Correctness comes before speed, in an order where each failure names its own
+ * cause:
+ *
+ *   sync           - edge placement and bit order, against a known constant
+ *   CLIENT_ID      - a reply read back through the peripheral input path
+ *   STM0_TIM0 x2   - a live bus read, which a stuck wire cannot fake
+ *   blockread      - multi-parcel framing, cross-checked word for word
+ *
+ * If any of those fail the backend is switched off and the bit-bang path is
+ * re-verified, so a bad SPI experiment never leaves the probe broken.
+ */
+/*
+ * Send the real attach frames and print the raw reply window for each.
+ *
+ * Uses the ordinary transaction path with decoding switched off, so the frames,
+ * the lead clocks and the turnaround are exactly what the working bit-bang
+ * attach sends.  Run on both backends it shows whether the device answers
+ * client_set and client_read at all, and where in the window the answer sits.
+ */
+static void dump_raw_attach(const char *what)
+{
+    dap_exchange_t x;
+
+    ESP_LOGW(TAG, "--- raw windows, %s ---", what);
+    dap_phy_idle_clocks(s_max_wait, 0);
+
+    dap_probe_set_raw_window(48);
+    dap_probe_sync(&x);
+    dap_probe_client_set(1, &x);
+    dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
+    dap_probe_set_raw_window(0);
+}
+
+esp_err_t dap_probe_spi_bringup(void)
+{
+#if !AEL_BOARD_HAS_DAP_PROBE
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    dap_exchange_t x;
+    int failures = 0;
+
+    ESP_LOGW(TAG, "=== Phase 1c: GP-SPI backend ===");
+
+    /*
+     * Establish that the target answers *before* any of this, so a silence
+     * afterwards can be attributed.  Without it every SPI failure has two
+     * candidate causes and no way to tell them apart.
+     */
+    {
+        const esp_err_t pre = dap_probe_attach(&x, 3);
+        ESP_LOGW(TAG, "  before SPI, bit-bang sync -> 0x%08" PRIX64 " %s", x.reply,
+                 (pre == ESP_OK && x.reply == DAP_SYNC_EXPECT) ? "(target is answering)"
+                                                               : "(TARGET ALREADY SILENT)");
+        if (pre != ESP_OK || x.reply != DAP_SYNC_EXPECT) {
+            ESP_LOGE(TAG, "  nothing to measure against - fix the bit-bang attach first");
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    esp_err_t err = dap_phy_spi_init(AEL_DAP0_PIN, AEL_DAP1_PIN,
+                                     CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI backend init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    dap_phy_use_spi(true);
+    ESP_LOGI(TAG, "backend is now %s", dap_phy_is_spi() ? "GP-SPI" : "bit-bang");
+
+    dap_phy_spi_log_routing();
+
+    /* Prove the peripheral reaches the pads before asking the target anything. */
+    if (dap_phy_spi_loopback(0xA5) != ESP_OK) {
+        ESP_LOGE(TAG, "the SPI path does not even reach its own pads");
+        dap_phy_use_spi(false);
+        return ESP_FAIL;
+    }
+
+    /* And that the clock pad moves: it is the one signal with no readback. */
+    if (dap_phy_spi_clock_pad_check() != ESP_OK) {
+        ESP_LOGE(TAG, "no clock on the DAP0 pad - nothing downstream can work");
+        dap_phy_use_spi(false);
+        return ESP_FAIL;
+    }
+
+    /* And that a 19-bit frame is serialised the way the frame layer means it. */
+    {
+        dap_frame_t f;
+        uint8_t     echo[DAP_FRAME_MAX_BITS];
+        char        a[DAP_FRAME_MAX_BITS + 1], b[DAP_FRAME_MAX_BITS + 1];
+
+        if (dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0) &&
+            dap_phy_spi_echo_bits(f.bit, f.len, echo) == ESP_OK) {
+            size_t i;
+            for (i = 0; i < f.len; i++) {
+                a[i] = f.bit[i] ? '1' : '0';
+                b[i] = echo[i]  ? '1' : '0';
+            }
+            a[i] = '\0';
+            b[i] = '\0';
+            ESP_LOGW(TAG, "  sync frame out %s", a);
+            ESP_LOGW(TAG, "  read back      %s  %s", b,
+                     memcmp(f.bit, echo, f.len) == 0 ? "(identical)" : "DIFFERS");
+        }
+    }
+
+    /* 1: sync.  A wrong sampling edge shows up here and nowhere cheaper. */
+    err = dap_probe_attach(&x, 3);
+    ESP_LOGW(TAG, "  sync -> 0x%08" PRIX64 " wait %d crc 0x%02X %s %s", x.reply,
+             x.wait_cycles, x.reply_crc, x.crc_ok ? "residue-ok" : "residue-BAD",
+             x.reply == DAP_SYNC_EXPECT ? "(expected)" : "MISMATCH");
+    if (err != ESP_OK || x.reply != DAP_SYNC_EXPECT) {
+        failures++;
+        /*
+         * Dump the raw window on both backends before theorising.  A reply
+         * that is nearly right is either a sampling-phase problem or a length
+         * problem, and the two look identical in a decoded value.
+         */
+        ESP_LOGW(TAG, "  raw window, GP-SPI:");
+        dap_probe_dump_sync_reply(64);
+        dap_phy_use_spi(false);
+        dap_phy_idle_clocks(s_max_wait, 0);
+        ESP_LOGW(TAG, "  raw window, bit-bang:");
+        dap_probe_dump_sync_reply(64);
+        dap_phy_use_spi(true);
+    }
+
+    /* 2: a selected client and its hard-wired ID. */
+    if (!failures) {
+        /*
+         * Twice, deliberately.  The first exchange after a backend switch may
+         * be the one that teaches the window its wait count, and an
+         * acknowledge has no CRC to fail on, so it is retried rather than
+         * trusted.
+         */
+        dap_probe_client_set(1, &x);
+        dap_probe_client_set(1, &x);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
+            if (err == ESP_OK && x.reply == DAP_CLIENT_ID_EXPECT) {
+                break;
+            }
+            dap_phy_idle_clocks(s_max_wait, 0);
+            dap_probe_clear_error_state();
+        }
+        ESP_LOGW(TAG, "  CLIENT_ID -> 0x%04" PRIX64 " %s", x.reply,
+                 x.reply == DAP_CLIENT_ID_EXPECT ? "(expected)" : "MISMATCH");
+        if (x.reply != DAP_CLIENT_ID_EXPECT) {
+            failures++;
+        }
+    }
+
+    /* 3: a bus read that moves, so a stuck wire cannot pass. */
+    if (!failures) {
+        uint32_t a = 0, b = 0;
+        dap_probe_clear_error_state();
+        dap_probe_set_rw_mode(true);
+        if (dap_probe_read32(0xF0001010u, &a) == ESP_OK &&
+            dap_probe_read32(0xF0001010u, &b) == ESP_OK && a != b) {
+            ESP_LOGW(TAG, "  STM0_TIM0 0x%08" PRIX32 " -> 0x%08" PRIX32
+                          " (+%" PRIu32 ")", a, b, b - a);
+        } else {
+            ESP_LOGE(TAG, "  STM0_TIM0 read did not advance: 0x%08" PRIX32
+                          " / 0x%08" PRIX32, a, b);
+            failures++;
+        }
+    }
+
+    /* 4: multi-parcel framing, word for word against single reads. */
+    if (!failures) {
+        const uint32_t base = 0x70000000u;   /* DSPR: readable without OCDS */
+        uint32_t blk[8] = {0}, one = 0;
+        int mismatch = 0;
+
+        if (dap_probe_blockread(base, blk, 8) == ESP_OK) {
+            for (size_t i = 0; i < 8; i++) {
+                if (dap_probe_read32(base + 4u * i, &one) != ESP_OK || one != blk[i]) {
+                    mismatch++;
+                }
+            }
+            ESP_LOGW(TAG, "  blockread 8 words: %s",
+                     mismatch ? "MISMATCH vs single reads" : "matches single reads");
+        } else {
+            ESP_LOGE(TAG, "  blockread drew no parcels");
+            mismatch++;
+        }
+        if (mismatch) {
+            failures++;
+        }
+        dap_probe_clear_error_state();
+    }
+
+    if (failures) {
+        dap_probe_set_trailer_bits(0);
+        ESP_LOGE(TAG, "=== GP-SPI backend failed %d check%s: reverting to bit-bang ===",
+                 failures, failures == 1 ? "" : "s");
+        dap_phy_use_spi(false);
+        /*
+         * A failed SPI attempt may have left the device mid-telegram, so flush
+         * with a long low burst before deciding the bit-bang path is broken -
+         * otherwise the revert reports a pad-routing fault for what is only a
+         * desynchronised device.
+         */
+        dap_phy_idle_clocks(s_max_wait * 2u, 0);
+        /* Which of the two possible causes is it? */
+        if (!dap_phy_pad_toggle_check()) {
+            ESP_LOGE(TAG, "the pads are no longer under GPIO control");
+        }
+        dap_probe_clear_error_state();
+        if (dap_probe_attach(&x, 5) == ESP_OK && x.reply == DAP_SYNC_EXPECT) {
+            ESP_LOGI(TAG, "bit-bang path still good after the revert");
+        } else {
+            ESP_LOGE(TAG, "bit-bang path is broken too - the pad routing did not "
+                          "come back and a reset is needed");
+        }
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "=== GP-SPI backend passes every correctness check ===");
+
+    /* The same measurements as the bit-bang path, for a direct comparison. */
+    dap_probe_rate_test();
+    dap_probe_block_throughput();
+
+    /*
+     * And the rates only hardware clocking can reach.  The bit-bang path tops
+     * out near 1 MHz effective whatever it is asked for, so everything above
+     * that is new ground - and the rate where the target stops agreeing is a
+     * number this project has never had.
+     */
+    {
+        static const uint32_t fast[] = { 8000000u, 12000000u, 16000000u, 20000000u };
+        static uint32_t buf[256];
+
+        ESP_LOGW(TAG, "--- GP-SPI only: rates above the bit-bang ceiling ---");
+        for (size_t r = 0; r < sizeof(fast) / sizeof(fast[0]); r++) {
+            dap_phy_set_clock(fast[r]);
+
+            /* Re-verify at the new rate before trusting its throughput. */
+            dap_probe_clear_error_state();
+            if (dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x) != ESP_OK ||
+                x.reply != DAP_CLIENT_ID_EXPECT) {
+                ESP_LOGW(TAG, "  %8" PRIu32 " Hz: CLIENT_ID reads 0x%04" PRIX64
+                              " - past the usable rate", fast[r], x.reply);
+                continue;
+            }
+
+            int ok = 0;
+            const int64_t t0 = esp_timer_get_time();
+            for (int i = 0; i < 8; i++) {
+                if (dap_probe_blockread(0x70000000u, buf, 256) == ESP_OK) {
+                    ok++;
+                } else {
+                    dap_probe_clear_error_state();
+                }
+            }
+            const int64_t us = esp_timer_get_time() - t0;
+            if (ok && us > 0) {
+                const int kbps = (int)((int64_t)ok * 1024 * 1000000 / us / 1024);
+                ESP_LOGW(TAG, "  %8" PRIu32 " Hz: %d/8 blocks -> %d kB/s",
+                         fast[r], ok, kbps);
+            } else {
+                ESP_LOGW(TAG, "  %8" PRIu32 " Hz: no blocks completed", fast[r]);
+            }
+        }
+        dap_phy_set_clock(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    }
+
+    return ESP_OK;
+#endif
 }
 
 esp_err_t dap_probe_bringup_report(void)
@@ -1258,7 +1606,7 @@ esp_err_t dap_probe_bringup_report(void)
             for (size_t i = 0; i < sizeof(raw) && n < sizeof(text) - 1; i++) {
                 text[n++] = raw[i] ? '1' : '0';
             }
-            text[n] = ' ';
+            text[n] = '\0';
             ESP_LOGW(TAG, "dapisc reply window, %u bits raw:", (unsigned)sizeof(raw));
             ESP_LOGW(TAG, "  %s", text);
         }
