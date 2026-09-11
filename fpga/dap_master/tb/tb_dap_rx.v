@@ -28,6 +28,7 @@ module tb_dap_rx;
     reg  [6:0]  reply_bits = 7'd32;
     reg  [15:0] max_wait   = 16'd64;
     reg  [7:0]  trail      = 8'd1;
+    reg         expect_crc = 1'b1;
 
     wire        busy, done, timed_out, idle_high, crc_ok;
     wire [15:0] wait_cycles;
@@ -42,7 +43,7 @@ module tb_dap_rx;
     dap_frame_rx #(.DIV_WIDTH(8)) dut (
         .clk (clk), .rst (rst), .div (8'd1),
         .start (start), .reply_bits (reply_bits),
-        .max_wait (max_wait), .trail_clocks (trail),
+        .max_wait (max_wait), .trail_clocks (trail), .expect_crc (expect_crc),
         .busy (busy), .done (done),
         .wait_cycles (wait_cycles), .timed_out (timed_out),
         .idle_high (idle_high), .crc_ok (crc_ok),
@@ -100,6 +101,7 @@ module tb_dap_rx;
     endtask
 
     integer errors = 0;
+    integer k;
 
     task check;
         input [199:0] name;
@@ -213,6 +215,37 @@ module tb_dap_rx;
         check("acknowledged",       crc_ok === 1'b1);
         check("wait cycles = 1",    wait_cycles === 16'd1);
         check("not timed out",      timed_out === 1'b0);
+
+        /* ---- a block-read parcel: 32 bits and no CRC ----
+         * The parcels before the last one carry no checksum, and reading six
+         * phantom CRC bits after one of them would clock into the next parcel
+         * and shift the whole rest of the block. */
+        $display("block parcel, 32 bits with no CRC following");
+        repeat (4) @(posedge clk);
+        reply_bits = 7'd32;
+        expect_crc = 1'b0;
+        fork
+            begin
+                @(posedge clk) start = 1'b1;
+                @(posedge clk) start = 1'b0;
+            end
+            begin
+                /* Driven inline rather than through send_reply, which always
+                 * appends a CRC: with none expected the receiver stops
+                 * clocking after the payload, and a driver still waiting to
+                 * send checksum bits would hang on edges that never come. */
+                @(negedge dat_oe);
+                drive_bit(1'b0);
+                drive_bit(1'b1);
+                for (k = 0; k < 32; k = k + 1) drive_bit(32'h11223344 >> k);
+                target_bit = 1'b0;
+            end
+        join
+        wait (done); @(posedge clk);
+        check("parcel payload", payload[31:0] === 32'h11223344);
+        check("reported good",  crc_ok === 1'b1);
+        check("not timed out",  timed_out === 1'b0);
+        expect_crc = 1'b1;
 
         $display("");
         if (errors == 0) $display("PASSED (0 failures)");

@@ -56,6 +56,14 @@ module dap_frame_rx #(
     input  wire [15:0]           max_wait,
     /* Clocks to issue after the reply, target still driving.  See note 3. */
     input  wire [7:0]            trail_clocks,
+    /*
+     * Whether a CRC6 follows the payload.  It does for an ordinary reply, and
+     * for the *last* parcel of a block read - but not for the parcels before
+     * it, which are start bit plus 32 data bits and nothing else.  Reading six
+     * phantom CRC bits after one of those would clock into the next parcel and
+     * shift the whole rest of the block.
+     */
+    input  wire                  expect_crc,
 
     output reg                   busy,
     output reg                   done,
@@ -86,6 +94,7 @@ module dap_frame_rx #(
     reg                 all_ones;
 
     reg [6:0]  nbits_r;
+    reg        crc_r;
     reg [7:0]  trail_r;
     reg [15:0] max_wait_r;
 
@@ -143,6 +152,7 @@ module dap_frame_rx #(
                  */
                 dat_oe      <= 1'b0;
                 nbits_r     <= reply_bits;
+                crc_r       <= expect_crc;
                 trail_r     <= trail_clocks;
                 max_wait_r  <= max_wait;
                 trail_left  <= trail_clocks;
@@ -190,7 +200,7 @@ module dap_frame_rx #(
                             payload[index[5:0]] <= dap1_in;
                             all_ones            <= all_ones & dap1_in;
                             if (index + 1'b1 == nbits_r) begin
-                                state <= S_CRC;
+                                state <= crc_r ? S_CRC : S_TRAIL;
                                 index <= 7'd0;
                             end else begin
                                 index <= index + 1'b1;
@@ -236,8 +246,10 @@ module dap_frame_rx #(
                  * been fed through; a reply that never got that far reports the
                  * reason it stopped instead.
                  */
-                crc_ok    <= (nbits_r == 7'd0) ? 1'b1
-                                               : (residue_ok & ~timed_out);
+                /* Nothing to check means nothing to fail: an acknowledge and a
+                 * CRC-less block parcel are both good if they arrived at all. */
+                crc_ok    <= (nbits_r == 7'd0 || !crc_r) ? ~timed_out
+                                                         : (residue_ok & ~timed_out);
                 idle_high <= all_ones & (nbits_r != 7'd0);
                 dat_oe    <= 1'b1;        /* take the line back */
                 dap0      <= 1'b0;
