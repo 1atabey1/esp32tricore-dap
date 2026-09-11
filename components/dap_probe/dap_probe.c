@@ -180,6 +180,28 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
 #define DAP_ADDR_MCDS_CT       (DAP_ADDR_MCDS_BASE + 0x0010u)
 #define DAP_MCDS_ID_EXPECT     0x00D6C007u
 
+/*
+ * The trace FIFO, offsets from the miniMCDS base.  FIFONOW is the write
+ * pointer a drain follows; FIFOBOT and FIFOTOP are the buffer bounds, written
+ * by whoever sets the streaming up rather than by the MCDS configuration.
+ */
+#define DAP_ADDR_FIFONOW       (DAP_ADDR_MCDS_BASE + 0x0200u)
+#define DAP_ADDR_FIFOBOT       (DAP_ADDR_MCDS_BASE + 0x0204u)
+#define DAP_ADDR_FIFOTOP       (DAP_ADDR_MCDS_BASE + 0x020Cu)
+#define DAP_ADDR_FIFOCTL       (DAP_ADDR_MCDS_BASE + 0x0210u)
+#define DAP_ADDR_FIFOWARN0     (DAP_ADDR_MCDS_BASE + 0x0214u)
+#define DAP_ADDR_FIFOWARN1     (DAP_ADDR_MCDS_BASE + 0x0218u)
+#define DAP_ADDR_FIFOOVRCNT    (DAP_ADDR_MCDS_BASE + 0x021Cu)
+
+/*
+ * The TRAM itself, over the non-cached SRI alias: 8 kB, eight 1 kB paragraphs.
+ * Paragraph boundaries are where a drain resumes after a lap, because each
+ * trace unit's first message in a paragraph is uncompressed.
+ */
+#define DAP_ADDR_TRAM_BASE     0xB8000000u
+#define DAP_TRAM_BYTES         0x2000u
+#define DAP_TRAM_PARAGRAPH     0x400u
+
 #define DAP_SYNC_EXPECT        0xAAAAAAAAu
 #define DAP_SYNC_WIRE_WORD     0x09FE1u
 
@@ -1874,6 +1896,64 @@ esp_err_t dap_probe_bringup_report(void)
             }
         } else {
             ESP_LOGW(TAG, "7 blockread drew no parcels");
+            failures++;
+        }
+        dap_probe_clear_error_state();
+    }
+
+    /*
+     * Checkpoint 8, the groundwork for the autonomous drain: is the trace FIFO
+     * reachable, and is the TRAM readable through the same block reads?
+     *
+     * Nothing here configures tracing - that is the host's 54-write list - so
+     * FIFONOW is expected to sit still and the TRAM to hold whatever the last
+     * session left.  What it establishes is that the drain has something to
+     * read and a pointer to follow, which is the one assumption Phase 4 rests
+     * on and the one this project had never tested.
+     */
+    {
+        static const struct { uint32_t addr; const char *name; } fifo[] = {
+            { DAP_ADDR_FIFONOW,    "FIFONOW  (write pointer)" },
+            { DAP_ADDR_FIFOBOT,    "FIFOBOT  (buffer bottom)" },
+            { DAP_ADDR_FIFOTOP,    "FIFOTOP  (buffer top)" },
+            { DAP_ADDR_FIFOCTL,    "FIFOCTL" },
+            { DAP_ADDR_FIFOOVRCNT, "FIFOOVRCNT" },
+        };
+        uint32_t v = 0;
+        int fifo_ok = 0;
+
+        ESP_LOGI(TAG, "8 trace FIFO registers:");
+        for (size_t i = 0; i < sizeof(fifo) / sizeof(fifo[0]); i++) {
+            if (dap_probe_read32(fifo[i].addr, &v) == ESP_OK) {
+                ESP_LOGI(TAG, "   %-26s = 0x%08" PRIX32, fifo[i].name, v);
+                fifo_ok++;
+            } else {
+                ESP_LOGW(TAG, "   %-26s   no reply", fifo[i].name);
+            }
+        }
+
+        /* And the buffer behind it, one paragraph at a time. */
+        static uint32_t para[DAP_TRAM_PARAGRAPH / 4];
+        if (dap_probe_blockread(DAP_ADDR_TRAM_BASE, para, 256) == ESP_OK) {
+            /*
+             * A configuration seeds 0xFFFFFFFF into the first five words, which
+             * decodes as <endoftrace>, so an untouched buffer says so plainly
+             * rather than looking like data.
+             */
+            int ones = 0;
+            for (int i = 0; i < 5; i++) {
+                ones += (para[i] == 0xFFFFFFFFu);
+            }
+            ESP_LOGI(TAG, "8 TRAM 0x%08" PRIX32 ": %08" PRIX32 " %08" PRIX32
+                          " %08" PRIX32 " %08" PRIX32 " (%d of the first 5 words "
+                          "are all-ones%s)",
+                     DAP_ADDR_TRAM_BASE, para[0], para[1], para[2], para[3], ones,
+                     ones == 5 ? ", so it is seeded and empty" : "");
+        } else {
+            ESP_LOGW(TAG, "8 TRAM block read drew no parcels");
+            failures++;
+        }
+        if (fifo_ok == 0) {
             failures++;
         }
         dap_probe_clear_error_state();

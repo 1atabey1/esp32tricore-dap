@@ -5,7 +5,7 @@
 # ESP-IDF dependencies.
 
 idf_component_register(
-    SRCS "dap_frame.c" "dap_phy.c" "dap_phy_spi.c" "dap_probe.c"
+    SRCS "dap_frame.c" "dap_phy.c" "dap_phy_spi.c" "dap_probe.c" "dap_trace.c"
     INCLUDE_DIRS "include"
     REQUIRES driver esp_driver_spi esp_hw_support esp_timer platform_include
 )
