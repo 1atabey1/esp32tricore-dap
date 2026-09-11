@@ -104,7 +104,33 @@ static void publish(uint32_t par_index, const uint32_t *words, uint32_t lost)
     xSemaphoreGive(s_lock);
 }
 
+/*
+ * Everything dap_trace_start() does except spawn the drain task.
+ *
+ * Split out for the self-test, which has to write the FIFO pointer itself and
+ * cannot do that while a background task is driving the same DAP: there is one
+ * probe and no lock around it, so two tasks issuing frames interleave and the
+ * result is neither one's.  The self-test calls this and then polls in its own
+ * thread of control.
+ */
+static esp_err_t trace_begin(void);
+
 esp_err_t dap_trace_start(void)
+{
+    const esp_err_t err = trace_begin();
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (s_task == NULL &&
+        xTaskCreate(trace_task, "dap_trace", 4096, NULL, 6, &s_task) != pdPASS) {
+        s_running = false;
+        ESP_LOGE(TAG, "could not start the drain task");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t trace_begin(void)
 {
     if (s_ring == NULL) {
         s_ring = heap_caps_malloc(TRACE_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -167,13 +193,6 @@ esp_err_t dap_trace_start(void)
                   ", FIFONOW 0x%08" PRIX32 " (paragraph %" PRIu32 ")",
              s_span / TRACE_PARAGRAPH, (unsigned)TRACE_PARAGRAPH,
              TRACE_TRAM_BASE + bot, now, now_par);
-
-    if (s_task == NULL &&
-        xTaskCreate(trace_task, "dap_trace", 4096, NULL, 6, &s_task) != pdPASS) {
-        s_running = false;
-        ESP_LOGE(TAG, "could not start the drain task");
-        return ESP_ERR_NO_MEM;
-    }
     return ESP_OK;
 }
 
@@ -183,25 +202,20 @@ void dap_trace_stop(void)
     s_stats.running = false;
 }
 
-esp_err_t dap_trace_poll(void)
+/*
+ * Everything a poll does once it knows where the write pointer is.
+ *
+ * Split from the read of FIFONOW so the self-test can say where the pointer is
+ * rather than having to move it: that register is written by the trace
+ * hardware and is not writable over the DAP, so a self-test that needed it to
+ * be would not have been a test of anything.
+ */
+static esp_err_t drain_to(uint32_t now, uint32_t ovr)
 {
     static uint32_t words[TRACE_WORDS_PER_PAR];
 
-    if (!s_running) {
-        return ESP_OK;
-    }
-
     const int64_t t0 = esp_timer_get_time();
 
-    uint32_t now = 0, ovr = 0;
-    if (dap_probe_read32(TRACE_FIFONOW, &now) != ESP_OK) {
-        s_stats.read_errors++;
-        dap_probe_clear_error_state();
-        return ESP_ERR_TIMEOUT;
-    }
-    if (dap_probe_read32(TRACE_FIFOOVRCNT, &ovr) != ESP_OK) {
-        ovr = s_last_ovrcnt;
-    }
     if (ovr != s_last_ovrcnt) {
         /*
          * Observation-unit overflow, which is a different loss from a TRAM lap:
@@ -264,6 +278,24 @@ esp_err_t dap_trace_poll(void)
     return to_read ? ESP_OK : ESP_ERR_NOT_FOUND;    /* NOT_FOUND: nothing waiting */
 }
 
+esp_err_t dap_trace_poll(void)
+{
+    if (!s_running) {
+        return ESP_OK;
+    }
+
+    uint32_t now = 0, ovr = 0;
+    if (dap_probe_read32(TRACE_FIFONOW, &now) != ESP_OK) {
+        s_stats.read_errors++;
+        dap_probe_clear_error_state();
+        return ESP_ERR_TIMEOUT;
+    }
+    if (dap_probe_read32(TRACE_FIFOOVRCNT, &ovr) != ESP_OK) {
+        ovr = s_last_ovrcnt;
+    }
+    return drain_to(now, ovr);
+}
+
 /*
  * The drain task.
  *
@@ -317,4 +349,172 @@ void dap_trace_get_stats(dap_trace_stats_t *out)
     }
     *out = s_stats;
     out->running = s_running;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Self-test                                                                  */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Drive the drain with data we control, since the target is not tracing.
+ *
+ * The trace buffer and the FIFO write pointer are both ordinary memory as far
+ * as the DAP is concerned, so a pattern can be written into two paragraphs and
+ * the pointer moved over them - which is what the miniMCDS does when it is
+ * tracing, at a rate this can control.  Everything after that point is the
+ * real code path: the same poll, the same publish, the same ring, the same
+ * read the HTTP stream uses.
+ *
+ * Two paragraphs rather than one, because a single one cannot show that the
+ * paragraph index advances; the sequence numbers and TRAM offsets are checked
+ * as well as the payload, for the same reason.
+ */
+#define SELFTEST_PARAGRAPHS  2u
+
+esp_err_t dap_trace_selftest(void)
+{
+    static uint8_t got[SELFTEST_PARAGRAPHS *
+                       (sizeof(dap_trace_record_t) + TRACE_PARAGRAPH)];
+
+    dap_trace_stop();
+
+    uint32_t bot = 0, top = 0;
+    if (dap_probe_read32(TRACE_FIFOBOT, &bot) != ESP_OK ||
+        dap_probe_read32(TRACE_FIFOTOP, &top) != ESP_OK) {
+        ESP_LOGE(TAG, "selftest: the trace FIFO registers are not readable");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (top <= bot || ((top - bot + 1u) % TRACE_PARAGRAPH) != 0u) {
+        ESP_LOGE(TAG, "selftest: FIFOBOT/FIFOTOP are not whole paragraphs");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* A pattern that is wrong in an obvious way if anything shifts: the
+     * paragraph index in the top byte, the word index below it. */
+    for (uint32_t par = 0; par < SELFTEST_PARAGRAPHS; par++) {
+        const uint32_t addr = TRACE_TRAM_BASE + bot + par * TRACE_PARAGRAPH;
+
+        for (uint32_t i = 0; i < TRACE_WORDS_PER_PAR; i++) {
+            if (dap_probe_write32(addr + i * 4u,
+                                  (par << 24) | (i & 0x00FFFFFFu)) != ESP_OK) {
+                ESP_LOGE(TAG, "selftest: TRAM is not writable at 0x%08" PRIX32,
+                         addr + i * 4u);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+        }
+
+        /*
+         * Read one word back before trusting any of it.  A write that returns
+         * success has been acknowledged, not necessarily applied - the first
+         * version of this checked FIFONOW's writability by writing the value
+         * it already held, which read back correctly and proved nothing.
+         */
+        uint32_t check = 0;
+        const uint32_t want = (par << 24) | 1u;
+        if (dap_probe_read32(addr + 4u, &check) != ESP_OK || check != want) {
+            ESP_LOGE(TAG, "selftest: TRAM at 0x%08" PRIX32 " read back 0x%08"
+                          PRIX32 ", wanted 0x%08" PRIX32, addr + 4u, check, want);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+    }
+
+    /* No background task: this thread drives the poll, so nothing else is
+     * issuing DAP frames while the pointer is being moved. */
+    if (trace_begin() != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /*
+     * Tell the drain the pointer has moved past what was written, rather than
+     * moving it - FIFONOW belongs to the trace hardware and ignores writes.
+     * The drain excludes the pointer's own paragraph as still being written,
+     * so naming the one after them is what makes both complete.
+     */
+    s_next_par = 0;
+
+    size_t n = 0;
+    for (int pass = 0; pass < 8 && n < sizeof(got); pass++) {
+        const esp_err_t perr =
+            drain_to(bot + SELFTEST_PARAGRAPHS * TRACE_PARAGRAPH, s_last_ovrcnt);
+        if (perr != ESP_OK && perr != ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "selftest: a drain pass failed: %s",
+                     esp_err_to_name(perr));
+            break;
+        }
+        n += dap_trace_read(got + n, sizeof(got) - n);
+    }
+    s_running = false;
+
+    if (n != sizeof(got)) {
+        ESP_LOGE(TAG, "selftest: drained %u bytes of %u", (unsigned)n,
+                 (unsigned)sizeof(got));
+        return ESP_FAIL;
+    }
+
+    int            failures = 0;
+    const uint8_t *p = got;
+
+    for (uint32_t par = 0; par < SELFTEST_PARAGRAPHS; par++) {
+        dap_trace_record_t hdr;
+
+        memcpy(&hdr, p, sizeof(hdr));
+        p += sizeof(hdr);
+
+        if (hdr.magic != DAP_TRACE_MAGIC) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": magic 0x%08" PRIX32, par, hdr.magic);
+            failures++;
+        }
+        if (hdr.seq != par) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": seq %" PRIu32, par, hdr.seq);
+            failures++;
+        }
+        if (hdr.tram_offset != bot + par * TRACE_PARAGRAPH) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": offset 0x%08" PRIX32, par,
+                     hdr.tram_offset);
+            failures++;
+        }
+        if (hdr.length != TRACE_PARAGRAPH) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": length %u", par, hdr.length);
+            failures++;
+        }
+        if (hdr.flags != 0 || hdr.lost != 0) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": a gap was reported where none "
+                          "was made, flags 0x%04X lost %" PRIu32,
+                     par, hdr.flags, hdr.lost);
+            failures++;
+        }
+
+        int bad = 0;
+        for (uint32_t i = 0; i < TRACE_WORDS_PER_PAR; i++) {
+            uint32_t w;
+
+            memcpy(&w, p + i * 4u, sizeof(w));
+            if (w != ((par << 24) | (i & 0x00FFFFFFu))) {
+                if (bad == 0) {
+                    ESP_LOGE(TAG, "  record %" PRIu32 ": word %" PRIu32
+                                  " is 0x%08" PRIX32 ", wanted 0x%08" PRIX32,
+                             par, i, w, (par << 24) | i);
+                }
+                bad++;
+            }
+        }
+        if (bad) {
+            ESP_LOGE(TAG, "  record %" PRIu32 ": %d of %u words wrong", par, bad,
+                     (unsigned)TRACE_WORDS_PER_PAR);
+            failures++;
+        } else {
+            ESP_LOGW(TAG, "  record %" PRIu32 ": seq %" PRIu32 ", offset 0x%08"
+                          PRIX32 ", %u bytes, all correct", par, hdr.seq,
+                     hdr.tram_offset, (unsigned)TRACE_PARAGRAPH);
+        }
+        p += TRACE_PARAGRAPH;
+    }
+
+    if (failures) {
+        ESP_LOGE(TAG, "selftest FAILED (%d)", failures);
+        return ESP_FAIL;
+    }
+    ESP_LOGW(TAG, "selftest passed: %u paragraphs drained and verified byte for "
+                  "byte", (unsigned)SELFTEST_PARAGRAPHS);
+    return ESP_OK;
 }

@@ -2149,6 +2149,44 @@ static esp_err_t dap_trace_start_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * GET /api/dap_trace/selftest - prove the drain works on a target that is not
+ * tracing.
+ *
+ * Without this, "the drain ran and published nothing" is indistinguishable
+ * from "the drain is broken", which is the state the backend was in: it had
+ * never moved a byte on hardware because nothing here configures the miniMCDS
+ * to emit anything.  See dap_trace_selftest() for what it does and does not
+ * prove.
+ */
+static esp_err_t dap_trace_selftest_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board\n");
+        return ESP_OK;
+    }
+
+    dap_capture_begin();
+
+    dap_exchange_t x;
+    err = dap_probe_attach(&x, 3);
+    if (err == ESP_OK) {
+        dap_probe_client_set(1, &x);
+        dap_probe_clear_error_state();
+        dap_probe_set_rw_mode(true);
+        dap_probe_enable_ocds();
+        err = dap_trace_selftest();
+    }
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== trace drain verified ===\n"
+        : "\n=== trace drain NOT verified ===\n");
+    return ESP_OK;
+}
+
 static esp_err_t dap_trace_stop_handler(httpd_req_t *req)
 {
     if (check_auth(req) != ESP_OK) return ESP_OK;
@@ -2563,6 +2601,13 @@ httpd_uri_t uri_dap_trace_start = {
     .user_ctx = NULL
 };
 
+httpd_uri_t uri_dap_trace_selftest = {
+    .uri      = "/api/dap_trace/selftest",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_selftest_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_dap_trace_stop = {
     .uri      = "/api/dap_trace/stop",
     .method   = HTTP_GET,
@@ -2941,6 +2986,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_reset_to_factory);
     httpd_register_uri_handler(*http_handle, &uri_dap_spi);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_start);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_selftest);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
     httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);

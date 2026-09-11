@@ -96,6 +96,26 @@ size_t dap_trace_read(uint8_t *out, size_t max);
 
 void dap_trace_get_stats(dap_trace_stats_t *out);
 
+/*
+ * Prove the drain works, without waiting for the target to emit trace.
+ *
+ * This backend only ever follows the trace FIFO's write pointer; nothing here
+ * configures the miniMCDS to produce messages, so on a target that is not
+ * tracing there is nothing to drain and "it ran and published nothing" is
+ * indistinguishable from "it is broken".  This writes a known pattern into the
+ * trace buffer, advances the write pointer over it, and checks that exactly
+ * those bytes come back out of the ring in order.
+ *
+ * What it proves: paragraph detection, the wrap at the end of the buffer, the
+ * gap accounting, the ring, and the read path the HTTP stream uses - every
+ * part of this file.  What it does not prove: that the target's trace
+ * messages are what the host thinks they are.  That needs a target that is
+ * actually tracing, and is a separate question from whether the drain works.
+ *
+ * Returns ESP_OK only if every byte matched.  Leaves the drain stopped.
+ */
+esp_err_t dap_trace_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif
