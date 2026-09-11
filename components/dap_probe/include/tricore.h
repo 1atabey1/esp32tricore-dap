@@ -50,12 +50,34 @@ extern "C" {
 
 /* GDB register numbers, which this project defines because it also serves the
  * target description: D0..D15, A0..A15, then PCXI, PSW, PC. */
+/*
+ * Register numbering, which is GDB's and not ours to choose.
+ *
+ * `maint print registers` on a tricore-elf-gdb lists 44 raw registers in this
+ * exact order, and its architecture rejects any target description that does
+ * not supply all of them - which is what "Architecture rejected target-supplied
+ * description" meant when this stopped at 35 and called PCXI by its
+ * architectural name rather than GDB's `pcx`.
+ *
+ * All 44 are really readable; none of this is padding.  The nine beyond the
+ * core set come from Infineon's own IfxCpu_reg.h, and the five that overlap
+ * with the tas-debug reference - PCXI, PSW, PC, D0, A0 - agree with it exactly.
+ */
 #define TRICORE_REG_D0        0
 #define TRICORE_REG_A0        16
-#define TRICORE_REG_PCXI      32
-#define TRICORE_REG_PSW       33
-#define TRICORE_REG_PC        34
-#define TRICORE_NUM_REGS      35
+#define TRICORE_REG_LCX       32
+#define TRICORE_REG_FCX       33
+#define TRICORE_REG_PCXI      34    /* GDB calls this one `pcx` */
+#define TRICORE_REG_PSW       35
+#define TRICORE_REG_PC        36
+#define TRICORE_REG_ICR       37
+#define TRICORE_REG_ISP       38
+#define TRICORE_REG_BTV       39
+#define TRICORE_REG_BIV       40
+#define TRICORE_REG_SYSCON    41
+#define TRICORE_REG_PCON0     42
+#define TRICORE_REG_DCON0     43
+#define TRICORE_NUM_REGS      44
 
 typedef enum {
     TRICORE_BP_FREE = 0,
@@ -114,6 +136,23 @@ esp_err_t tricore_halt(int core, int line, uint32_t timeout_ms);
  */
 esp_err_t tricore_halt_request(int core, int line);
 bool      tricore_halt_poll(int core);
+
+/*
+ * Release the trigger line whether or not the core halted.
+ *
+ * Giving up on a halt without this leaves the line forced active, and the next
+ * attempt's assert is then no edge at all - so every later halt fails, on a
+ * target that keeps the state across a probe reboot.  The reference releases
+ * the line in a try/finally for the same reason.
+ */
+void      tricore_halt_release(int core);
+
+/*
+ * Log the registers that say why a halt did not arrive.  Called on the failure
+ * path rather than kept for interactive use: this failure is intermittent, and
+ * without the state at the moment it happened there is nothing to go on.
+ */
+void      tricore_halt_diag(int core, const char *what);
 
 /* Clear the halt request and wait for the core to run again. */
 esp_err_t tricore_resume(int core, uint32_t timeout_ms);

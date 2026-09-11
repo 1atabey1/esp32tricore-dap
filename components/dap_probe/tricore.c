@@ -79,6 +79,21 @@ static const uint32_t k_core_base[TRICORE_MAX_CORES] = {
 #define OFF_D0              0xFF00u     /* D0..D15, four bytes apart */
 #define OFF_A0              0xFF80u     /* A0..A15, four bytes apart */
 
+/*
+ * The rest of the core registers GDB asks for, from Infineon's IfxCpu_reg.h.
+ * PCXI, PSW, PC, D0 and A0 above are the five the tas-debug reference also
+ * uses, and agree with it.
+ */
+#define OFF_SYSCON          0xFE14u
+#define OFF_BIV             0xFE20u
+#define OFF_BTV             0xFE24u
+#define OFF_ISP             0xFE28u
+#define OFF_ICR             0xFE2Cu
+#define OFF_FCX             0xFE38u
+#define OFF_LCX             0xFE3Cu
+#define OFF_DCON0           0x9040u
+#define OFF_PCON0           0x920Cu
+
 /* DBGSR */
 #define DBGSR_DE            (1u << 0)
 #define DBGSR_HALT_SHIFT    1
@@ -301,11 +316,72 @@ esp_err_t tricore_halt_request(int core, int line)
     }
     const int shift = 4 * line;
 
+    /*
+     * The released state of the line is the baseline, not whatever is there
+     * now.
+     *
+     * Reading the current value and restoring it later assumes the line is
+     * idle to begin with, and if a previous halt left it forced active that
+     * assumption writes the fault in permanently: the "assert" below is then
+     * no transition at all, the core never takes a break-in event, and every
+     * halt from then on fails.  It survives a probe reboot too, because the
+     * state is the target's.  So the field is cleared here and released
+     * unconditionally when the wait ends - which is what the reference does
+     * with a try/finally.
+     */
     s_halt_line[core] = line;
     s_halt_tlc[core]  = control & ~(0xFu << shift);
 
+    if (dap_probe_write32(CBS_TLC, s_halt_tlc[core]) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return dap_probe_write32(CBS_TLC,
                              s_halt_tlc[core] | (TLSP_FORCE_ACTIVE << shift));
+}
+
+void tricore_halt_diag(int core, const char *what)
+{
+    if (!core_ok(core)) {
+        return;
+    }
+
+    uint32_t dbgsr = 0, exevt = 0, trc = 0, tlc = 0, ostate = 0;
+
+    rd(core, OFF_DBGSR, &dbgsr);
+    rd(core, OFF_EXEVT, &exevt);
+    dap_probe_read32(CBS_TRC(core), &trc);
+    dap_probe_read32(CBS_TLC, &tlc);
+    dap_probe_read32(CBS_OSTATE, &ostate);
+
+    /*
+     * The four registers that separate the ways a halt can fail to arrive, and
+     * what each should read once it has:
+     *
+     *   DBGSR  0x13   halted, DE set, SUSP set, EVTSRC 0 for EXEVT
+     *   EXEVT  0x22   halt and suspend, which is what this asks for
+     *   TRC    BRKIN  in bits 23:20, naming the line driving this core
+     *   TLC    0      the line released again
+     *   OSTATE OEN    set, or none of the rest is even listened to
+     *
+     * OEN clear means OCDS is off and every debug write is ignored in silence,
+     * which is the one failure that looks identical to a dead probe.
+     */
+    ESP_LOGE(TAG, "CPU%d %s: halt did not arrive. DBGSR=0x%08" PRIX32
+                  " EXEVT=0x%08" PRIX32 " TRC=0x%08" PRIX32
+                  " TLC=0x%08" PRIX32 " OSTATE=0x%08" PRIX32 "%s",
+             core, what, dbgsr, exevt, trc, tlc, ostate,
+             (ostate & OSTATE_OEN) ? "" : "  <- OCDS is off");
+}
+
+void tricore_halt_release(int core)
+{
+    if (!core_ok(core) || s_halt_line[core] <= 0) {
+        return;
+    }
+    /* Unconditional: a line left forced active stops the *next* halt from
+     * being an edge, so giving up on a halt has to undo it too. */
+    dap_probe_write32(CBS_TLC, s_halt_tlc[core]);
+    s_halt_line[core] = 0;
 }
 
 bool tricore_halt_poll(int core)
@@ -485,10 +561,19 @@ static uint32_t reg_offset(int regno)
         return OFF_A0 + 4u * (uint32_t)(regno - TRICORE_REG_A0);
     }
     switch (regno) {
-    case TRICORE_REG_PCXI: return OFF_PCXI;
-    case TRICORE_REG_PSW:  return OFF_PSW;
-    case TRICORE_REG_PC:   return OFF_PC;
-    default:               return 0;
+    case TRICORE_REG_LCX:    return OFF_LCX;
+    case TRICORE_REG_FCX:    return OFF_FCX;
+    case TRICORE_REG_PCXI:   return OFF_PCXI;
+    case TRICORE_REG_PSW:    return OFF_PSW;
+    case TRICORE_REG_PC:     return OFF_PC;
+    case TRICORE_REG_ICR:    return OFF_ICR;
+    case TRICORE_REG_ISP:    return OFF_ISP;
+    case TRICORE_REG_BTV:    return OFF_BTV;
+    case TRICORE_REG_BIV:    return OFF_BIV;
+    case TRICORE_REG_SYSCON: return OFF_SYSCON;
+    case TRICORE_REG_PCON0:  return OFF_PCON0;
+    case TRICORE_REG_DCON0:  return OFF_DCON0;
+    default:                 return 0;
     }
 }
 

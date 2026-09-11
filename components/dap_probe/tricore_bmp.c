@@ -92,14 +92,36 @@ static const char k_target_xml[] =
     "<reg name=\"a13\" bitsize=\"32\" type=\"data_ptr\"/>"
     "<reg name=\"a14\" bitsize=\"32\" type=\"data_ptr\"/>"
     "<reg name=\"a15\" bitsize=\"32\" type=\"data_ptr\"/>"
-    "<reg name=\"pcxi\" bitsize=\"32\" type=\"uint32\"/>"
+    /*
+     * From here the names and the order are GDB's, not the architecture's -
+     * `maint print registers` on tricore-elf-gdb lists exactly these 44 in
+     * exactly this sequence, and its architecture rejects a description that
+     * supplies anything else.  Two traps in one: PCXI has to be spelled `pcx`,
+     * and lcx and fcx come *before* it rather than after pc.  Getting either
+     * wrong produces "Architecture rejected target-supplied description" and
+     * then a register read that fails, with nothing saying which.
+     */
+    "<reg name=\"lcx\" bitsize=\"32\" type=\"uint32\"/>"
+    "<reg name=\"fcx\" bitsize=\"32\" type=\"uint32\"/>"
+    "<reg name=\"pcx\" bitsize=\"32\" type=\"uint32\"/>"
     "<reg name=\"psw\" bitsize=\"32\" type=\"uint32\"/>"
     "<reg name=\"pc\" bitsize=\"32\" type=\"code_ptr\"/>"
+    "<reg name=\"icr\" bitsize=\"32\" type=\"uint32\"/>"
+    "<reg name=\"isp\" bitsize=\"32\" type=\"data_ptr\"/>"
+    "<reg name=\"btv\" bitsize=\"32\" type=\"code_ptr\"/>"
+    "<reg name=\"biv\" bitsize=\"32\" type=\"code_ptr\"/>"
+    "<reg name=\"syscon\" bitsize=\"32\" type=\"uint32\"/>"
+    "<reg name=\"pcon0\" bitsize=\"32\" type=\"uint32\"/>"
+    "<reg name=\"dcon0\" bitsize=\"32\" type=\"uint32\"/>"
     "</feature>"
     "</target>";
 
 /* Sticky: set by any failed transaction, reported and cleared by check_error. */
 static bool s_error;
+
+/* Whether the last resume of this core was a single step, per core.  The step
+ * itself leaves no trace by the time BMP asks why the core halted. */
+static bool s_stepped[TRICORE_MAX_CORES];
 
 /* ------------------------------------------------------------------------ */
 /* Memory                                                                    */
@@ -249,6 +271,22 @@ static target_halt_reason_e tricore_halt_poll_cb(target_s *target, target_addr64
             }
         }
     }
+
+    /*
+     * A step that landed, reported as one.
+     *
+     * This cannot be read back off the trigger that caused it: tricore_step()
+     * is synchronous - it arms the successors, resumes, waits for the halt and
+     * disarms them again - so by the time BMP polls there is no step trigger
+     * left to recognise.  Falling through to TARGET_HALT_REQUEST made every
+     * `stepi` come back as "Program received signal SIGINT, Interrupt", GDB
+     * reporting a Ctrl-C the user never pressed for a step that had in fact
+     * completed normally.  TARGET_HALT_STEPPING is what produces SIGTRAP.
+     */
+    if (s_stepped[core]) {
+        s_stepped[core] = false;
+        return TARGET_HALT_STEPPING;
+    }
     return TARGET_HALT_REQUEST;
 }
 
@@ -263,6 +301,8 @@ static void tricore_halt_resume(target_s *target, bool step)
         } else if (result.note[0]) {
             ESP_LOGI(TAG, "CPU%d step: %s", core, result.note);
         }
+        /* Remembered for the poll that follows - see tricore_halt_poll_cb. */
+        s_stepped[core] = true;
         return;
     }
 
@@ -356,6 +396,50 @@ static bool tricore_attach(target_s *target)
     tricore_freeze_timer(core, true);
 
     s_error = false;
+
+    /*
+     * Halt, the way every other BMP target's attach does.
+     *
+     * GDB's attach means "stop it and take control", and here it is not a
+     * nicety: with OCDS enabled but the core running, reads of PC, PSW, PCXI
+     * and the GPRs all bus-error - only DBGSR is safe to poll, which the
+     * tas-debug reference says in as many words.  Attaching without halting
+     * therefore gave a session where the first `info registers` came back
+     * `Could not fetch register "pc"; remote failure reply 'EFF'` and nothing
+     * pointed at the cause.
+     */
+    target_halt_request(target);
+
+    /*
+     * Polled rather than asked once.  A halt here is not a register write that
+     * takes effect on the next instruction: it goes out as a debug event and
+     * comes back over a trigger line, so the core is still running for a short
+     * while afterwards and a single poll loses the race about as often as it
+     * wins it.
+     */
+    target_halt_reason_e reason = TARGET_HALT_RUNNING;
+    for (int i = 0; i < 200 && reason == TARGET_HALT_RUNNING; i++) {
+        reason = target_halt_poll(target, NULL);
+        if (reason == TARGET_HALT_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    if (reason == TARGET_HALT_ERROR || reason == TARGET_HALT_RUNNING) {
+        /*
+         * Say what the silicon looked like, not just that it did not stop.
+         * This failure is intermittent, and "CPU0 did not halt on attach" on
+         * its own cannot separate a halt that was never delivered from one
+         * that was and is not visible - the registers that distinguish them
+         * are the same four every time, so print them here rather than make
+         * the next person reconstruct the session by hand.
+         */
+        tricore_halt_diag(core, "attach");
+        /* Put the trigger line back before giving up, or this failure makes
+         * every later halt fail too - see tricore_halt_release(). */
+        tricore_halt_release(core);
+        return false;
+    }
     return true;
 }
 
