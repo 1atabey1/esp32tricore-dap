@@ -2315,6 +2315,159 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Trace over a WebSocket                                                     */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Why this exists alongside /api/dap_trace/stream.
+ *
+ * esp_http_server runs every request from one task, so a plain HTTP response
+ * that streamed for the length of a capture would block every other endpoint -
+ * including /api/dap_trace/stop, which would leave no way to stop the drain but
+ * a reset.  The chunked endpoint therefore returns after about a second and the
+ * client reconnects, and the gap between requests is covered by a 64 kB ring
+ * that a three-signal capture fills in roughly 160 ms.  It works for bring-up
+ * and it is not a transport for a sustained capture.
+ *
+ * A WebSocket has neither problem.  The handler returns as soon as the upgrade
+ * is done, so the server task is free, and the frames are pushed afterwards
+ * from a task of this file's own through httpd_ws_send_frame_async.  There is
+ * no reconnect, so there is no window in which the ring has to hold anything.
+ *
+ * One connection at a time, deliberately: the drained stream is consumed
+ * destructively - dap_trace_read() empties the ring - so two readers would each
+ * get an arbitrary half of the capture, which is worse than a refusal.
+ */
+
+#define TRACE_WS_CHUNK   4096
+#define TRACE_WS_IDLE_MS 5
+
+static httpd_handle_t s_trace_ws_hd;
+static int            s_trace_ws_fd = -1;
+static TaskHandle_t   s_trace_ws_task;
+static volatile bool  s_trace_ws_run;
+
+static void trace_ws_close(void)
+{
+    s_trace_ws_fd = -1;
+    s_trace_ws_hd = NULL;
+    s_trace_ws_run = false;
+}
+
+/*
+ * Push whatever the drain has produced, for as long as the socket lives.
+ *
+ * Sends are synchronous from this task's point of view but asynchronous with
+ * respect to the server task, which is the whole point.  A failed send means
+ * the peer is gone: there is nothing useful to do but stop, and continuing
+ * would spin on a dead descriptor.
+ */
+static void trace_ws_task(void *arg)
+{
+    uint8_t *buf = heap_caps_malloc(TRACE_WS_CHUNK,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = heap_caps_malloc(TRACE_WS_CHUNK, MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "trace ws: no buffer");
+        trace_ws_close();
+        s_trace_ws_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "trace ws: streaming to fd %d", s_trace_ws_fd);
+
+    while (s_trace_ws_run && s_trace_ws_fd >= 0) {
+        const size_t n = dap_trace_read(buf, TRACE_WS_CHUNK);
+
+        if (n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
+            continue;
+        }
+
+        httpd_ws_frame_t pkt = {
+            .final   = true,
+            .type    = HTTPD_WS_TYPE_BINARY,
+            .payload = buf,
+            .len     = n,
+        };
+
+        const esp_err_t err = httpd_ws_send_frame_async(s_trace_ws_hd,
+                                                        s_trace_ws_fd, &pkt);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "trace ws: send failed (%s); closing",
+                     esp_err_to_name(err));
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "trace ws: stopped");
+    free(buf);
+    trace_ws_close();
+    s_trace_ws_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/*
+ * GET /ws/trace - the upgrade, and nothing else.
+ *
+ * esp_http_server calls this once with method GET to perform the handshake and
+ * again for every frame the client sends.  The sender task is started on the
+ * handshake; incoming frames are read and discarded, because the client has
+ * nothing to say - it stops by closing, and /api/dap_trace/stop remains
+ * reachable throughout precisely because this handler does not linger.
+ */
+static esp_err_t trace_ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        if (s_trace_ws_fd >= 0) {
+            ESP_LOGW(TAG, "trace ws: already streaming to fd %d",
+                     s_trace_ws_fd);
+            return ESP_FAIL;      /* refuse rather than split the stream */
+        }
+        s_trace_ws_hd  = req->handle;
+        s_trace_ws_fd  = httpd_req_to_sockfd(req);
+        s_trace_ws_run = true;
+
+        if (xTaskCreate(trace_ws_task, "trace_ws", 4096, NULL, 5,
+                        &s_trace_ws_task) != pdPASS) {
+            ESP_LOGE(TAG, "trace ws: could not start the sender");
+            trace_ws_close();
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+
+    /*
+     * A frame from the client.  Read it so the socket does not stall, and use
+     * it only to notice a close.
+     */
+    httpd_ws_frame_t pkt = {0};
+    uint8_t scratch[64];
+
+    pkt.payload = scratch;
+    if (httpd_ws_recv_frame(req, &pkt, sizeof(scratch)) != ESP_OK) {
+        s_trace_ws_run = false;
+        return ESP_OK;
+    }
+    if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ESP_LOGI(TAG, "trace ws: client closed");
+        s_trace_ws_run = false;
+    }
+    return ESP_OK;
+}
+
+httpd_uri_t uri_trace_ws = {
+    .uri          = "/ws/trace",
+    .method       = HTTP_GET,
+    .handler      = trace_ws_handler,
+    .user_ctx     = NULL,
+    .is_websocket = true,
+};
+
 /*
  * POST /api/fpga_load - configure the FPGA from an uploaded bitstream.
  *
@@ -3144,6 +3297,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_file_delete);
     httpd_register_uri_handler(*http_handle, &uri_logic_analyzer);
     httpd_register_uri_handler(*http_handle, &uri_trace_page);
+    httpd_register_uri_handler(*http_handle, &uri_trace_ws);
     httpd_register_uri_handler(*http_handle, &uri_help);
     //httpd_register_uri_handler(*http_handle, &uri_logic_analyzer_data);
     httpd_register_uri_handler(*http_handle, &uri_log_error);

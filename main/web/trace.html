@@ -92,6 +92,7 @@
     <div class="cell"><div class="k">Paragraphs</div><div class="v" id="s_records">0</div></div>
     <div class="cell"><div class="k">Gaps seen</div><div class="v" id="s_gaps">0</div></div>
     <div class="cell"><div class="k">Framing errors</div><div class="v" id="s_bad">0</div></div>
+    <div class="cell"><div class="k">Transport</div><div class="v" id="s_tx" style="font-size:15px">-</div></div>
   </div>
 
   <h2>Probe counters</h2>
@@ -147,6 +148,8 @@ const fmtBytes = n =>
 
 let running = false;      // our streaming loop, not the probe's drain
 let abort = null;
+let sock = null;          // the WebSocket, when one is up
+let transport = "-";
 let carry = new Uint8Array(0);   // bytes left over from the last chunk
 let writer = null;               // FileSystemWritableFileStream, when chosen
 let memory = [];                 // fallback sink
@@ -237,6 +240,64 @@ async function sink(chunk) {
   else { memory.push(chunk); el("download").disabled = false; }
 }
 
+/*
+ * The preferred transport.
+ *
+ * The chunked endpoint below returns after about a second by design - the
+ * probe's web server runs every request from one task, so a response held open
+ * for a whole capture would block /api/dap_trace/stop too - and every
+ * reconnect is a window in which the probe's 64 kB ring has to hold everything
+ * the target produces, which at three signals is about 160 ms of headroom.
+ *
+ * A WebSocket has no such window: the upgrade returns immediately, the probe
+ * pushes frames from a task of its own, and the connection simply stays up.
+ * This is the one to use for a capture that matters; the fallback exists for
+ * browsers or proxies that will not carry one.
+ */
+function pumpWebSocket() {
+  return new Promise(resolve => {
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") +
+                location.host + "/ws/trace";
+    let ws;
+    try { ws = new WebSocket(url); } catch (e) { resolve(false); return; }
+
+    ws.binaryType = "arraybuffer";
+    let opened = false;
+
+    ws.onopen = () => {
+      opened = true;
+      sock = ws;
+      transport = "websocket";
+      el("state").textContent = "capturing (websocket)";
+      log("streaming over a websocket");
+      resolve(true);
+    };
+
+    ws.onmessage = async ev => {
+      const chunk = new Uint8Array(ev.data);
+      st.bytes += chunk.length;
+      await sink(chunk);
+      carry = consume(concat(carry, chunk));
+      render();
+    };
+
+    ws.onerror = () => {
+      if (!opened) { resolve(false); }        // fall back, quietly
+    };
+
+    ws.onclose = () => {
+      sock = null;
+      if (!opened) { resolve(false); return; }
+      if (running) {
+        log("websocket closed; falling back to the chunked stream");
+        transport = "chunked";
+        el("state").textContent = "capturing (chunked)";
+        pump();
+      }
+    };
+  });
+}
+
 async function pump() {
   st.t0 = performance.now();
   while (running) {
@@ -280,6 +341,7 @@ function render() {
   g.className = "v" + (st.gaps ? " warn" : " ok");
   const b = el("s_bad"); b.textContent = st.bad;
   b.className = "v" + (st.bad ? " bad" : " ok");
+  el("s_tx").textContent = transport;
 }
 
 async function poll() {
@@ -324,11 +386,20 @@ el("start").onclick = async () => {
   carry = new Uint8Array(0);
   running = true;
   setState(true);
-  pump();
+  st.t0 = performance.now();
+
+  /* Try the websocket first and fall back without fuss if it will not open. */
+  if (!await pumpWebSocket()) {
+    transport = "chunked";
+    el("state").textContent = "capturing (chunked)";
+    log("no websocket; using the chunked stream, which reconnects every second");
+    pump();
+  }
 };
 
 el("stop").onclick = async () => {
   running = false;
+  if (sock) { sock.close(); sock = null; }
   if (abort) abort.abort();
   setState(false);
   try { log("stop: " + (await (await fetch("/api/dap_trace/stop")).text()).trim()); }
