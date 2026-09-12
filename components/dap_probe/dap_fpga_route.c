@@ -1352,7 +1352,7 @@ static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
              * are swapped, offset by a bit, or being read at the wrong phase.
              */
             if (aligned || x.reply != 0u) {
-                ESP_LOGW(TAG, "      taps %u,%u -> 0x%08" PRIX32 "%s", t1, t2,
+                ESP_LOGW(TAG, "      taps %u,%u -> 0x%08" PRIX64 "%s", t1, t2,
                          x.reply, aligned ? "  (start bit on DAP2)" : "");
             }
 
@@ -1578,7 +1578,7 @@ static void wide_route_check(void)
     dap_exchange_t probe = {0};
     const bool still_narrow = dap_probe_attach(&probe, 3) == ESP_OK &&
                               probe.reply == 0xAAAAAAAAu;
-    ESP_LOGW(TAG, "  narrow sync after the handshake: %s (0x%08" PRIX32 ")",
+    ESP_LOGW(TAG, "  narrow sync after the handshake: %s (0x%08" PRIX64 ")",
              still_narrow ? "still answers - the mux did NOT switch"
                           : "no longer answers", probe.reply);
 
@@ -1627,11 +1627,23 @@ static void wide_route_check(void)
      * the device back in narrow mode between attempts.
      */
     if (s_wide_stage == 6) {
+        /*
+         * dap_exchange_t::reply is 64 bits, and every log of it has to say so.
+         *
+         * Printed with PRIX32 it hands vsnprintf four bytes of an eight-byte
+         * argument and every argument after it comes from the wrong slot: the
+         * trailing %s here picked up the value's high half, which is zero, and
+         * strlen(NULL) panicked the probe.  That is the whole of the "one wide
+         * frame is survivable, sixteen are not" folklore in the notes above -
+         * the tap sweep logs the same way, so it died on whichever frame first
+         * reached the log, and it looked like something cumulative on the DAP2
+         * net.  Nothing was wrong with the hardware.
+         */
         dap_exchange_t one = {0};
 
         dap_phy_fpga_set_skew((uint8_t)s_wide_tap1, (uint8_t)s_wide_tap2);
         const esp_err_t e = dap_probe_sync(&one);
-        ESP_LOGW(TAG, "  taps %d,%d: sync %s, reply 0x%08" PRIX32 "%s",
+        ESP_LOGW(TAG, "  taps %d,%d: sync %s, reply 0x%08" PRIX64 "%s",
                  s_wide_tap1, s_wide_tap2, esp_err_to_name(e), one.reply,
                  one.reply == 0xAAAAAAAAu ? "   <== CORRECT" : "");
         wide_revert();
