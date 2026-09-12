@@ -73,12 +73,16 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_RCRC        0x24
 #define REG_WAIT        0x25
 #define REG_FIFO        0x40
+#define REG_WLEVEL      0x43    /* 16-bit, bytes waiting in the write FIFO */
+#define REG_WFIFO       0x48    /* byte port into the write FIFO */
 #define REG_SCAN        0x41    /* 16-bit: every other BANK0 pad's level */
 
 #define CTRL_START_FRAME (1u << 0)
 #define CTRL_START_BLOCK (1u << 1)
 #define CTRL_ABORT       (1u << 2)
 #define CTRL_CLEAR_FIFO  (1u << 3)
+#define CTRL_START_WRITE (1u << 4)
+#define CTRL_CLEAR_WFIFO (1u << 5)
 
 #define ST_BUSY          (1u << 0)
 #define ST_DONE          (1u << 1)
@@ -870,6 +874,91 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
                    ((uint32_t)s_buf[4 * i + 1] << 8) |
                    ((uint32_t)s_buf[4 * i + 2] << 16) |
                    ((uint32_t)s_buf[4 * i + 3] << 24);
+    }
+    return ESP_OK;
+}
+
+/*
+ * One client_blockwrite: the command frame, then `count` words streamed from
+ * the fabric's write FIFO.
+ *
+ * Capped at DAP_FPGA_BLOCK_WORDS because the FIFO holds that much: the whole
+ * block goes in before the transfer starts, so the host is not in the loop at
+ * all once it does.  The fabric stalls rather than fails if the FIFO runs dry,
+ * so a larger block would work too - it would just put the host back in the
+ * loop, which is the thing worth avoiding.
+ *
+ * The address is word-aligned and travels shifted right by two, which is what
+ * the 30-bit address form in the telegram carries.
+ */
+esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
+                                   size_t count)
+{
+    uint8_t status = 0;
+
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (count == 0 || count > DAP_FPGA_BLOCK_WORDS || words == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (address & 3u) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (reg_write8(REG_CTRL, CTRL_CLEAR_WFIFO) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /*
+     * The words first, as one burst.  0x48 does not auto-increment - it is a
+     * port, like the reply FIFO's 0x40 - so a burst of any length lands in the
+     * FIFO in order.
+     */
+    for (size_t i = 0; i < count; i += DAP_FPGA_BURST_WORDS) {
+        const size_t n = (count - i > DAP_FPGA_BURST_WORDS)
+                             ? DAP_FPGA_BURST_WORDS : (count - i);
+        uint8_t *out = s_buf;
+
+        for (size_t w = 0; w < n; w++) {
+            const uint32_t value = words[i + w];
+            *out++ = (uint8_t)(value);
+            *out++ = (uint8_t)(value >> 8);
+            *out++ = (uint8_t)(value >> 16);
+            *out++ = (uint8_t)(value >> 24);
+        }
+        if (reg_write(REG_WFIFO, s_buf, n * 4) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+
+    /*
+     * bit 0  CRCdown, bit 1 per-parcel CRC6, bits 9:2 the word count with 0
+     * meaning 256, bits 39:10 the word address.  Both checks are off: the
+     * loader verifies the whole image with an on-target CRC32 afterwards,
+     * which costs one round trip for the lot rather than six bits per word.
+     */
+    const uint64_t payload = ((uint64_t)(address >> 2) << 10) |
+                             ((uint64_t)(count & 0xFFu) << 2);
+
+    if (load_frame(0x09u, 40, payload, 40, 0) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (reg_write8(REG_PARCELS, (uint8_t)(count - 1)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (reg_write8(REG_CTRL, CTRL_START_WRITE) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    const esp_err_t err = wait_done(&status);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (status & ST_TIMED_OUT) {
+        ESP_LOGW(TAG, "block write to 0x%08" PRIX32 " was not acknowledged",
+                 address);
+        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }

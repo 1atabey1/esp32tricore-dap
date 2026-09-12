@@ -164,7 +164,6 @@ uint8_t   dap_phy_fpga_line_witness(void);
  * own pins, the bit that follows names the pad it reaches, and no bit
  * following says no free pad does.
  */
-uint16_t  dap_phy_fpga_pad_scan(void);
 
 /*
  * Send a frame the caller assembled, bit for bit.
@@ -183,6 +182,30 @@ uint16_t  dap_phy_fpga_pad_scan(void);
 esp_err_t dap_phy_fpga_raw_frame(uint64_t bits, size_t nbits,
                                  size_t reply_bits,
                                  uint32_t *reply, uint16_t *wait_cycles);
+
+/*
+ * How many words one client_blockwrite carries here.
+ *
+ * The fabric's write FIFO holds this much, so the whole block is pushed before
+ * the transfer starts and the host is out of the loop while it runs.  The
+ * telegram itself allows 256; the FIFO is the limit, and a bigger one bought
+ * nothing but memory pressure.
+ */
+#define DAP_FPGA_BLOCK_WORDS  128
+/* Words per SPI burst when filling it. */
+#define DAP_FPGA_BURST_WORDS  128
+
+/*
+ * One client_blockwrite: the command frame, then `count` words streamed to
+ * `address` by the fabric.
+ *
+ * This is the bulk path.  A word at a time costs two register-file round trips
+ * each, and a 700 kB image is 179 200 words, so the host overhead would be the
+ * whole cost of flashing; here the host fills a FIFO and the fabric issues
+ * every parcel itself.
+ */
+esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
+                                   size_t count);
 
 /*
  * One command and its reply.  `reply_bits` of zero means a bare acknowledge.

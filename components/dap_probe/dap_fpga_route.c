@@ -666,23 +666,18 @@ static void dap2_wiring_probe(void)
     uint32_t in_lo = 0, in_hi = 0;
 
     /*
-     * Every free BANK0 pad is read at both levels as well.
-     *
-     * The dedicated DAP2 pad seeing nothing has two causes - the bench does not
-     * wire DAP2 through, or package pin 34 is not the pad that reaches the
-     * connector - and only the second is fixable from here.  Pin 34 is the one
-     * of the four whose mapping was never confirmed by function; the other
-     * three are proven every time the link works.  So while the target's pin is
-     * being driven, every other pad is watched too.
+     * The scan across every other BANK0 pad that used to run here is gone: it
+     * answered its question - package pin 34 is the right pad and nothing else
+     * sees the target's DAP2 - and the sixteen input pads it needed were worth
+     * more to the block-write FIFO.  It is in the history if the wiring ever
+     * changes.
      */
     dap_probe_write32(P21_OUT, out & ~(1u << DAP2_PIN));
     dap_probe_read32(P21_IN, &in_lo);
-    const uint16_t scan_lo = dap_phy_fpga_pad_scan();
     const unsigned lo = dap2_level_samples();
 
     dap_probe_write32(P21_OUT, out | (1u << DAP2_PIN));
     dap_probe_read32(P21_IN, &in_hi);
-    const uint16_t scan_hi = dap_phy_fpga_pad_scan();
     const unsigned hi = dap2_level_samples();
 
     /* Put the pin back before judging anything. */
@@ -702,35 +697,6 @@ static void dap2_wiring_probe(void)
                  ? "   <== the net is good"
                  : moved ? "   <== the pin moved and this board saw nothing"
                          : "   <== inconclusive: the pad is not port-controlled");
-
-    /*
-     * Which free pad, if any, followed the target's pin.
-     *
-     * A pad that went from low to high with it is the one the signal actually
-     * reaches, whatever the schematic says.  Both words are printed either way,
-     * because "nothing followed" is only believable alongside the levels it is
-     * derived from - a scan word that is all ones or all zeros at both levels
-     * is a scan that is not reading anything.
-     */
-    static const uint8_t k_scan_pins[16] = {
-        25, 26, 27, 23, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 47, 48
-    };
-    const uint16_t rose = (uint16_t)(~scan_lo & scan_hi);
-
-    ESP_LOGW(TAG, "    free BANK0 pads: 0x%04X with the pin low, 0x%04X with it "
-                  "high", scan_lo, scan_hi);
-    if (rose == 0u) {
-        ESP_LOGW(TAG, "    no free pad followed it, so no pad on this FPGA "
-                      "sees the target's DAP2 - the bench does not wire it");
-    } else {
-        for (unsigned i = 0; i < 16; i++) {
-            if (rose & (1u << i)) {
-                ESP_LOGW(TAG, "    package pin %u followed the target's DAP2 "
-                              "- THAT is where it lands, not pin 34",
-                         k_scan_pins[i]);
-            }
-        }
-    }
 }
 
 /*

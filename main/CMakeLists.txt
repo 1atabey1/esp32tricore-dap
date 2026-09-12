@@ -6,6 +6,7 @@ set(sources
     network/network_adapter.c
     network/network_mngr.c
     network/web_server.c
+    network/flash_web.c
     network/network_mngr_ota.c
     network/descriptors.c
     network/uart_websocket.c
@@ -49,6 +50,7 @@ idf_component_register(
         "web/website.html"
         "web/logic_analyzer.html"
         "web/trace.html"
+        "web/flash.html"
         "web/help.html"
         "web/ez32.svg"
         "web/favicon.ico"

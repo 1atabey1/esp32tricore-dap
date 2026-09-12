@@ -39,7 +39,7 @@
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
 #include "mbedtls/base64.h"
 
-static esp_err_t check_auth(httpd_req_t *req) {
+esp_err_t check_auth(httpd_req_t *req) {
     char *buf = NULL;
     size_t buf_len = 0;
 
@@ -106,6 +106,8 @@ trigger_edge_t gbl_channel_triggers[16] = {TRIGGER_DISABLED};
 //defined in main.c for comm between webserver and ice.c data capture
 extern SemaphoreHandle_t capture_start_semaphore;
 extern SemaphoreHandle_t capture_done_semaphore;
+
+void flash_web_register(httpd_handle_t server);
 
 static const char *TAG = "web-server";
 
@@ -3294,6 +3296,10 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_logic_analyzer);
     httpd_register_uri_handler(*http_handle, &uri_trace_page);
     httpd_register_uri_handler(*http_handle, &uri_trace_ws);
+
+    /* The flasher's page and its three endpoints, registered together from
+     * the module that owns them. */
+    flash_web_register(*http_handle);
     httpd_register_uri_handler(*http_handle, &uri_help);
     //httpd_register_uri_handler(*http_handle, &uri_logic_analyzer_data);
     httpd_register_uri_handler(*http_handle, &uri_log_error);
