@@ -157,33 +157,6 @@ bool      dap_phy_fpga_last_aligned(void);
 uint8_t   dap_phy_fpga_line_witness(void);
 
 /*
- * What the fabric reported for the last block write's final acknowledge.
- *
- * A block write is acknowledged with a bare start bit, which carries no CRC to
- * reject a false one, so these are what separate a device that accepted the
- * transfer from a line that merely idled high.
- */
-/* Send block writes without the optional address, using whatever IOADDR the
- * device already holds.  Diagnostic; see the note in the source. */
-void      dap_phy_fpga_block_write_no_address(bool enable);
-
-/* Bytes the write FIFO held just before the last block write started. */
-uint16_t  dap_phy_fpga_last_bw_level(void);
-/* Push this many extra words into the write FIFO beyond the parcels the next
- * block write will send, so the level afterwards counts what it consumed. */
-void      dap_phy_fpga_block_write_pad(unsigned words);
-
-/* ... and once the transfer has finished. */
-uint16_t  dap_phy_fpga_last_bw_level_after(void);
-
-/* DATA as the fabric left it after the last block write, which for a one-word
- * transfer is the parcel it assembled: start bit in bit 0, word above it. */
-uint64_t  dap_phy_fpga_last_bw_data(void);
-
-uint8_t   dap_phy_fpga_last_bw_status(void);
-uint16_t  dap_phy_fpga_last_bw_wait(void);
-
-/*
  * The level on every BANK0 pad this design does not otherwise use, bit n being
  * the pad named scan[n] in the PCF.
  *

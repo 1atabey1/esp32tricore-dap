@@ -2775,17 +2775,6 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
     }
     dap_probe_fpga_wide_stage(stage);
 
-    /* ?dcmd=N sends the dapisc telegram as command N instead of the default. */
-    {
-        char dval[8];
-        int dcmd = -1;
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-            httpd_query_key_value(query, "dcmd", dval, sizeof(dval)) == ESP_OK) {
-            dcmd = atoi(dval);
-        }
-        dap_probe_fpga_dapisc_cmd(dcmd);
-    }
-
     /* ?t1=&t2= pick the capture taps stage 6 uses. */
     {
         char val[8];

@@ -891,24 +891,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
  * The address is word-aligned and travels shifted right by two, which is what
  * the 30-bit address form in the telegram carries.
  */
-/*
- * Leave the address out of the command and let the device use the IOADDR it
- * already holds - the short form, LEN 10.
- *
- * Only for finding out whether the optional address field is what a block write
- * that is acknowledged but lands nowhere is getting wrong.  The acknowledges
- * come back with a realistic six-clock wait and the receiver does not report an
- * idle line, so the device is accepting the command; what it does with the
- * address is the remaining question.
- */
-static bool     s_bw_no_address;
 
-static uint64_t s_bw_data;
-static unsigned s_bw_pad_words;
-static uint16_t s_bw_level;
-static uint16_t s_bw_level_after;
-static uint8_t  s_bw_status;
-static uint16_t s_bw_wait;
 
 esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
                                    size_t count)
@@ -952,59 +935,15 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
     }
 
     /*
-     * Surplus words, for counting what the data phase really consumes.
-     *
-     * With more in the FIFO than the parcels need, the level afterwards is
-     * pushed minus consumed, and consumed is the only number in question: two
-     * parcels that take eight bytes leave a different remainder from two
-     * parcels that take eight while a third word is quietly popped before the
-     * data phase begins.  Without the surplus both stories end at zero.
-     */
-    for (unsigned e = 0; e < s_bw_pad_words; e++) {
-        static const uint8_t filler[4] = { 0xA5u, 0x5Au, 0xA5u, 0x5Au };
-        if (reg_write(REG_WFIFO, filler, sizeof(filler)) != ESP_OK) {
-            return ESP_FAIL;
-        }
-    }
-
-    /*
-     * What the FIFO actually took.
-     *
-     * The testbench checks this after every push and the host never did, which
-     * left "the bytes never arrived" and "the bytes arrived and the first word
-     * went out wrong" looking identical from up here.
-     */
-    {
-        /*
-         * Two reads, not a two-byte burst.
-         *
-         * WLEVEL sits above the fabric's AUTOINC_STOP, so the address does not
-         * advance inside a burst and a two-byte read returns the low byte
-         * twice - 32 bytes waiting reads back as 0x2020.  The reply FIFO's
-         * LEVEL at 0x0D is below the line and may be read either way, which is
-         * what made this look like a working idiom.
-         */
-        uint8_t lo = 0, hi = 0;
-        reg_read(REG_WLEVEL, &lo, 1);
-        reg_read(REG_WLEVEL + 1, &hi, 1);
-        s_bw_level = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
-    }
-
-    /*
      * bit 0  CRCdown, bit 1 per-parcel CRC6, bits 9:2 the word count with 0
      * meaning 256, bits 39:10 the word address.  Both checks are off: the
      * loader verifies the whole image with an on-target CRC32 afterwards,
      * which costs one round trip for the lot rather than six bits per word.
      */
-    uint64_t payload = (uint64_t)(count & 0xFFu) << 2;
-    uint8_t  len     = 10;
+    const uint64_t payload = ((uint64_t)(address >> 2) << 10) |
+                             ((uint64_t)(count & 0xFFu) << 2);
 
-    if (!s_bw_no_address) {
-        payload |= (uint64_t)(address >> 2) << 10;
-        len      = 40;
-    }
-
-    if (load_frame(0x09u, len, payload, len, 0) != ESP_OK) {
+    if (load_frame(0x09u, 40, payload, 40, 0) != ESP_OK) {
         return ESP_FAIL;
     }
     if (reg_write8(REG_PARCELS, (uint8_t)(count - 1)) != ESP_OK) {
@@ -1016,55 +955,6 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
 
     const esp_err_t err = wait_done(&status);
 
-    /*
-     * What the fabric assembled into DATA for the last parcel it sent.
-     *
-     * DATA is readable, and the parcel is built in it a byte at a time, so
-     * after a one-word block write this is literally the bits that went on the
-     * wire: the start bit in bit 0 and the word above it.  It separates "the
-     * assembly produced zero" from "the assembly was right and the wire lost
-     * it", which is the one fork the testbench cannot settle because it passes.
-     */
-    {
-        uint8_t raw[8] = {0};
-        reg_read(REG_DATA, raw, sizeof(raw));
-        s_bw_data = 0;
-        for (int i = 7; i >= 0; i--) {
-            s_bw_data = (s_bw_data << 8) | raw[i];
-        }
-    }
-
-    /*
-     * And the level once it is over.
-     *
-     * Pushed minus consumed.  A state machine that pops one word before the
-     * data phase starts would take four bytes more than the parcels account
-     * for, so this is what separates "the FIFO gave up exactly what the
-     * parcels needed" from "something ate a word on the way in".
-     */
-    {
-        uint8_t lo = 0, hi = 0;
-        reg_read(REG_WLEVEL, &lo, 1);
-        reg_read(REG_WLEVEL + 1, &hi, 1);
-        s_bw_level_after = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
-    }
-
-    /*
-     * Keep what the fabric said about the last acknowledge.
-     *
-     * A block write is acknowledged with a bare start bit and nothing else, so
-     * the receiver has no CRC to reject a false one: a line that idles high
-     * makes the very first sample look like an acknowledge.  The status byte
-     * and the wait count are the only things that can tell a real acknowledge
-     * from that, and a caller debugging a write that lands nowhere needs them.
-     */
-    s_bw_status = status;
-    {
-        uint8_t raw[2] = {0};
-        reg_read(REG_WAIT, raw, sizeof(raw));
-        s_bw_wait = (uint16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
-    }
-
     if (err != ESP_OK) {
         return err;
     }
@@ -1074,41 +964,6 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
-}
-
-void dap_phy_fpga_block_write_no_address(bool enable)
-{
-    s_bw_no_address = enable;
-}
-
-uint64_t dap_phy_fpga_last_bw_data(void)
-{
-    return s_bw_data;
-}
-
-void dap_phy_fpga_block_write_pad(unsigned words)
-{
-    s_bw_pad_words = words;
-}
-
-uint16_t dap_phy_fpga_last_bw_level_after(void)
-{
-    return s_bw_level_after;
-}
-
-uint16_t dap_phy_fpga_last_bw_level(void)
-{
-    return s_bw_level;
-}
-
-uint8_t dap_phy_fpga_last_bw_status(void)
-{
-    return s_bw_status;
-}
-
-uint16_t dap_phy_fpga_last_bw_wait(void)
-{
-    return s_bw_wait;
 }
 
 void dap_phy_fpga_log_status(void)
