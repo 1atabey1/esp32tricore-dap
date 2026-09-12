@@ -56,8 +56,6 @@ idf_component_register(
         # Built from fpga/dap_master; copied in rather than embedded from the
         # build tree, which is not in the repository, so a fresh clone builds.
         "ice40up5k/dap_master.bin"
-        "cacert.pem"
-        "prvtkey.pem"
 )
 
 set(host "esp-idf")

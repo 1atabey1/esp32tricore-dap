@@ -3240,57 +3240,48 @@ httpd_uri_t uri_test_result = {
     .user_ctx = NULL
 };
 
-#include "esp_https_server.h"
-
-extern const unsigned char cacert_pem_start[] asm("_binary_cacert_pem_start");
-extern const unsigned char cacert_pem_end[]   asm("_binary_cacert_pem_end");
-extern const unsigned char prvtkey_pem_start[] asm("_binary_prvtkey_pem_start");
-extern const unsigned char prvtkey_pem_end[]   asm("_binary_prvtkey_pem_end");
-
+/*
+ * Plain HTTP, not HTTPS.
+ *
+ * This probe sits on a bench network and every client is a browser on the same
+ * LAN, so TLS was buying a certificate warning rather than security - the
+ * certificate is self-signed and checked in, which anyone on that network can
+ * read.  What it cost was real: mbedTLS on an ESP32 encrypts every byte of the
+ * trace stream in software, and the trace stream is the one thing here that is
+ * supposed to run at over a megabyte a second.  The websocket added in the
+ * previous commit was a wss:// socket for exactly that reason and could not
+ * have reached the rate the drain produces.
+ *
+ * The credentials still apply: check_auth() runs on every endpoint as before.
+ * They now travel in the clear, which on a bench LAN they effectively did
+ * anyway.  If this ever faces a network that is not a bench, the answer is a
+ * real certificate and a reverse proxy, not a self-signed one on the probe.
+ */
 esp_err_t web_server_start(httpd_handle_t *http_handle) {
-    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
-
-    // Note: mbedtls requires PEM to be null-terminated. Embedded files might not be.
-    // We allocate a buffer, copy, and adhere to requirements.
-    
-    size_t cacert_len = cacert_pem_end - cacert_pem_start;
-    size_t prvtkey_len = prvtkey_pem_end - prvtkey_pem_start;
-
-    // Allocate buffers with space for \0
-    uint8_t *cacert_buf = calloc(1, cacert_len + 1);
-    uint8_t *prvtkey_buf = calloc(1, prvtkey_len + 1);
-
-    if (!cacert_buf || !prvtkey_buf) {
-        ESP_LOGE(TAG, "Failed to allocate memory for SSL certs");
-        free(cacert_buf);
-        free(prvtkey_buf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    memcpy(cacert_buf, cacert_pem_start, cacert_len);
-    cacert_buf[cacert_len] = '\0';
-
-    memcpy(prvtkey_buf, prvtkey_pem_start, prvtkey_len);
-    prvtkey_buf[prvtkey_len] = '\0';
-
-    config.servercert = cacert_buf;
-    config.servercert_len = cacert_len + 1; // Include null terminator
-    config.prvtkey_pem = prvtkey_buf;
-    config.prvtkey_len = prvtkey_len + 1; // Include null terminator
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
     /*
-     * 33 handlers are registered below, and httpd_register_uri_handler()
+     * 34 handlers are registered below, and httpd_register_uri_handler()
      * returns an error rather than complaining loudly when the table is full -
      * so a cap set too low takes the *last* endpoints registered off the air
      * with no sign of it but a 404.  Kept well clear of the count.
      */
-    config.httpd.max_uri_handlers = 56;
-    config.httpd.stack_size = 10240; // Increased stack for SSL operations
+    config.max_uri_handlers = 56;
+    config.stack_size = 10240;
+    /*
+     * The trace websocket holds one socket for the length of a capture, and
+     * the flasher's upload holds another.  The default of four leaves too
+     * little room for a browser that also wants the page and its polling.
+     */
+    config.max_open_sockets = 7;
+    config.lru_purge_enable = true;
+    config.server_port = 80;
 
-    ESP_LOGI(TAG, "Starting HTTPS Server on port: '%d'", config.httpd.server_port);
-    esp_err_t ret = httpd_ssl_start(http_handle, &config);
+    ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
+    esp_err_t ret = httpd_start(http_handle, &config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start web server! Error: %d", ret);
+        return ret;
     }
 
     httpd_register_uri_handler(*http_handle, &uri_get_main_page);
