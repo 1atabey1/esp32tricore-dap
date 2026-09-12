@@ -23,7 +23,8 @@
  *   0x08 MAXWAIT  rw  16-bit, low byte first
  *   0x0A PARCELS  rw  block read: parcels minus one, so 0xFF is 256
  *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt),
- *                     2 wide mode (DAP1 even bits, DAP2 odd)
+ *                     2 wide mode (DAP1 even bits, DAP2 odd),
+ *                     3 raw frame (DATA is the whole frame, DBITS its length)
  *   0x0C LEAD     rw  idle clocks before each frame
  *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
  *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
@@ -31,7 +32,10 @@
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
  *   0x25 WAIT     ro  16-bit busy cycle count, low byte first
- *   0x27 ALIGN    ro  0 DAP2 carried the start bit too (wide mode alignment)
+ *   0x27 LINES    ro  0 DAP2 carried the start bit too (wide mode alignment),
+ *                     1/2 DAP2 seen low/high while we were transmitting,
+ *                     3/4 DAP2 seen low/high while the target had the lines,
+ *                     5/6 DAP1 seen low/high while the target had the lines
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
  *
  * Everything the device turned out to be fussy about is a register rather than
@@ -79,6 +83,17 @@ module dap_top #(
     reg        r_no_hunt = 1'b0;  /* FLAGS bit 1: keep the whole reply window */
     reg        r_wide    = 1'b0;  /* FLAGS bit 2: two bits per DAP0 clock */
     /*
+     * FLAGS bit 3: DATA is the finished frame, not its payload.
+     *
+     * The wide framing rule is not documented anywhere this project can reach,
+     * and the reconstruction it was built from - per-field padding, covered by
+     * the CRC - is rejected by the device.  Rebuilding the bitstream for each
+     * guess is a twenty-minute loop; assembling candidate frames on the host is
+     * a one-second loop.  So the fabric stops having an opinion about framing
+     * and the host holds it instead.
+     */
+    reg        r_raw     = 1'b0;
+    /*
      * Per-line capture tap, in fabric clocks back from the sample instant.
      *
      * Wide mode needs this and narrow mode does not: the silicon does not
@@ -100,6 +115,33 @@ module dap_top #(
     reg        s_done, s_timed_out, s_idle_high, s_crc_ok, s_overrun;
     /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
     reg        s_aligned;
+
+    /*
+     * Sticky witnesses: what levels each data line was seen at, split by who
+     * was driving at the time.
+     *
+     * "Wide mode does not answer" has three causes that a reply value cannot
+     * tell apart, and these separate them with four flip-flops:
+     *
+     *   nothing set while transmitting -> our own driver is not reaching the
+     *       pad, or the input path from it is dead.  The transmitter drives
+     *       real data onto DAP2 during a wide command, so both levels must
+     *       appear there; if they do not, the problem is below the protocol.
+     *   both set while transmitting, nothing while receiving -> the pad and
+     *       the net are fine and the target is simply not driving DAP2, which
+     *       points at the device's mode rather than at this end.
+     *   both set in both phases -> the line is alive in both directions and
+     *       the fault is in the framing or the capture phase.
+     *
+     * DAP1's receive-phase witnesses are there for contrast: a reply window
+     * that reads all zeros means something holds the line down, and knowing
+     * whether DAP1 moved at all separates a stuffing target from a dead link.
+     *
+     * Cleared when a frame starts, so each pair describes one exchange.
+     */
+    reg        s_tx2_lo, s_tx2_hi;
+    reg        s_rx2_lo, s_rx2_hi;
+    reg        s_rx1_lo, s_rx1_hi;
     /*
      * "The sequencer is running", as a flip-flop rather than a compare.
      *
@@ -329,7 +371,7 @@ module dap_top #(
         .clk (clk), .rst (rst), .div (r_div),
         .start (tx_start), .cmd (r_cmd), .len (r_len),
         .data_bits (r_dbits), .data (r_data[62:0]), .lead (r_lead),
-        .wide (r_wide),
+        .wide (r_wide), .raw (r_raw),
         .busy (tx_busy), .done (tx_done),
         .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe),
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
@@ -374,6 +416,28 @@ module dap_top #(
         rx_start   <= 1'b0;
         fifo_push  <= 1'b0;
         s_busy     <= (q != Q_IDLE);
+
+        /*
+         * Sampled here rather than in the frame engines: this is one flop per
+         * witness with the pad's already-synchronised level on its D input,
+         * and it stays out of the engines' enable chains entirely.
+         */
+        if (tx_start) begin
+            s_tx2_lo <= 1'b0;  s_tx2_hi <= 1'b0;
+            s_rx2_lo <= 1'b0;  s_rx2_hi <= 1'b0;
+            s_rx1_lo <= 1'b0;  s_rx1_hi <= 1'b0;
+        end else begin
+            if (tx_busy) begin
+                s_tx2_lo <= s_tx2_lo | ~dap2_in;
+                s_tx2_hi <= s_tx2_hi |  dap2_in;
+            end
+            if (rx_busy) begin
+                s_rx2_lo <= s_rx2_lo | ~dap2_in;
+                s_rx2_hi <= s_rx2_hi |  dap2_in;
+                s_rx1_lo <= s_rx1_lo | ~dap1_in;
+                s_rx1_hi <= s_rx1_hi |  dap1_in;
+            end
+        end
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -512,6 +576,7 @@ module dap_top #(
             trst      <= 1'b1;         /* released; asserting it resets the target */
             r_no_hunt <= 1'b0;         /* ordinary hunting is the operating mode */
             r_wide    <= 1'b0;         /* narrow until the host has run DAPISC */
+            r_raw     <= 1'b0;
             r_skew1   <= 2'd0;
             r_skew2   <= 2'd0;
         end else begin
@@ -536,6 +601,7 @@ module dap_top #(
                         trst      <= ~reg_wdata[0];      /* 1 = assert = drive low */
                         r_no_hunt <=  reg_wdata[1];
                         r_wide    <=  reg_wdata[2];
+                        r_raw     <=  reg_wdata[3];
                     end
                     7'h0F: begin
                         r_skew1 <= reg_wdata[1:0];
@@ -636,7 +702,7 @@ module dap_top #(
             3'h0: rd_ctrl_hi = r_maxwait[7:0];         /* 0x08 */
             3'h1: rd_ctrl_hi = r_maxwait[15:8];
             3'h2: rd_ctrl_hi = r_parcels;
-            3'h3: rd_ctrl_hi = {5'd0, r_wide, r_no_hunt, ~trst};
+            3'h3: rd_ctrl_hi = {4'd0, r_raw, r_wide, r_no_hunt, ~trst};
             3'h4: rd_ctrl_hi = {2'd0, r_lead};
             3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
             /*
@@ -675,9 +741,19 @@ module dap_top #(
             3'd4: rd_rep = {2'd0, s_crc};
             3'd5: rd_rep = s_wait[7:0];
             3'd6: rd_rep = s_wait[15:8];
-            /* 0x27 ALIGN, in the slot the rep group already spends on a
-             * default - so reading it costs no extra mux level. */
-            default: rd_rep = {7'd0, s_aligned};
+            /*
+             * 0x27 LINES, in the slot the reply group already spends on a
+             * default - so reading it costs no extra mux level.
+             *
+             * Where these are read from is not cosmetic: they come from the
+             * receiver's end of the chip, and decoding them in the control
+             * group or in LEVEL's high byte was measured at 46.7 and 48.5 MHz
+             * respectively, against 50.4 here - and at 48.5 the block-read
+             * drain, which polls LEVEL thousands of times per block, started
+             * losing bytes.
+             */
+            default: rd_rep = {1'b0, s_rx1_hi, s_rx1_lo, s_rx2_hi, s_rx2_lo,
+                               s_tx2_hi, s_tx2_lo, s_aligned};
         endcase
     end
 

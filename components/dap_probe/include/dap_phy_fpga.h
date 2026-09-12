@@ -97,6 +97,56 @@ esp_err_t dap_phy_fpga_set_trst(bool asserted);
 esp_err_t dap_phy_fpga_set_raw_window(bool enable);
 
 /*
+ * Wide mode: two bits per DAP0 clock, the even bits of a frame on DAP1 and the
+ * odd ones on DAP2.
+ *
+ * This is the probe's half only - it changes how the fabric frames and
+ * samples and says nothing to the device, which is told separately by a DAPISC
+ * telegram with MODE = 01B.  The ordering is forced: that telegram has to go
+ * out in narrow mode, because narrow is the only framing the device
+ * understands until it has read the telegram.  So enable this after the
+ * telegram is acknowledged, and disable it before talking to a device that
+ * might have been reset since.
+ */
+esp_err_t dap_phy_fpga_set_wide(bool enable);
+bool      dap_phy_fpga_is_wide(void);
+
+/*
+ * Where in the window each line is sampled, in fabric clocks, 0 to 3.
+ *
+ * Tap 0 on both is exactly what narrow mode has always done.  The taps exist
+ * because the silicon does not promise DAP1 and DAP2 leave the pads together:
+ * at the fastest divider a bit period is two fabric clocks, so one clock of
+ * skew between the lines is half a bit.  Sweep them against a reply whose
+ * value is known - sync answers 0xAAAAAAAA - rather than guessing from the
+ * board.
+ */
+esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap);
+
+/*
+ * Did the last reply's start bit arrive on DAP2 at the same sample as on DAP1?
+ *
+ * The start bit is the one bit the device drives on both lines together, so it
+ * is the only direct evidence that the two taps agree.  A reply that fails
+ * this is still delivered - the point of the bit is to let a sweep see which
+ * settings work, and refusing the frame would hide that.
+ */
+bool      dap_phy_fpga_last_aligned(void);
+
+/*
+ * What levels each data line was seen at during the last exchange, split by
+ * who was driving.
+ *
+ * Bit 0 is the start-bit alignment above; 1 and 2 are DAP2 seen low and high
+ * while the probe was transmitting; 3 and 4 the same while the target had the
+ * lines; 5 and 6 DAP1 while the target had them.  The point is to separate
+ * three failures a reply value cannot tell apart: a DAP2 our own driver never
+ * reaches, a DAP2 the target never drives, and a live line read at the wrong
+ * phase.
+ */
+uint8_t   dap_phy_fpga_line_witness(void);
+
+/*
  * One command and its reply.  `reply_bits` of zero means a bare acknowledge.
  * Returns ESP_OK only when the fabric reported a reply with a good CRC.
  */

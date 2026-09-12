@@ -31,6 +31,7 @@ module tb_dap_frame;
     reg  [62:0] data  = 63'd0;
 
     reg         wide  = 1'b0;
+    reg         raw   = 1'b0;
 
     wire busy, done, dap0, dap1, dat_oe, dap2, dat2_oe;
 
@@ -38,7 +39,7 @@ module tb_dap_frame;
         .clk (clk), .rst (rst),
         .div (8'd1),               /* fast, so the test runs in little time */
         .start (start), .cmd (cmd), .len (len), .data_bits (dbits), .data (data),
-        .lead (6'd2), .wide (wide),
+        .lead (6'd2), .wide (wide), .raw (raw),
         .busy (busy), .done (done),
         .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe),
         .dap2 (dap2), .dat2_oe (dat2_oe)
@@ -338,6 +339,54 @@ module tb_dap_frame;
         wait (done);
         @(posedge clk);
         check_eq("dap2 released in narrow mode", {63'd0, dat2_oe}, 64'd0);
+
+        /*
+         * Raw frames: the host supplies the bits and the fabric shifts them.
+         *
+         * Checked against the assembled path rather than against a constant,
+         * which is the property that matters: feeding the sync frame's own
+         * wire word back in as raw data must put exactly the same bits on the
+         * wire.  If the two ever disagree, one of them is wrong and this says
+         * so without either being trusted.
+         */
+        $display("raw frame, narrow: sync's wire word fed back in");
+        wide = 1'b0;
+        raw  = 1'b1;
+        restart;
+        dbits = 6'd19;              /* start + 5 + 6 + 6 + trailing zero */
+        data  = 63'h09FE1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("raw narrow length", nbits - LEAD, 19);
+        check_eq("raw narrow word", (captured >> LEAD) & 96'h7FFFF, 64'h09FE1);
+
+        /*
+         * The same bits wide: one clock per pair, DAP1 taking the even
+         * positions and DAP2 the odd ones.  19 bits is odd, so the last pair
+         * is half a pair - the host is responsible for what rides in the unused
+         * half, and here it is the zero the shift register supplies.
+         */
+        $display("raw frame, wide: the same bits, two per clock");
+        wide = 1'b1;
+        restart;
+        dbits = 6'd19;
+        data  = 63'h09FE1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("raw wide clocks", nbits - LEAD, 10);
+        /* 0x09FE1, first bit on the wire in bit 0, split by position parity:
+         * the even bits make 0x079 and the odd ones 0x0BC.  Both come from a
+         * model of the split rather than from running this design - the first
+         * version of this line had 0x0F8 for the odd half, the design said
+         * 0x0BC, and the model agreed with the design. */
+        check_eq("raw wide dap1", (captured  >> LEAD) & 96'h3FF, 64'h079);
+        check_eq("raw wide dap2", (captured2 >> LEAD) & 96'h3FF, 64'h0BC);
+        raw  = 1'b0;
+        wide = 1'b0;
 
         $display("");
         if (errors == 0) begin

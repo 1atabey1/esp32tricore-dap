@@ -66,6 +66,7 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_FLAGS       0x0B
 #define REG_LEAD        0x0C
 #define REG_LEVEL       0x0D    /* 16-bit, bytes waiting in the reply FIFO */
+#define REG_SKEW        0x0F    /* capture tap: [1:0] DAP1, [3:2] DAP2 */
 
 #define REG_DATA        0x10
 #define REG_REPLY       0x20
@@ -86,6 +87,30 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define ST_FIFO_EMPTY    (1u << 5)
 #define ST_FIFO_FULL     (1u << 6)
 #define ST_OVERRUN       (1u << 7)
+
+#define FLAG_TRST        (1u << 0)
+#define FLAG_RAW_WINDOW  (1u << 1)
+#define FLAG_WIDE        (1u << 2)
+
+/*
+ * The wide-mode start-bit alignment, in the reply group's spare slot.
+ *
+ * Where it is read from is not cosmetic: it comes from the receiver, at the far
+ * end of the chip from the register read mux, so the decode it joins decides
+ * how much clock it costs.  In the control group the bitstream closes 46.7 MHz;
+ * in LEVEL's high byte, which this file's own drain loop polls thousands of
+ * times per block, 48.5 - at which it starts losing bytes at the slow
+ * dividers.  Here, in a slot the reply group already spent on a constant, it
+ * closes 50.4.
+ */
+#define REG_LINES        0x27
+#define LINES_ALIGNED    (1u << 0)
+#define LINES_TX2_LO     (1u << 1)
+#define LINES_TX2_HI     (1u << 2)
+#define LINES_RX2_LO     (1u << 3)
+#define LINES_RX2_HI     (1u << 4)
+#define LINES_RX1_LO     (1u << 5)
+#define LINES_RX1_HI     (1u << 6)
 
 #define WRITE_BIT        0x80
 
@@ -439,7 +464,7 @@ static uint8_t s_flags;
 
 esp_err_t dap_phy_fpga_set_trst(bool asserted)
 {
-    s_flags = (uint8_t)((s_flags & ~1u) | (asserted ? 1u : 0u));
+    s_flags = (uint8_t)((s_flags & ~FLAG_TRST) | (asserted ? FLAG_TRST : 0u));
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
 }
 
@@ -450,9 +475,71 @@ esp_err_t dap_phy_fpga_set_lead(uint8_t clocks)
 
 esp_err_t dap_phy_fpga_set_raw_window(bool enable)
 {
-    s_flags = (uint8_t)((s_flags & ~2u) | (enable ? 2u : 0u));
+    s_flags = (uint8_t)((s_flags & ~FLAG_RAW_WINDOW) |
+                        (enable ? FLAG_RAW_WINDOW : 0u));
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
 }
+
+/*
+ * Wide mode, on the probe side only.
+ *
+ * This changes how the fabric frames and samples; it says nothing to the
+ * device.  The device is told by a DAPISC telegram with MODE = 01B, and the
+ * order matters - the telegram itself has to go out narrow, because until the
+ * device has read it that is the only framing it understands.  So a caller
+ * turns this on *after* the telegram is acknowledged, and back off before
+ * anything that needs to talk to a device that has been reset.
+ */
+esp_err_t dap_phy_fpga_set_wide(bool enable)
+{
+    s_flags = (uint8_t)((s_flags & ~FLAG_WIDE) | (enable ? FLAG_WIDE : 0u));
+    return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
+}
+
+bool dap_phy_fpga_is_wide(void)
+{
+    return (s_flags & FLAG_WIDE) != 0u;
+}
+
+/*
+ * Where in the two-clock-deep window each line is sampled.
+ *
+ * Tap 0 is what narrow mode has always used.  The silicon does not promise
+ * DAP1 and DAP2 leave the pads together, and at the fastest divider a bit is
+ * two fabric clocks, so one clock of skew between them is half a bit - which
+ * is why this exists at all and why it is per line.
+ */
+esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap)
+{
+    if (dap1_tap > 3 || dap2_tap > 3) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint8_t v = (uint8_t)((dap1_tap & 3u) | ((dap2_tap & 3u) << 2));
+    return s_ready ? reg_write8(REG_SKEW, v) : ESP_ERR_INVALID_STATE;
+}
+
+/*
+ * Did the last reply's start bit arrive on DAP2 at the same sample as on DAP1?
+ *
+ * The start bit is the one bit the device drives on both lines together, so
+ * this is the only direct evidence the two taps are set consistently.  It is
+ * read from LEVEL's high byte rather than STATUS because STATUS had no bit
+ * left and that byte had four.
+ */
+bool dap_phy_fpga_last_aligned(void)
+{
+    if (!s_ready) {
+        return false;
+    }
+    return (reg_read8(REG_LINES) & LINES_ALIGNED) != 0u;
+}
+
+uint8_t dap_phy_fpga_line_witness(void)
+{
+    return s_ready ? reg_read8(REG_LINES) : 0u;
+}
+
+
 
 /* ------------------------------------------------------------------------ */
 /* Exchanges                                                                 */

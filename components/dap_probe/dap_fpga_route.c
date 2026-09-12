@@ -19,6 +19,7 @@
  */
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dap_phy.h"
@@ -26,6 +27,8 @@
 #include "dap_probe.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "DAP_FPGA_RT";
 
@@ -117,15 +120,11 @@ static bool try_trail(uint8_t trail, uint16_t *id_out)
 #define DAPISC_SIGNATURE  0x4ABBAF53u
 #define DAPISC_VALUE      0x0F00u
 
+static void send_dapisc_long(uint16_t value);
+
 static void send_dapisc(void)
 {
-    const uint64_t data = ((uint64_t)DAPISC_SIGNATURE << 16) | DAPISC_VALUE;
-    uint32_t reply = 0;
-    uint16_t waited = 0;
-
-    dap_phy_fpga_set_raw_window(true);
-    dap_phy_fpga_exchange(0x11u, 48, data, 48, 2, &reply, &waited);
-    dap_phy_fpga_set_raw_window(false);
+    send_dapisc_long(DAPISC_VALUE);
 }
 
 /*
@@ -333,6 +332,451 @@ esp_err_t dap_phy_fpga_attach(void)
     return ESP_FAIL;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Wide mode                                                                 */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * DAPISC field positions, from the register layout: MODE is bits 5:4, and 01B
+ * there is wide mode - DAP1 carrying the even bits of a frame and DAP2 the odd
+ * ones, two bits per DAP0 clock.
+ *
+ * Worth being explicit about which bits are *not* being touched, because this
+ * register is shared with the wait-state timeout: MAXWAIT8 is bits 12:8 and
+ * writing it as zero disables the timeout, which turns an internal bus lockup
+ * into a probe that hangs forever.  DAPISC_VALUE's 0x0F00 is MAXWAIT8 = 15
+ * with MW8E clear - 120 DAP0 clocks - and the mode bits are ORed into that
+ * rather than replacing it.
+ */
+#define DAPISC_MODE_SHIFT   4
+#define DAPISC_MODE_NARROW  0u   /* 2-pin, DAP1 bidirectional */
+#define DAPISC_MODE_WIDE    1u   /* 3-pin, DAP1 even bits and DAP2 odd */
+
+#define OIFM_ADDR           0xF000040Cu
+
+/*
+ * Both DAPISC forms.  Long carries the 32-bit signature and is what the cold
+ * attach uses; short is for reconfiguring a link that is already up.
+ *
+ * Both go out with the reply window raw: with a hunt enabled the undriven line
+ * reads idle high, the fabric latches a phantom start bit and issues trailing
+ * clocks on top of it, and the *next* frame is the one that gets lost.
+ */
+static void send_dapisc_long(uint16_t value)
+{
+    const uint64_t data = ((uint64_t)DAPISC_SIGNATURE << 16) | value;
+    uint32_t reply = 0;
+    uint16_t waited = 0;
+
+    dap_phy_fpga_set_raw_window(true);
+    dap_phy_fpga_exchange(0x11u, 48, data, 48, 2, &reply, &waited);
+    dap_phy_fpga_set_raw_window(false);
+}
+
+static void send_dapisc_short(uint16_t value)
+{
+    uint32_t reply = 0;
+    uint16_t waited = 0;
+
+    dap_phy_fpga_set_raw_window(true);
+    dap_phy_fpga_exchange(0x11u, 16, value, 16, 2, &reply, &waited);
+    dap_phy_fpga_set_raw_window(false);
+}
+
+/*
+ * The same write, keeping the reply.
+ *
+ * Both forms answer with the register as it now stands - start bit, the updated
+ * sixteen bits, then a CRC6 - which makes the telegram self-verifying in the
+ * one direction that matters.  Only useful when both ends agree on the framing;
+ * the telegram that *changes* the framing cannot be read back this way, which
+ * cost a debugging round and is written up at the call site.
+ */
+static bool dapisc_write_read(uint8_t len_field, uint64_t data, size_t dbits,
+                              uint16_t *now)
+{
+    uint32_t reply = 0;
+    uint16_t waited = 0;
+
+    const esp_err_t err = dap_phy_fpga_exchange(0x11u, len_field, data, dbits,
+                                                16, &reply, &waited);
+    *now = (uint16_t)reply;
+    return err == ESP_OK;
+}
+
+/*
+ * What do the two data lines idle at?
+ *
+ * The fabric can be put in wide mode while the *device* is still on two pins.
+ * The frame that goes out is then one the device does not understand, so it
+ * neither replies nor changes mode - but the reply window is still clocked and
+ * still sampled on both lines, and in wide mode the raw window interleaves
+ * them into the payload exactly as a real reply would be.  So one raw read
+ * separates into the two lines and reports what each sits at when nothing is
+ * driving it, at no cost: no telegram, no mode change, nothing to recover.
+ *
+ *   DAP2 all zero -> the net is held low.  In two-pin mode that pin is an
+ *                    ordinary port pin and the target owns it.
+ *   DAP2 all ones -> the net floats, so nothing drives it from either end and
+ *                    wide mode has somewhere to put the odd bits.
+ *
+ * An earlier version answered this by adding a register to the fabric that
+ * drove DAP2 from the host and read the pad back.  It worked, and it is what
+ * established that package pin 34 is the right pad in both directions - but
+ * overriding the pad's output enable cost about four megahertz of fabric clock
+ * wherever the readback was decoded, and at 48.5 MHz the block read started
+ * losing bytes at the slow dividers.  Not worth the clock when the window
+ * gives the part that matters for free.
+ */
+/*
+ * The line witnesses from the last exchange, decoded.
+ *
+ * Printed as two characters per phase - the levels that were actually seen -
+ * because "did not toggle" and "was never sampled" look the same in a single
+ * bit and mean entirely different things here.
+ */
+static void report_lines(const char *what)
+{
+    const uint8_t w = dap_phy_fpga_line_witness();
+
+    ESP_LOGW(TAG, "  %-24s DAP2 while we drove %s%s | DAP2 while target drove "
+                  "%s%s | DAP1 while target drove %s%s%s", what,
+             (w & (1u << 1)) ? "0" : "-", (w & (1u << 2)) ? "1" : "-",
+             (w & (1u << 3)) ? "0" : "-", (w & (1u << 4)) ? "1" : "-",
+             (w & (1u << 5)) ? "0" : "-", (w & (1u << 6)) ? "1" : "-",
+             (w & (1u << 0)) ? "  [start bit on DAP2]" : "");
+}
+
+static bool dap2_line_free(void)
+{
+    uint32_t reply = 0;
+    uint16_t waited = 0;
+    char     l1[17], l2[17];
+    unsigned ones = 0;
+
+    dap_phy_fpga_set_wide(true);
+    dap_phy_fpga_set_raw_window(true);
+    dap_phy_fpga_exchange(0x10u, 63, 0, 0, 32, &reply, &waited);
+    dap_phy_fpga_set_raw_window(false);
+    dap_phy_fpga_set_wide(false);
+
+    for (int i = 0; i < 16; i++) {
+        l1[i] = (reply & (1u << (2 * i)))     ? '1' : '0';
+        l2[i] = (reply & (1u << (2 * i + 1))) ? '1' : '0';
+        if (reply & (1u << (2 * i + 1))) {
+            ones++;
+        }
+    }
+    l1[16] = l2[16] = '\0';
+
+    ESP_LOGW(TAG, "  idle levels, fabric wide and device not: DAP1 %s "
+                  "DAP2 %s", l1, l2);
+    report_lines("wide frame, narrow device:");
+    return ones == 16;
+}
+
+/*
+ * Put the device back on two pins and get the link working again.
+ *
+ * The telegram goes out FIRST, in whatever mode the fabric is currently in,
+ * and the fabric follows.  Getting that backwards is a trap worth naming:
+ * switching the fabric to narrow first means the telegram asking the device to
+ * go narrow is itself sent in a framing the device - still wide - cannot
+ * parse, so it is never received and the link stays broken.  The device only
+ * ever changes mode on a telegram it understood, so the probe has to speak the
+ * old mode to ask for the new one.  That is true in both directions.
+ */
+static void wide_revert(void)
+{
+    dap_exchange_t x;
+
+    send_dapisc_short(DAPISC_VALUE |
+                      (DAPISC_MODE_NARROW << DAPISC_MODE_SHIFT));
+    dap_phy_fpga_set_wide(false);
+    dap_probe_clear_error_state();
+
+    if (dap_probe_attach(&x, 3) != ESP_OK || x.reply != 0xAAAAAAAAu) {
+        ESP_LOGW(TAG, "  narrow mode did not come back from a telegram; "
+                      "resetting the target");
+        dap_phy_fpga_set_trst(true);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        dap_phy_fpga_set_trst(false);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        dap_probe_clear_error_state();
+        (void)dap_probe_attach(&x, 3);
+    }
+
+}
+
+/*
+ * Which pair of capture taps reads the wire correctly?
+ *
+ * sync is the only command the device answers from any state and its reply is a
+ * known constant, 0xAAAAAAAA - which in wide mode is exactly the useful
+ * pattern, because alternating bits put all the zeros on one line and all the
+ * ones on the other.  A tap pair with the two lines swapped reads 0x55555555;
+ * one sampling a line outside its bit reads something with a dead CRC.  So the
+ * sweep is a measurement and not a smoke test.
+ *
+ * The start-bit alignment bit is recorded alongside but not used to choose: it
+ * is one sample of one bit and can agree by luck, where the payload and its CRC
+ * are thirty-eight bits of evidence.  Where the two disagree is worth seeing,
+ * which is why both are printed.
+ */
+static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
+{
+    bool found = false;
+
+    ESP_LOGW(TAG, "  capture tap sweep (sync must answer 0xAAAAAAAA):");
+
+    for (uint8_t t1 = 0; t1 < 4; t1++) {
+        char line[80];
+        int  n = snprintf(line, sizeof(line), "    DAP1 tap %u:", t1);
+
+        for (uint8_t t2 = 0; t2 < 4; t2++) {
+            dap_exchange_t x = {0};
+
+            if (dap_phy_fpga_set_skew(t1, t2) != ESP_OK) {
+                continue;
+            }
+
+            /*
+             * sync and nothing before it.
+             *
+             * An earlier version cleared the error state first, which sends a
+             * real IOINFO read - and a payload command emitted in a framing
+             * the device is not using is not a neutral act: it can leave the
+             * device far enough out of step that the sync after it fails too.
+             * Then every tap pair reads as "no answer" and the sweep says
+             * nothing about the taps at all.  sync is answered from any state,
+             * so it needs no preparation.
+             */
+            const bool ok = dap_probe_attach(&x, 3) == ESP_OK &&
+                            x.reply == 0xAAAAAAAAu;
+            const bool aligned = dap_phy_fpga_last_aligned();
+
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "  %c%c",
+                          ok ? 'D' : (x.reply == 0x55555555u ? 'x' : '.'),
+                          aligned ? 'a' : '-');
+
+            if (ok && !found) {
+                found     = true;
+                *tap1_out = t1;
+                *tap2_out = t2;
+            }
+        }
+        ESP_LOGW(TAG, "%s", line);
+    }
+
+    ESP_LOGW(TAG, "    (D data good, x lines swapped, . no answer; "
+                  "a start bit seen on DAP2)");
+    return found;
+}
+
+/*
+ * Wide mode end to end: get the part to route the line, tell the device,
+ * switch the fabric, find the taps, prove a real transaction, measure it.
+ */
+static void wide_route_check(void)
+{
+    ESP_LOGW(TAG, "--- DAP wide mode ---");
+
+    /*
+     * OIFM first, for the record rather than as a gate.
+     *
+     * DAPMODE 000B is the reset value and it already permits both two-pin
+     * standard and three-pin wide mode - it is not a two-pin strapping, which
+     * an earlier reading of it here assumed and spent a while acting on.  So
+     * there is nothing to configure and nothing to restore; the value is
+     * logged because a part that did have it set otherwise would change what
+     * everything below means.
+     */
+    {
+        uint32_t oifm = 0;
+        if (dap_probe_read32(OIFM_ADDR, &oifm) == ESP_OK) {
+            ESP_LOGW(TAG, "  OIFM 0x%08" PRIX32 ", DAPMODE %u, PADCTL %u",
+                     oifm, (unsigned)(oifm & 7u), (unsigned)((oifm >> 12) & 3u));
+        }
+    }
+
+    /*
+     * What the lines do with the fabric wide and the device still narrow.
+     *
+     * Informational, not a gate.  The transmitter drives real data onto DAP2
+     * during this frame, so the witness bits it leaves behind answer the one
+     * question that has to be settled before any protocol theory is worth
+     * testing: whether our own driver reaches the pad and comes back through
+     * the input path at all.
+     */
+    (void)dap2_line_free();
+
+    /*
+     * Baseline: write the mode the device is already in and read it back.  If
+     * that does not come back cleanly the readback is not trustworthy here and
+     * nothing below it means much, so it is established before the interesting
+     * write rather than after.
+     */
+    uint16_t now = 0;
+    const uint16_t narrow = DAPISC_VALUE |
+                            (DAPISC_MODE_NARROW << DAPISC_MODE_SHIFT);
+    const bool base_ok = dapisc_write_read(16, narrow, 16, &now);
+    ESP_LOGW(TAG, "  dapisc narrow baseline: wrote 0x%04X -> read 0x%04X%s, "
+                  "MODE %u", (unsigned)narrow, (unsigned)now,
+             base_ok ? "" : " NO VALID REPLY",
+             (unsigned)((now >> DAPISC_MODE_SHIFT) & 3u));
+    dap_probe_clear_error_state();
+
+    /*
+     * The mode change, as a handshake rather than a fire-and-forget write.
+     *
+     * This is the step that was wrong for a long time.  The short dapisc form
+     * does change the register - the device starts interleaving its replies
+     * the moment it has read one, which is how 0x0334 came back for a register
+     * that should read 0x0F10 - but changing the register is not the same as
+     * the physical multiplexer being reconfigured.  The long form carries the
+     * 32-bit signature, which the spec describes as the protection against
+     * accidental *configuration changes*, and it answers: three DAP0 clocks
+     * after the host's CRC6 the device sends a start bit, the sixteen updated
+     * bits, and a CRC6.
+     *
+     * Sending it and not clocking that reply leaves the handshake half done.
+     * So this one goes out with an ordinary hunting window and its answer is
+     * read and checked, which is the whole difference from send_dapisc_long().
+     *
+     * It goes out narrow, because narrow is all the device understands until
+     * it has read it.
+     */
+    const uint16_t widev = DAPISC_VALUE |
+                           (DAPISC_MODE_WIDE << DAPISC_MODE_SHIFT);
+    const uint64_t sig = ((uint64_t)DAPISC_SIGNATURE << 16) | widev;
+
+    const bool hs = dapisc_write_read(48, sig, 48, &now);
+    ESP_LOGW(TAG, "  dapisc wide (long form, handshake): wrote 0x%04X -> "
+                  "read 0x%04X%s, MODE %u", (unsigned)widev, (unsigned)now,
+             hs ? "" : " NO VALID REPLY",
+             (unsigned)((now >> DAPISC_MODE_SHIFT) & 3u));
+    report_lines("after the handshake:");
+
+    /*
+     * Does the device still answer narrow?
+     *
+     * If it does, the mux has not switched and the handshake did not take,
+     * which is worth knowing before sixteen tap combinations are tried against
+     * a device that is still on one line.  If it does not, something changed -
+     * and the sweep below is the right next question.
+     */
+    dap_exchange_t probe = {0};
+    const bool still_narrow = dap_probe_attach(&probe, 3) == ESP_OK &&
+                              probe.reply == 0xAAAAAAAAu;
+    ESP_LOGW(TAG, "  narrow sync after the handshake: %s (0x%08" PRIX32 ")",
+             still_narrow ? "still answers - the mux did NOT switch"
+                          : "no longer answers", probe.reply);
+
+    if (dap_phy_fpga_set_wide(true) != ESP_OK) {
+        ESP_LOGE(TAG, "  the fabric would not switch to wide mode");
+        wide_revert();
+        return;
+    }
+
+    uint8_t tap1 = 0, tap2 = 0;
+    if (!wide_calibrate(&tap1, &tap2)) {
+        ESP_LOGE(TAG, "  no capture tap pair read sync correctly in wide mode");
+        report_lines("after the sweep:");
+        wide_revert();
+        return;
+    }
+
+    dap_phy_fpga_set_skew(tap1, tap2);
+    ESP_LOGW(TAG, "  taps DAP1 %u, DAP2 %u", tap1, tap2);
+
+    /* Now the register can be read for real, on both lines. */
+    const bool wide_ok = dapisc_write_read(16, widev, 16, &now);
+    ESP_LOGW(TAG, "  dapisc read wide: 0x%04X%s, MODE %u", (unsigned)now,
+             wide_ok ? "" : " (no valid reply)",
+             (unsigned)((now >> DAPISC_MODE_SHIFT) & 3u));
+
+    /*
+     * sync answering is not the same as the link working: sync is answered from
+     * any state and carries no address, so it says nothing about whether a
+     * command with a payload gets through.  That was exactly the failure this
+     * project spent a session on in narrow mode, so wide mode gets the same
+     * check - attach properly, then read a constant off the bus.
+     */
+    dap_probe_clear_error_state();
+    dap_exchange_t x, id = {0};
+    if (dap_probe_attach(&x, 3) != ESP_OK ||
+        dap_probe_client_set(1, &x) != ESP_OK ||
+        dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id) != ESP_OK ||
+        id.reply != CLIENT_ID_EXPECT) {
+        ESP_LOGE(TAG, "  wide mode answers sync but will not attach: "
+                      "CLIENT_ID 0x%04X", (unsigned)id.reply);
+        wide_revert();
+        return;
+    }
+
+    dap_probe_set_rw_mode(true);
+    uint32_t mcds_id = 0;
+    if (dap_probe_enable_ocds() != ESP_OK ||
+        dap_probe_read32(0xFB718008u, &mcds_id) != ESP_OK ||
+        mcds_id != 0x00D6C007u) {
+        ESP_LOGE(TAG, "  wide mode attaches but a bus read came back "
+                      "0x%08" PRIX32, mcds_id);
+        wide_revert();
+        return;
+    }
+    ESP_LOGW(TAG, "  attached wide: CLIENT_ID 0x%04X, miniMCDS ID "
+                  "0x%08" PRIX32, (unsigned)id.reply, mcds_id);
+
+    /*
+     * The same block-read sweep as narrow mode, at the same dividers, so the
+     * two numbers are comparable.  Wide mode halves the clocks a block takes,
+     * so the wire term should halve; the drain and the host overhead do not
+     * move, so the gain is less than twice and the size of that gap is the
+     * interesting part.
+     */
+    static uint32_t buf[256];
+    static const uint8_t divs[] = { 11, 5, 3, 2, 1, 0 };
+    const int iterations = 8;
+
+    ESP_LOGW(TAG, "  block read throughput, wide:");
+    for (size_t d = 0; d < sizeof(divs); d++) {
+        dap_phy_fpga_set_div(divs[d]);
+        int ok = 0;
+
+        const int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < iterations; i++) {
+            if (dap_probe_blockread(CHECK_ADDR, buf, 256) == ESP_OK) {
+                ok++;
+            } else {
+                dap_probe_clear_error_state();
+            }
+        }
+        const int64_t us = esp_timer_get_time() - t0;
+
+        if (ok && us > 0) {
+            const int kbps = (int)((int64_t)ok * 1024 * 1000000 / us / 1024);
+            ESP_LOGW(TAG, "    div %2u (%4u kHz): %d/%d blocks in %6lld us "
+                          "-> %3d kB/s", divs[d],
+                     (unsigned)(48000u / (2u * (divs[d] + 1u))),
+                     ok, iterations, (long long)us, kbps);
+        } else {
+            ESP_LOGW(TAG, "    div %2u: no full blocks completed", divs[d]);
+        }
+    }
+
+    /*
+     * Left in narrow mode with OIFM as it was found.
+     *
+     * Everything above this in the firmware - the BMP target, the trace drain -
+     * runs narrow, and leaving the device in a mode only this function knows
+     * how to speak would break all of it.  Wide mode becomes the default when
+     * the calibration happens at attach rather than in a check.
+     */
+    wide_revert();
+    dap_phy_fpga_set_div(1);
+    ESP_LOGW(TAG, "  back to narrow mode");
+}
+
 esp_err_t dap_probe_fpga_route_check(void)
 {
     ESP_LOGW(TAG, "=== fabric DAP route ===");
@@ -434,7 +878,11 @@ esp_err_t dap_probe_fpga_route_check(void)
             }
         }
         ESP_LOGW(TAG, "  (the CPU path does 453 kB/s at 12 MHz)");
+        dap_phy_fpga_set_div(1);
     }
+
+    /* 5: the same thing again, on two data lines. */
+    wide_route_check();
 
     /*
      * Left switched on.  Unlike the CPU path, this one only exists while the
