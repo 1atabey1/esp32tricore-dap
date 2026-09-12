@@ -502,6 +502,38 @@ static esp_err_t write_block(uint32_t address, const uint8_t *data, size_t len)
             ? dap_phy_fpga_block_write(address + offset, words, n)
             : ESP_ERR_NOT_SUPPORTED;
 
+        /*
+         * Put the first word back.
+         *
+         * Every block write loses its first parcel: it is written, as zero, at
+         * the command address, and every word after it lands correctly.  That
+         * is independent of the clock from 24 MHz down to 2 MHz, of whether the
+         * address arrives inline or through a separate IO_SET_ADDRESS, and of
+         * anything this end does - the parcel is assembled correctly, exactly
+         * one word leaves the FIFO for it, and the device acknowledges it.
+         *
+         * Prepending a dummy word absorbs it, which is how it was confirmed,
+         * but that shifts the whole block and the sacrificial write then lands
+         * on the word before the destination - which for a contiguous image is
+         * the last word of the previous chunk.  Repairing the one word
+         * afterwards costs a single frame per block and touches nothing else.
+         */
+        if (err == ESP_OK && n > 0) {
+            /*
+             * Drain first.  The spec ends a bulk write with a read against a
+             * known location to force the buffered bus transactions out, and
+             * IO_SUPERVISOR is that read as well as the one that clears any
+             * latched error - without it the repair write is refused.
+             */
+            dap_probe_clear_error_state();
+            err = dap_probe_write32(address + offset, words[0]);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "repairing the first word at 0x%08" PRIX32
+                              " failed: %s", address + offset,
+                         esp_err_to_name(err));
+            }
+        }
+
         if (err == ESP_ERR_NOT_SUPPORTED) {
             for (size_t i = 0; i < n; i++) {
                 err = dap_probe_write32(address + offset + 4u * i, words[i]);
@@ -688,234 +720,6 @@ static esp_err_t install_loader(void)
         tricore_halt_diag(0, "flash loader install");
         set_phase(TRICORE_FLASH_FAILED, "CPU0 would not halt");
         return ESP_FAIL;
-    }
-
-    /*
-     * A small block write first, on its own, before the blob.
-     *
-     * Eight words to the buffer the stub would use anyway, read back through
-     * the word path that is known to work.  The whole-blob write is 302 bytes
-     * across several frames and its failure says only "nothing arrived"; this
-     * says whether a single well-formed block write lands at all, and IOINFO
-     * says whether the device refused it or never understood it - BUS_WR_ERR
-     * means the command was decoded and the bus write failed, no error at all
-     * means it was never treated as a write.
-     */
-    if (s_use_blockwrite && dap_phy_fpga_ready()) {
-        static const uint32_t pattern[8] = {
-            0x0BADC0DEu, 0x11111111u, 0x22222222u, 0x33333333u,
-            0x44444444u, 0x55555555u, 0x66666666u, 0xA5A5A5A5u,
-        };
-        uint32_t back[8] = {0};
-        bool all_ok = true;
-
-        /* A marker underneath, so "parcel 0 arrived as zero" and "parcel 0
-         * never arrived" are different readings rather than the same one. */
-        for (int i = 0; i < 8; i++) {
-            dap_probe_write32(LOADER_BUFFER + 4u * i, 0xDEADBEEFu);
-        }
-
-        dap_probe_clear_error_state();
-        const esp_err_t bw = dap_phy_fpga_block_write(LOADER_BUFFER, pattern, 8);
-
-        for (int i = 0; i < 8; i++) {
-            if (dap_probe_read32(LOADER_BUFFER + 4u * i, &back[i]) != ESP_OK ||
-                back[i] != pattern[i]) {
-                all_ok = false;
-            }
-        }
-        ESP_LOGW(TAG, "block write probe: %s, %s", esp_err_to_name(bw),
-                 all_ok ? "all eight words landed" : "readback differs");
-        ESP_LOGW(TAG, "  wrote %08" PRIX32 " %08" PRIX32 " %08" PRIX32
-                      " ... read %08" PRIX32 " %08" PRIX32 " %08" PRIX32,
-                 pattern[0], pattern[1], pattern[2], back[0], back[1], back[2]);
-
-        /* What the device thought of it.  BUS_WR_ERR means the command was
-         * decoded and the bus write failed; no error at all means it was never
-         * treated as a write. */
-        dap_exchange_t info = {0};
-        if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
-            ESP_LOGW(TAG, "  IOINFO after the block write:");
-            dap_probe_log_ioinfo((uint16_t)info.reply);
-        }
-
-        /*
-         * One word on its own, and what the fabric assembled for it.
-         *
-         * With a single parcel, DATA still holds that parcel when the transfer
-         * ends, so reading it back says whether the zero was assembled or
-         * happened on the wire.  0x0BADC0DE should read as the word shifted up
-         * by one with the start bit under it: 0x175B81BD.
-         */
-        uint32_t one_back = 0xDEADBEEFu;
-        dap_probe_write32(LOADER_BUFFER + 0x80u, 0xDEADBEEFu);
-        const esp_err_t bw1 =
-            dap_phy_fpga_block_write(LOADER_BUFFER + 0x80u, pattern, 1);
-        const uint64_t assembled = dap_phy_fpga_last_bw_data();
-        dap_probe_read32(LOADER_BUFFER + 0x80u, &one_back);
-        ESP_LOGW(TAG, "  one-word block write: %s, landed 0x%08" PRIX32
-                      ", DATA assembled 0x%08" PRIX32 "%08" PRIX32,
-                 esp_err_to_name(bw1), one_back,
-                 (uint32_t)(assembled >> 32), (uint32_t)assembled);
-
-        /*
-         * The same two words at every divider.
-         *
-         * If the first parcel is lost to turnaround - the device still letting
-         * go of the line after acknowledging the command frame while this end
-         * is already driving the next start bit - then slowing the wire down
-         * gives it time and the word arrives.  A divider that works is also a
-         * usable fallback, since even the slowest is quicker than the word
-         * path.
-         */
-        static char line[96];
-        {
-            static const uint8_t divs[] = { 0, 1, 2, 3, 5, 11 };
-            int n = 0;
-
-            for (size_t d = 0; d < sizeof(divs); d++) {
-                const uint32_t at = LOADER_BUFFER + 0x100u + 0x20u * (uint32_t)d;
-                uint32_t got[2] = {0};
-
-                for (int i = 0; i < 2; i++) {
-                    dap_probe_write32(at + 4u * i, 0xDEADBEEFu);
-                }
-                dap_phy_fpga_set_div(divs[d]);
-                const esp_err_t e = dap_phy_fpga_block_write(at, pattern, 2);
-                dap_phy_fpga_set_div(1);
-
-                for (int i = 0; i < 2; i++) {
-                    dap_probe_read32(at + 4u * i, &got[i]);
-                }
-                const bool good = (e == ESP_OK) &&
-                                  got[0] == pattern[0] && got[1] == pattern[1];
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " d%u=%s",
-                              divs[d],
-                              good ? "ok"
-                                   : (got[0] == 0u ? "zero"
-                                                   : (got[0] == 0xDEADBEEFu
-                                                      ? "none" : "junk")));
-                ESP_LOGW(TAG, "  div %u: %08" PRIX32 " %08" PRIX32 " (%s)",
-                         divs[d], got[0], got[1], esp_err_to_name(e));
-            }
-            ESP_LOGW(TAG, "  divider sweep:%s", line);
-        }
-
-        /*
-         * Two words, on a freshly marked address.
-         *
-         * One word landed nothing while eight left a zero in the first slot,
-         * and those cannot both be "parcel 0 is dropped".  Two says which:
-         * if the marker survives at +0 and pattern[1] appears at +4, parcel 0
-         * is never written and the others land at their own index.
-         */
-        uint32_t two[3] = {0};
-        uint32_t ioaddr_tail = 0;
-        for (int i = 0; i < 3; i++) {
-            dap_probe_write32(LOADER_BUFFER + 0xC0u + 4u * i, 0xDEADBEEFu);
-        }
-        const esp_err_t bw3 =
-            dap_phy_fpga_block_write(LOADER_BUFFER + 0xC0u, pattern, 2);
-        for (int i = 0; i < 3; i++) {
-            dap_probe_read32(LOADER_BUFFER + 0xC0u + 4u * i, &two[i]);
-        }
-        ESP_LOGW(TAG, "  two-word block write: %s -> %08" PRIX32 " %08" PRIX32
-                      " %08" PRIX32, esp_err_to_name(bw3), two[0], two[1],
-                 two[2]);
-
-        /*
-         * Where the device left IOADDR.
-         *
-         * IO_READ_WORD with no IO_SET_ADDRESS in front of it reads from
-         * whatever IOADDR holds, so this reads the device's own pointer back
-         * rather than trusting that the address field was understood.  After
-         * two words at A it should be A+8, whose content is still the
-         * 0xDEADBEEF marker - a different value, or an error, says the address
-         * never landed where this end thinks it did.
-         */
-        /*
-         * Two parcels with four spare words behind them.
-         *
-         * 24 bytes should be left of 24 pushed beyond the two the parcels
-         * take; 20 would mean a third word came out of the FIFO without ever
-         * reaching the wire.
-         */
-        unsigned pad_left = 0;
-        {
-            const uint32_t at = LOADER_BUFFER + 0x180u;
-            dap_phy_fpga_block_write_pad(4);
-            dap_phy_fpga_block_write(at, pattern, 2);
-            dap_phy_fpga_block_write_pad(0);
-            pad_left = dap_phy_fpga_last_bw_level_after();
-            ESP_LOGW(TAG, "  two parcels, four spare words: %u bytes left of "
-                          "16 surplus", pad_left);
-        }
-
-        const uint32_t two_asm = (uint32_t)dap_phy_fpga_last_bw_data();
-        const unsigned two_lvl = dap_phy_fpga_last_bw_level_after();
-        ESP_LOGW(TAG, "  after two words: DATA 0x%08" PRIX32 " (want 0x%08X),"
-                      " FIFO %u left of 8", two_asm, 0x22222223u, two_lvl);
-
-        dap_exchange_t tail = {0};
-        const esp_err_t te = dap_probe_client_read(DAP_IO_READ_WORD, 5, 32,
-                                                   &tail);
-        ESP_LOGW(TAG, "  IOADDR after the block write reads %s -> 0x%08" PRIX32
-                      " (A+8 holds the marker)", esp_err_to_name(te),
-                 (uint32_t)tail.reply);
-        ioaddr_tail = (uint32_t)tail.reply;
-
-        /*
-         * The same eight words again, without the address field.
-         *
-         * A word write first, to leave IOADDR pointing where the device's own
-         * post-increment would put it, then the short form so the device uses
-         * that rather than one this end encoded.  If the words land this way
-         * and not the other, the optional address field is what is wrong; if
-         * neither lands, it is not the address at all.
-         */
-        uint32_t shorts[4] = {0};
-        for (int i = 0; i < 4; i++) {
-            dap_probe_write32(LOADER_BUFFER + 0x40u + 4u * i, 0u);
-        }
-        dap_probe_write32(LOADER_BUFFER + 0x40u, 0u);
-        dap_phy_fpga_block_write_no_address(true);
-        const esp_err_t bw2 = dap_phy_fpga_block_write(0, pattern, 8);
-        dap_phy_fpga_block_write_no_address(false);
-        for (int i = 0; i < 4; i++) {
-            dap_probe_read32(LOADER_BUFFER + 0x40u + 4u * i, &shorts[i]);
-        }
-        ESP_LOGW(TAG, "  short form (no address): %s -> 0x%08" PRIX32
-                      " 0x%08" PRIX32, esp_err_to_name(bw2), shorts[0],
-                 shorts[1]);
-
-        /* A word-path write of the same pattern, as the control: if this also
-         * fails the problem is not the block write at all. */
-        uint32_t control = 0;
-        if (!all_ok) {
-            for (int i = 0; i < 8; i++) {
-                dap_probe_write32(LOADER_BUFFER + 4u * i, pattern[i]);
-            }
-            dap_probe_read32(LOADER_BUFFER, &control);
-            ESP_LOGW(TAG, "  control, word writes: 0x%08" PRIX32 " (want 0x%08"
-                          PRIX32 ")", control, pattern[0]);
-
-            /*
-             * Report it where it can be read without the console.
-             *
-             * This is the minimal repro - eight words, one frame - so stopping
-             * here says more than letting the 302-byte blob fail afterwards
-             * with nothing but "it did not arrive".
-             */
-            char why[256];
-            snprintf(why, sizeof(why),
-                     "bw probe: %s, 8w %08" PRIX32 " %08" PRIX32
-                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", 2asm %08" PRIX32 " left %u pad %u, tail %08" PRIX32 ", divs:%s",
-                     esp_err_to_name(bw), back[0], back[1],
-                     one_back, (uint32_t)assembled, two_asm, two_lvl, pad_left,
-                     ioaddr_tail, line);
-            set_phase(TRICORE_FLASH_FAILED, why);
-            return ESP_FAIL;
-        }
     }
 
     /* The blob is not a multiple of four, so it is padded to a word; the stub
