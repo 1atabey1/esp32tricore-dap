@@ -102,7 +102,7 @@ module tb_dap_top;
      * DBITS and RBITS in another.  The single-byte form passing says nothing
      * about the burst form, and the burst form is what carries the payload.
      */
-    reg [7:0] burst [0:7];
+    reg [7:0] burst [0:15];
     integer   bi;
 
     task wr_burst;
@@ -188,6 +188,63 @@ module tb_dap_top;
             target_bit = 1'b0;
         end
     endtask
+
+    /*
+     * A bare acknowledge: one busy cycle, then the start bit and nothing else.
+     *
+     * This is what the device answers a client_blockwrite command frame and
+     * every parcel after it with - six DAP0 clocks of overhead per word, which
+     * is the whole reason the command exists.
+     */
+    task send_ack;
+        begin
+            drive_bit(1'b0);
+            drive_bit(1'b1);
+            target_bit = 1'b0;
+        end
+    endtask
+
+    /*
+     * Every parcel the transmitter sent, captured off the wire.
+     *
+     * Sampled where the device samples, and only while the transmitter is
+     * driving, so the receiver's own acknowledge clocks stay out of it.  A
+     * parcel is a start bit and thirty-two data bits; the start bit is dropped
+     * here and the word kept, which is what the checks want to compare.
+     */
+    reg [31:0] parcel_seen [0:7];
+    integer    parcels_seen;
+    reg [5:0]  parcel_bit;
+    reg [31:0] parcel_acc;
+    reg        in_parcel;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            parcels_seen <= 0;
+            parcel_bit   <= 6'd0;
+            in_parcel    <= 1'b0;
+        /* Only while a *parcel* is going out.  The command frame has a start
+         * bit too, and counting it as a parcel makes every value wrong. */
+        end else if (dap0 && !dap0_d && dut.tx_parcel && capture_parcels) begin
+            if (!in_parcel) begin
+                if (dap1) begin          /* the start bit */
+                    in_parcel  <= 1'b1;
+                    parcel_bit <= 6'd0;
+                end
+            end else begin
+                parcel_acc <= {dap1, parcel_acc[31:1]};
+                if (parcel_bit == 6'd31) begin
+                    parcel_seen[parcels_seen[2:0]] <= {dap1, parcel_acc[31:1]};
+                    parcels_seen <= parcels_seen + 1;
+                    in_parcel    <= 1'b0;
+                end else begin
+                    parcel_bit <= parcel_bit + 1'b1;
+                end
+            end
+        end
+    end
+
+    reg capture_parcels = 1'b0;
 
     integer errors = 0;
 
@@ -453,6 +510,58 @@ module tb_dap_top;
         check("DIV 1 not timed out", scratch[2], 1'b0);
         rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
         check("DIV 1 reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
+
+        /* ---- a block write of three words ---- */
+        $display("block write, 3 words pushed through the write FIFO");
+        wr(7'h01, 8'h20);                      /* CTRL: clear the write fifo */
+
+        /* The words go in first; the fabric streams them once started. */
+        burst[0] = 8'h44; burst[1] = 8'h33; burst[2] = 8'h22; burst[3] = 8'h11;
+        burst[4] = 8'h88; burst[5] = 8'h77; burst[6] = 8'h66; burst[7] = 8'h55;
+        burst[8] = 8'hEF; burst[9] = 8'hBE; burst[10] = 8'hAD; burst[11] = 8'hDE;
+        wr_burst(7'h48, 12);
+
+        /* The level should be exactly what was pushed. */
+        rd(7'h43, scratch);
+        check("write fifo took 12 bytes", {24'd0, scratch}, 32'd12);
+
+        wr(7'h0A, 8'd2);                       /* PARCELS: three words */
+        wr(7'h03, 8'h09);                      /* CMD: client_blockwrite */
+        wr(7'h04, 8'd40);                      /* LEN */
+        wr(7'h05, 8'd40);                      /* DBITS */
+        capture_parcels = 1'b1;
+        parcels_seen = 0;
+
+        fork
+            wr(7'h01, 8'h10);                  /* CTRL: start block write */
+            begin
+                /* The command frame's acknowledge, then one per parcel. */
+                for (p = 0; p < 4; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_ack;
+                    target_drive = 1'b0;
+                    /*
+                     * Wait for the line to come back before looking for the
+                     * next window.  Without this the same window is answered
+                     * twice - dat_oe is still low when the loop comes round -
+                     * and the device runs out of acknowledges before the words
+                     * run out, which looks exactly like the sequencer hanging.
+                     */
+                    wait (dut.u_rx.dat_oe == 1'b1);
+                end
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        capture_parcels = 1'b0;
+
+        check("three parcels went out", parcels_seen, 32'd3);
+        check("parcel 0", parcel_seen[0], 32'h11223344);
+        check("parcel 1", parcel_seen[1], 32'h55667788);
+        check("parcel 2", parcel_seen[2], 32'hDEADBEEF);
+        check("block write not timed out", {31'd0, scratch[2]}, 32'd0);
 
         $display("");
         if (errors == 0) $display("PASSED (0 failures)");

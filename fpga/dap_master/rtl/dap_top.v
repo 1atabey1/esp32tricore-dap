@@ -13,7 +13,9 @@
  *
  *   0x00 STATUS   ro  0 busy, 1 done, 2 timed_out, 3 idle_high, 4 crc_ok,
  *                     5 fifo_empty, 6 fifo_full, 7 overrun
- *   0x01 CTRL     wo  0 start frame, 1 start block, 2 abort, 3 clear fifo
+ *   0x01 CTRL     wo  0 start frame, 1 start block read, 2 abort,
+ *                     3 clear reply fifo, 4 start block write,
+ *                     5 clear write fifo
  *   0x02 DIV      rw  bit period = 2*(DIV+1) fabric clocks
  *   0x03 CMD      rw  the 5-bit command
  *   0x04 LEN      rw  the LEN field as it goes on the wire
@@ -33,13 +35,13 @@
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
  *   0x25 WAIT     ro  16-bit busy cycle count, low byte first
- *   0x27 LINES    ro  0 DAP2 carried the start bit too (wide mode alignment),
+ *   0x27 ALIGN    ro  0 DAP2 carried the start bit too (wide mode alignment)
  *                     1/2 DAP2 seen low/high while we were transmitting,
  *                     3/4 DAP2 seen low/high while the target had the lines,
  *                     5/6 DAP1 seen low/high while the target had the lines
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
- *   0x41 SCAN     ro  16-bit, low byte first: the level on every other BANK0
- *                     pad, for finding which one a target signal reaches
+ *   0x43 WLEVEL   ro  16-bit bytes waiting in the write FIFO, low byte first
+ *   0x48 WFIFO    wo  pushes one byte; does not auto-increment
  *
  * Everything the device turned out to be fussy about is a register rather than
  * a constant - DIV, TRAIL, MAXWAIT - because every one of those was settled on
@@ -50,7 +52,17 @@
 `default_nettype none
 
 module dap_top #(
-    parameter integer FIFO_DEPTH = 1088    /* 1 kB block plus headroom */
+    parameter integer FIFO_DEPTH  = 1088,  /* 1 kB block plus headroom */
+    /*
+     * Half a block.
+     *
+     * A whole one would be 1 kB, and it buys nothing: Q_WFETCH stalls when the
+     * FIFO is empty rather than failing, so the host refills mid-block exactly
+     * as it drains the reply FIFO mid-block in the other direction.  What the
+     * extra kilobyte does buy is memory pressure - two full FIFOs put this
+     * design's critical path into the reply FIFO's own address decode.
+     */
+    parameter integer WFIFO_DEPTH = 512
 ) (
     input  wire clk,
     input  wire rst,
@@ -67,10 +79,7 @@ module dap_top #(
     output reg  trst,
     /* Bidirectional in wide mode and an input otherwise: a line the design is
      * not using is better left undriven than held at a level. */
-    inout  wire dap2,
-
-    /* Every other BANK0 pad, as inputs - see the note in the board top. */
-    input  wire [15:0] scan
+    inout  wire dap2
 );
     /* ------------------------------------------------------------------ */
     /* Registers                                                           */
@@ -137,37 +146,8 @@ module dap_top #(
     reg        s_done, s_timed_out, s_idle_high, s_crc_ok, s_overrun;
     /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
     reg        s_aligned;
-    /* The scan pads, through two stages like every other asynchronous input.
-     * They feed nothing but a register read, so the second stage is where they
-     * stop. */
-    reg [15:0] scan_meta, scan_sync;
 
-    /*
-     * Sticky witnesses: what levels each data line was seen at, split by who
-     * was driving at the time.
-     *
-     * "Wide mode does not answer" has three causes that a reply value cannot
-     * tell apart, and these separate them with four flip-flops:
-     *
-     *   nothing set while transmitting -> our own driver is not reaching the
-     *       pad, or the input path from it is dead.  The transmitter drives
-     *       real data onto DAP2 during a wide command, so both levels must
-     *       appear there; if they do not, the problem is below the protocol.
-     *   both set while transmitting, nothing while receiving -> the pad and
-     *       the net are fine and the target is simply not driving DAP2, which
-     *       points at the device's mode rather than at this end.
-     *   both set in both phases -> the line is alive in both directions and
-     *       the fault is in the framing or the capture phase.
-     *
-     * DAP1's receive-phase witnesses are there for contrast: a reply window
-     * that reads all zeros means something holds the line down, and knowing
-     * whether DAP1 moved at all separates a stuffing target from a dead link.
-     *
-     * Cleared when a frame starts, so each pair describes one exchange.
-     */
-    reg        s_tx2_lo, s_tx2_hi;
-    reg        s_rx2_lo, s_rx2_hi;
-    reg        s_rx1_lo, s_rx1_hi;
+
     /*
      * "The sequencer is running", as a flip-flop rather than a compare.
      *
@@ -227,6 +207,95 @@ module dap_top #(
     reg        fifo_push;
     reg [7:0]  fifo_din;
     reg        fifo_clear;
+
+    /* ------------------------------------------------------------------ */
+    /* Write FIFO                                                          */
+    /* ------------------------------------------------------------------ */
+
+    /*
+     * The other direction, and the reason flashing is worth doing from here.
+     *
+     * client_blockwrite streams 32-bit parcels to the device, each acknowledged
+     * with a single start bit - about six DAP0 clocks of overhead per word.
+     * Driven a word at a time from the host that is two register-file round
+     * trips per word, and 700 kB of firmware is 179 200 words, so the host
+     * overhead is the whole cost.  With the words in a FIFO the fabric issues
+     * every parcel itself and the host only has to keep the FIFO fed, which is
+     * one long SPI burst - the mirror image of what the reply FIFO does for a
+     * block read.
+     *
+     * One block is 256 words, so 1 kB holds a whole one.
+     */
+    reg [7:0]  wfifo_mem [0:WFIFO_DEPTH-1];
+    reg [11:0] wfifo_wr, wfifo_rd;
+    reg [11:0] wfifo_count;
+    reg        wfifo_empty = 1'b1;
+    reg        wfifo_full  = 1'b0;
+
+    reg        wfifo_clear;
+    reg [7:0]  wfifo_head;
+
+    wire       wfifo_push = reg_we && (reg_addr == 7'h48) && !wfifo_full;
+
+    /*
+     * Popped combinationally, for the same reason the reply FIFO is.
+     *
+     * wfifo_head is a register loaded from wfifo_mem[wfifo_rd], so it trails the
+     * read pointer by a cycle.  A *registered* pop adds a second cycle before
+     * the pointer even moves, and then one idle cycle is not enough for the
+     * head to catch up - the fetch reads the same byte twice and the word goes
+     * out shifted by a byte, which is exactly what the first version of this
+     * did.  Driven from the state directly, the pointer moves at the end of the
+     * cycle the byte is taken in and one idle cycle is right again.
+     */
+    /*
+     * "Take a byte now", as one three-input term.
+     *
+     * Both the pop and the idle flag are this same condition, and writing it
+     * once means the flag's next state is a single AND rather than a chain
+     * through the state decode, the FIFO's empty flag and the mode - which is
+     * what it was, and it was the critical path.
+     */
+    wire       wfetch_go = (q == Q_WFETCH) && !wfetch_wait && !wfifo_empty;
+    wire       wfifo_pop = wfetch_go;
+
+    always @(posedge clk) begin
+        wfifo_head <= wfifo_mem[wfifo_rd];
+
+        if (rst || wfifo_clear) begin
+            wfifo_wr    <= 12'd0;
+            wfifo_rd    <= 12'd0;
+            wfifo_count <= 12'd0;
+            wfifo_empty <= 1'b1;
+            wfifo_full  <= 1'b0;
+        end else begin
+            case ({wfifo_push, wfifo_pop})
+                2'b10: begin
+                    wfifo_mem[wfifo_wr] <= reg_wdata;
+                    wfifo_wr    <= (wfifo_wr == WFIFO_DEPTH - 1) ? 12'd0
+                                                                 : wfifo_wr + 1'b1;
+                    wfifo_count <= wfifo_count + 1'b1;
+                    wfifo_empty <= 1'b0;
+                    wfifo_full  <= (wfifo_count + 1'b1 == WFIFO_DEPTH);
+                end
+                2'b01: begin
+                    wfifo_rd    <= (wfifo_rd == WFIFO_DEPTH - 1) ? 12'd0
+                                                                 : wfifo_rd + 1'b1;
+                    wfifo_count <= wfifo_count - 1'b1;
+                    wfifo_empty <= (wfifo_count == 12'd1);
+                    wfifo_full  <= 1'b0;
+                end
+                2'b11: begin
+                    wfifo_mem[wfifo_wr] <= reg_wdata;
+                    wfifo_wr    <= (wfifo_wr == WFIFO_DEPTH - 1) ? 12'd0
+                                                                 : wfifo_wr + 1'b1;
+                    wfifo_rd    <= (wfifo_rd == WFIFO_DEPTH - 1) ? 12'd0
+                                                                 : wfifo_rd + 1'b1;
+                end
+                default: ;
+            endcase
+        end
+    end
 
     /*
      * Popped the moment the byte is shifted out, combinationally rather than a
@@ -382,8 +451,6 @@ module dap_top #(
          * delay narrow mode was tuned against.  Taps 1 to 3 walk the sample
          * one clock later each.
          */
-        scan_meta <= scan;
-        scan_sync <= scan_meta;
         dap1_tap  <= dap1_sync[r_skew1];
         dap2_tap  <= dap2_sync[r_skew2];
     end
@@ -395,11 +462,31 @@ module dap_top #(
      * back on it and every other moment leaves it to the target. */
     assign dap2    = (tx_busy && tx_oe2) ? tx_dap2 : 1'bz;
 
+    /*
+     * A block-write parcel is a start bit and thirty-two data bits, and nothing
+     * else: no CMD, no LEN, no CRC6 unless the command asked for per-parcel
+     * ones.  That is exactly what the raw-frame path already sends, so the
+     * sequencer borrows it rather than growing a second serialiser.
+     *
+     * And it borrows the frame registers too rather than muxing into the
+     * transmitter.  A mux there is sixty-three bits wide on the data alone,
+     * feeding the load path of every field register, and it cost about four
+     * megahertz.  The sequencer owns DATA, DBITS and the raw flag for the
+     * duration of a block instead - which does mean a block write leaves them
+     * holding the last parcel, so the host sets up the next command from
+     * scratch.  It does that anyway.
+     */
+    wire        tx_parcel = (q == Q_WPARCEL);
+    /* Six bits and one bit: these cost nothing.  It is the sixty-three-bit
+     * data mux that cost four megahertz, and the parcel is assembled straight
+     * into DATA instead - see the register block. */
+    wire [5:0]  tx_dbits  = tx_parcel ? 6'd33 : r_dbits;
+
     dap_frame_tx #(.DIV_WIDTH(8)) u_tx (
         .clk (clk), .rst (rst), .div (r_div),
         .start (tx_start), .cmd (r_cmd), .len (r_len),
-        .data_bits (r_dbits), .data (r_data[62:0]), .lead (r_lead),
-        .wide (r_wide), .raw (r_raw),
+        .data_bits (tx_dbits), .data (r_data[62:0]), .lead (r_lead),
+        .wide (r_wide), .raw (r_raw | tx_parcel),
         .busy (tx_busy), .done (tx_done),
         .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe),
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
@@ -424,59 +511,64 @@ module dap_top #(
     /* Sequencer                                                           */
     /* ------------------------------------------------------------------ */
 
-    localparam [2:0] Q_IDLE    = 3'd0,
-                     Q_TX      = 3'd1,
-                     Q_RX      = 3'd2,
-                     Q_PARCEL  = 3'd3,
-                     Q_STORE   = 3'd4,
-                     Q_DONE    = 3'd5;
+    localparam [3:0] Q_IDLE    = 4'd0,
+                     Q_TX      = 4'd1,
+                     Q_RX      = 4'd2,
+                     Q_PARCEL  = 4'd3,
+                     Q_STORE   = 4'd4,
+                     Q_DONE    = 4'd5,
+                     /* client_blockwrite: the command frame's acknowledge,
+                      * then a parcel and its acknowledge per word. */
+                     Q_WACK    = 4'd6,
+                     Q_WFETCH  = 4'd7,
+                     Q_WPARCEL = 4'd8;
 
-    reg [2:0] q;
+    reg [3:0] q;
     reg       is_block;
+    reg       is_bwrite;
     reg [8:0] parcels_left;
     reg [1:0] store_byte;
     reg [31:0] store_word;
 
-    reg start_frame_req, start_block_req;
+    /* How many bytes of the word being streamed have been taken from the
+     * write FIFO; the word itself is assembled in DATA. */
+    reg [1:0]  wbyte;
+    reg        wfetch_wait;
+    /*
+     * "That was the last parcel", as a flip-flop.
+     *
+     * Written inline as `parcels_left == 0` it is a nine-bit compare ANDed with
+     * the mode flag and the receiver's timeout, and all of that lands in the
+     * clock enable of the status flags - which is the same shape of mistake the
+     * receiver's at_limit and the transmitter's nbits_last already have notes
+     * about, and it cost this design nine megahertz.  Updated alongside the
+     * counter, the enable is one bit again.
+     */
+    reg        wlast;
+
+    reg start_frame_req, start_block_req, start_bwrite_req;
 
     always @(posedge clk) begin
-        tx_start   <= 1'b0;
-        rx_start   <= 1'b0;
-        fifo_push  <= 1'b0;
-        s_busy     <= (q != Q_IDLE);
-
-        /*
-         * Sampled here rather than in the frame engines: this is one flop per
-         * witness with the pad's already-synchronised level on its D input,
-         * and it stays out of the engines' enable chains entirely.
-         */
-        if (tx_start) begin
-            s_tx2_lo <= 1'b0;  s_tx2_hi <= 1'b0;
-            s_rx2_lo <= 1'b0;  s_rx2_hi <= 1'b0;
-            s_rx1_lo <= 1'b0;  s_rx1_hi <= 1'b0;
-        end else begin
-            if (tx_busy) begin
-                s_tx2_lo <= s_tx2_lo | ~dap2_in;
-                s_tx2_hi <= s_tx2_hi |  dap2_in;
-            end
-            if (rx_busy) begin
-                s_rx2_lo <= s_rx2_lo | ~dap2_in;
-                s_rx2_hi <= s_rx2_hi |  dap2_in;
-                s_rx1_lo <= s_rx1_lo | ~dap1_in;
-                s_rx1_hi <= s_rx1_hi |  dap1_in;
-            end
-        end
+        tx_start    <= 1'b0;
+        rx_start    <= 1'b0;
+        fifo_push   <= 1'b0;
+        wfetch_wait <= 1'b0;
+        s_busy      <= (q != Q_IDLE);
 
         if (rst) begin
             q         <= Q_IDLE;
             s_done    <= 1'b0;
             s_overrun <= 1'b0;
+            is_bwrite <= 1'b0;
         end else begin
             case (q)
                 Q_IDLE: begin
-                    if (start_frame_req || start_block_req) begin
+                    if (start_frame_req || start_block_req || start_bwrite_req) begin
                         is_block      <= start_block_req;
+                        is_bwrite     <= start_bwrite_req;
                         parcels_left  <= {1'b0, r_parcels} + 9'd1;
+                        /* At least one parcel always follows the command. */
+                        wlast         <= 1'b0;
                         /*
                          * Only s_done is cleared here.  The three reply flags
                          * moved to Q_TX: clearing them from the start request
@@ -503,10 +595,107 @@ module dap_top #(
                          * A block read answers with parcels rather than one
                          * reply: 32 bits each, and a CRC only on the last.
                          */
-                        rx_bits       <= is_block ? 7'd32 : r_rbits;
-                        rx_expect_crc <= is_block ? (parcels_left == 9'd1) : 1'b1;
+                        /*
+                         * Three shapes of answer.  A plain frame replies with
+                         * r_rbits and a CRC; a block read answers with parcels
+                         * of 32 bits and a CRC only on the last; a block write
+                         * is acknowledged with a bare start bit, both for the
+                         * command and for every parcel after it.
+                         */
+                        rx_bits       <= is_bwrite ? 7'd0
+                                       : is_block  ? 7'd32 : r_rbits;
+                        rx_expect_crc <= is_bwrite ? 1'b0
+                                       : is_block  ? (parcels_left == 9'd1)
+                                                   : 1'b1;
                         rx_start      <= 1'b1;
-                        q             <= is_block ? Q_PARCEL : Q_RX;
+                        q             <= is_bwrite ? Q_WACK
+                                       : is_block  ? Q_PARCEL : Q_RX;
+                    end
+                end
+
+                /*
+                 * The acknowledge for the command frame and for every parcel.
+                 *
+                 * A timeout here ends the block.  The device stops acknowledging
+                 * when it has stopped listening, and streaming the rest of the
+                 * words into a device that is not taking them writes whatever
+                 * IOADDR happens to hold - which is the one failure worth
+                 * refusing to continue through.
+                 */
+                Q_WACK: begin
+                    if (rx_done) begin
+                        /*
+                         * Written on every acknowledge, not only the last.
+                         *
+                         * Gating these on "and it was the final parcel" reads
+                         * better and puts the parcel counter and the mode flag
+                         * into their clock enables, which is where this design
+                         * keeps losing its clock - see the receiver's at_limit.
+                         * Rewritten each time, the last acknowledge leaves
+                         * exactly the same values behind and the enable is one
+                         * state decode and rx_done.
+                         */
+                        s_wait      <= rx_wait;
+                        s_timed_out <= rx_timed_out;
+                        s_crc_ok    <= ~rx_timed_out;
+
+                        if (rx_timed_out || wlast) begin
+                            q <= Q_DONE;
+                        end else begin
+                            wbyte <= 2'd0;
+                            q     <= Q_WFETCH;
+                        end
+                    end
+                end
+
+                /*
+                 * Four bytes out of the FIFO make one parcel.
+                 *
+                 * Stalling here rather than failing is deliberate: the host
+                 * fills the FIFO in bursts while the wire drains it, exactly as
+                 * the reply FIFO works in the other direction, so an empty FIFO
+                 * usually means the next burst is still arriving.  The device's
+                 * own MAXWAIT timeout is what catches a host that has stopped
+                 * altogether.
+                 */
+                Q_WFETCH: begin
+                    /*
+                     * A byte every other cycle, because the FIFO's head is a
+                     * register.
+                     *
+                     * wfifo_head is loaded from wfifo_mem[wfifo_rd] on the same
+                     * edge that a pop advances wfifo_rd, so it still shows the
+                     * byte that was just taken for one cycle afterwards.
+                     * Popping every cycle therefore reads the first byte four
+                     * times.  This is the same one-ahead trap the reply FIFO
+                     * already has a note about, arrived at from the other
+                     * direction.
+                     *
+                     * Stalling on an empty FIFO rather than failing is
+                     * deliberate: the host refills while the wire drains, so an
+                     * empty FIFO usually means the next burst is still on its
+                     * way.  The device's own MAXWAIT is what catches a host that
+                     * has stopped altogether.
+                     */
+                    if (wfetch_go) begin
+                        wfetch_wait <= 1'b1;
+                        if (wbyte == 2'd3) begin
+                            tx_start <= 1'b1;
+                            q        <= Q_WPARCEL;
+                        end else begin
+                            wbyte <= wbyte + 1'b1;
+                        end
+                    end
+                end
+
+                Q_WPARCEL: begin
+                    if (tx_done) begin
+                        parcels_left  <= parcels_left - 1'b1;
+                        wlast         <= (parcels_left == 9'd1);
+                        rx_bits       <= 7'd0;
+                        rx_expect_crc <= 1'b0;
+                        rx_start      <= 1'b1;
+                        q             <= Q_WACK;
                     end
                 end
 
@@ -588,6 +777,7 @@ module dap_top #(
     always @(posedge clk) begin
         start_frame_req <= 1'b0;
         start_block_req <= 1'b0;
+        start_bwrite_req <= 1'b0;
         /*
          * Defaulted here, with the only code that sets it.
          *
@@ -599,6 +789,7 @@ module dap_top #(
          * the clear actually happening.
          */
         fifo_clear      <= 1'b0;
+        wfifo_clear     <= 1'b0;
 
         if (rst) begin
             trst      <= 1'b1;         /* released; asserting it resets the target */
@@ -609,12 +800,29 @@ module dap_top #(
             r_skew1   <= 2'd0;
             r_skew2   <= 2'd0;
         end else begin
+            /*
+             * A block-write parcel is assembled here rather than in the
+             * sequencer, because this is the block that owns DATA.  Driving one
+             * register from two always blocks is how CTRL bit 3 ended up tied
+             * to a constant once already - yosys resolves it by picking one.
+             *
+             * Bit 0 is the start bit and bits 32:1 the word, which is the order
+             * the raw path puts them on the wire.  A host write in the same
+             * cycle would win, which cannot happen: the host is not setting up
+             * a frame while the fabric is streaming one.
+             */
+            if (wfetch_go) begin
+                r_data <= {31'd0, wfifo_head, r_data[32:9], 1'b1};
+            end
+
             if (reg_we) begin
                 case (reg_addr)
                     7'h01: begin
                         start_frame_req <= reg_wdata[0];
                         start_block_req <= reg_wdata[1];
+                        start_bwrite_req <= reg_wdata[4];
                         if (reg_wdata[3]) fifo_clear <= 1'b1;
+                        if (reg_wdata[5]) wfifo_clear <= 1'b1;
                     end
                     7'h02: r_div     <= reg_wdata;
                     7'h03: r_cmd     <= reg_wdata[4:0];
@@ -742,6 +950,7 @@ module dap_top #(
              * takes about 2 ms for a 1 kB block and the drain about 1.6 ms,
              * and run one after the other that is most of the cost of a block.
              */
+            3'h3: rd_ctrl_hi = {4'd0, r_raw, r_wide, r_no_hunt, ~trst};
             3'h5: rd_ctrl_hi = fifo_count[7:0];
             default: rd_ctrl_hi = {4'd0, fifo_count[11:8]};   /* 0x0E */
         endcase
@@ -783,8 +992,7 @@ module dap_top #(
              * drain, which polls LEVEL thousands of times per block, started
              * losing bytes.
              */
-            default: rd_rep = {1'b0, s_rx1_hi, s_rx1_lo, s_rx2_hi, s_rx2_lo,
-                               s_tx2_hi, s_tx2_lo, s_aligned};
+            default: rd_rep = {7'd0, s_aligned};
         endcase
     end
 
@@ -798,9 +1006,15 @@ module dap_top #(
     reg [7:0] rd_fifo;
 
     always @(*) begin
-        case (reg_addr[1:0])
-            2'd1:    rd_fifo = scan_sync[7:0];
-            2'd2:    rd_fifo = scan_sync[15:8];
+        case (reg_addr[3:0])
+            /*
+             * How many bytes are waiting, so the host can keep the write FIFO
+             * fed without overrunning it.  The count rather than the free space:
+             * the subtraction is one twelve-bit adder in the middle of the read
+             * mux, and the host knows the depth perfectly well.
+             */
+            4'h3:    rd_fifo = wfifo_count[7:0];
+            4'h4:    rd_fifo = {4'd0, wfifo_count[11:8]};
             default: rd_fifo = fifo_empty ? 8'h00 : fifo_head;
         endcase
     end

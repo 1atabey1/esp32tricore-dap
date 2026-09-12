@@ -27,23 +27,6 @@ module dap_board_top (
     output wire dap0,      /* PC02, the clock this master generates */
     inout  wire dap1,      /* PC03, bidirectional data */
     inout  wire dap2,      /* PC01, the odd bits in wide mode */
-    /*
-     * Every other BANK0 pad, as inputs only.
-     *
-     * A bring-up instrument, not a feature.  The target's DAP2 pin demonstrably
-     * toggles - its own input register follows what the probe writes to it -
-     * and the pad this design calls dap2 demonstrably works, since driving it
-     * reads back both levels.  The two facts together say the net between them
-     * does not carry, and there are only two ways that happens: the bench does
-     * not wire DAP2 through, or package pin 34 is not the pad that reaches the
-     * connector.  Pin 34 is the one pin of the four whose mapping was never
-     * confirmed by function - the other three are proven every time the link
-     * works - so it is worth ruling out.
-     *
-     * Reading them costs far less than driving them: a flip-flop each and one
-     * byte pair in the register file, nowhere near the frame engines.
-     */
-    input  wire [15:0] scan,
     output wire trst,      /* PC04, target reset on this bench */
 
     /* ESP32, on the FPGA configuration SPI reused as user IO. */
@@ -122,8 +105,7 @@ module dap_board_top (
         .dap0    (dap0),
         .dap1    (dap1),
         .trst    (trst),
-        .dap2    (dap2),
-        .scan    (scan)
+        .dap2    (dap2)
     );
 endmodule
 

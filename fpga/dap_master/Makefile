@@ -57,7 +57,7 @@ FABRIC_MHZ := 48
 # the design was over its limit rather than that the seed was good; the fix was
 # to find the two paths responsible - see the capture tap in dap_top and the
 # split control read mux - after which most seeds clear it.
-SEED := 6
+SEED := 2
 
 bitstream: $(BUILD)/dap_master.bin
 
