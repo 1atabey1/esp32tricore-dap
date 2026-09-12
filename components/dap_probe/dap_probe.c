@@ -204,6 +204,17 @@ static uint32_t s_max_wait = DAP_MAXWAIT_RESET_CYCLES;
 #define DAP_TRAM_PARAGRAPH     0x400u
 
 #define DAP_SYNC_EXPECT        0xAAAAAAAAu
+/*
+ * The same reply, read back over a wide link.
+ *
+ * The device sends the training pattern on *each* line rather than splitting
+ * one pattern across the two, so weaving them back together doubles every bit
+ * and 0xAAAAAAAA arrives as 0xCCCCCCCC.  Its CRC does not survive the same
+ * treatment - six bits per line reassemble into twelve - so a wide sync is
+ * judged on the pattern alone.  A real telegram is genuinely interleaved and
+ * its CRC checks out, which is what the attach below goes on to prove.
+ */
+#define DAP_SYNC_EXPECT_WIDE   0xCCCCCCCCu
 #define DAP_SYNC_WIRE_WORD     0x09FE1u
 
 /* Widest reply this layer reads in one go: start bit is consumed separately. */
@@ -467,7 +478,9 @@ esp_err_t dap_probe_attach(dap_exchange_t *out, int attempts)
 
     for (int i = 0; i < attempts; i++) {
         err = dap_probe_sync(out);
-        if (err == ESP_OK && out->reply == DAP_SYNC_EXPECT) {
+        const bool wide = dap_phy_fpga_is_wide();
+        if ((wide || err == ESP_OK) &&
+            out->reply == (wide ? DAP_SYNC_EXPECT_WIDE : DAP_SYNC_EXPECT)) {
             if (i) {
                 ESP_LOGI(TAG, "sync succeeded on attempt %d", i + 1);
             }

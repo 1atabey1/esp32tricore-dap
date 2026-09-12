@@ -413,6 +413,26 @@ static void resume_application(void);
 #define OIFM_ADDR           0xF000040Cu
 
 /*
+ * What a wide sync reply reassembles to.
+ *
+ * The device sends the 0xAAAAAAAA training pattern on *each* line, not one
+ * pattern split across the two, so weaving them back together doubles every
+ * bit: 0,1,0,1... becomes 0,0,1,1,0,0,1,1..., which is 0xCCCCCCCC.
+ *
+ * This was read the other way round for a long time - the note here used to say
+ * alternating bits put all the zeros on one line and all the ones on the other,
+ * which would have made 0xAAAAAAAA the wide answer too.  That is what made a
+ * correct wide link look like a broken one.
+ *
+ * Its CRC is not checked with it.  Six CRC bits sent per line reassemble into
+ * twelve, which is not a CRC6 over the doubled payload and does not validate;
+ * a real telegram's payload is genuinely interleaved and its CRC does.  So the
+ * pattern is the whole of the evidence here, and a block read is what proves
+ * the link.
+ */
+#define WIDE_SYNC_EXPECT 0xCCCCCCCCu
+
+/*
  * Both DAPISC forms.  Long carries the 32-bit signature and is what the cold
  * attach uses; short is for reconfiguring a link that is already up.
  *
@@ -488,9 +508,14 @@ static void send_dapisc_short(uint16_t value)
 /*
  * Whether the window being decoded was sampled wide.
  *
- * Set around the one telegram whose reply comes back interleaved; see the note
- * at the handshake.  A flag rather than a parameter because it belongs to the
- * sampling, not to the caller's telegram - the command still goes out narrow.
+ * Set around the one telegram whose reply comes back interleaved while the
+ * fabric is otherwise narrow; see the note at the handshake.  A flag rather
+ * than a parameter because it belongs to the sampling, not to the caller's
+ * telegram - the command still goes out narrow.
+ *
+ * Once the fabric is wide outright, every reply is interleaved, so the decode
+ * has to ask it too.  Missing that read a perfectly good 0x0F10 back as 0x1E21
+ * for a second time, in the register read that exists to confirm the mode.
  */
 static bool s_dapisc_rx_wide;
 
@@ -514,7 +539,7 @@ static bool dapisc_decode(uint32_t raw, uint16_t *now)
      * bit and leaves the start bit in bit 0 - which is how a perfectly good
      * 0x0F10 reply read back as 0x1E21 and failed its CRC.
      */
-    const int skip = s_dapisc_rx_wide ? 2 : 1;
+    const int skip = (s_dapisc_rx_wide || dap_phy_fpga_is_wide()) ? 2 : 1;
 
     /* The value and its CRC6 both have to fit in what was sampled. */
     if (start < 0 || start + skip + 16 + 6 > 32) {
@@ -1229,7 +1254,8 @@ static bool wide_framing_sweep(wide_framing_t *rule, uint8_t *tap1_out,
 {
     bool found = false;
 
-    ESP_LOGW(TAG, "  wide framing sweep (sync must answer 0xAAAAAAAA):");
+    ESP_LOGW(TAG, "  wide framing sweep (sync must answer 0x%08X):",
+             WIDE_SYNC_EXPECT);
 
     for (unsigned v = 0; v < WF_COUNT; v++) {
         const frame_bits_t f = wide_frame((wide_framing_t)v, 0x10u, 63, 0, 0);
@@ -1247,9 +1273,12 @@ static bool wide_framing_sweep(wide_framing_t *rule, uint8_t *tap1_out,
                 }
                 const esp_err_t err = dap_phy_fpga_raw_frame(f.bits, f.n, 32,
                                                              &reply, &waited);
-                const bool ok = err == ESP_OK && reply == 0xAAAAAAAAu;
+                /* Same pattern as the tap sweep, and the status is not part
+                 * of it for the same reason - see WIDE_SYNC_EXPECT. */
+                (void)err;
+                const bool ok = (reply == WIDE_SYNC_EXPECT);
 
-                if (reply == 0xAAAAAAAAu || reply == 0x55555555u) {
+                if (ok || reply == 0xAAAAAAAAu) {
                     n += snprintf(line + n, sizeof(line) - (size_t)n, " %u%u%c",
                                   t1, t2, ok ? '!' : '~');
                 }
@@ -1272,26 +1301,28 @@ static bool wide_framing_sweep(wide_framing_t *rule, uint8_t *tap1_out,
     return found;
 }
 
+
 /*
  * Which pair of capture taps reads the wire correctly?
  *
- * sync is the only command the device answers from any state and its reply is a
- * known constant, 0xAAAAAAAA - which in wide mode is exactly the useful
- * pattern, because alternating bits put all the zeros on one line and all the
- * ones on the other.  A tap pair with the two lines swapped reads 0x55555555;
- * one sampling a line outside its bit reads something with a dead CRC.  So the
- * sweep is a measurement and not a smoke test.
+ * sync is the only command the device answers from any state, and in wide mode
+ * its reply is WIDE_SYNC_EXPECT.  A tap pair sampling a line outside its bit
+ * reads something else, so the sweep is a measurement and not a smoke test -
+ * but only a weak one, because the same pattern on both lines means a pair with
+ * the two lines swapped reads exactly the same thing.  What settles it is the
+ * bus read further down, which no tap pair can pass by accident.
  *
  * The start-bit alignment bit is recorded alongside but not used to choose: it
- * is one sample of one bit and can agree by luck, where the payload and its CRC
- * are thirty-eight bits of evidence.  Where the two disagree is worth seeing,
- * which is why both are printed.
+ * is one sample of one bit and can agree by luck, where the payload is
+ * thirty-two bits of evidence.  Where the two disagree is worth seeing, which
+ * is why both are printed.
  */
 static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
 {
     bool found = false;
 
-    ESP_LOGW(TAG, "  capture tap sweep (sync must answer 0xAAAAAAAA):");
+    ESP_LOGW(TAG, "  capture tap sweep (sync must answer 0x%08X):",
+             WIDE_SYNC_EXPECT);
 
     for (uint8_t t1 = 0; t1 < 4; t1++) {
         char line[80];
@@ -1335,13 +1366,15 @@ static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
              */
             vTaskDelay(pdMS_TO_TICKS(5));
 
-            const bool ok = dap_probe_sync(&x) == ESP_OK &&
-                            x.reply == 0xAAAAAAAAu;
+            /* The status is not part of the test: the reply carries a CRC
+             * this pattern cannot satisfy, so it comes back INVALID_CRC even
+             * when the bits are exactly right. */
+            (void)dap_probe_sync(&x);
+            const bool ok = (x.reply == WIDE_SYNC_EXPECT);
             const bool aligned = dap_phy_fpga_last_aligned();
 
             n += snprintf(line + n, sizeof(line) - (size_t)n, "  %c%c",
-                          ok ? 'D' : (x.reply == 0x55555555u ? 'x' : '.'),
-                          aligned ? 'a' : '-');
+                          ok ? 'D' : '.', aligned ? 'a' : '-');
 
             /*
              * Print the value whenever the device answered at all.
@@ -1365,8 +1398,7 @@ static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
         ESP_LOGW(TAG, "%s", line);
     }
 
-    ESP_LOGW(TAG, "    (D data good, x lines swapped, . no answer; "
-                  "a start bit seen on DAP2)");
+    ESP_LOGW(TAG, "    (D pattern correct, . not; a start bit seen on DAP2)");
     return found;
 }
 
@@ -1645,7 +1677,7 @@ static void wide_route_check(void)
         const esp_err_t e = dap_probe_sync(&one);
         ESP_LOGW(TAG, "  taps %d,%d: sync %s, reply 0x%08" PRIX64 "%s",
                  s_wide_tap1, s_wide_tap2, esp_err_to_name(e), one.reply,
-                 one.reply == 0xAAAAAAAAu ? "   <== CORRECT" : "");
+                 one.reply == WIDE_SYNC_EXPECT ? "   <== CORRECT" : "");
         wide_revert();
         return;
     }
@@ -1730,26 +1762,63 @@ static void wide_route_check(void)
      * check - attach properly, then read a constant off the bus.
      */
     dap_probe_clear_error_state();
-    dap_exchange_t x, id = {0};
-    if (dap_probe_attach(&x, 3) != ESP_OK ||
-        dap_probe_client_set(1, &x) != ESP_OK ||
-        dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id) != ESP_OK ||
-        id.reply != CLIENT_ID_EXPECT) {
-        ESP_LOGE(TAG, "  wide mode answers sync but will not attach: "
-                      "CLIENT_ID 0x%04X", (unsigned)id.reply);
-        wide_revert();
-        return;
+    dap_exchange_t x = {0}, id = {0};
+
+    /* One step per line: three commands collapsed into one condition reported
+     * the same "will not attach" whichever of them failed, and they fail for
+     * different reasons - sync carries no payload, client_set carries three
+     * bits, client_read carries an address and draws a real reply. */
+    const esp_err_t a_err = dap_probe_attach(&x, 3);
+    ESP_LOGW(TAG, "  wide attach: sync %s (0x%08" PRIX64 ")",
+             esp_err_to_name(a_err), x.reply);
+
+    const esp_err_t s_err = (a_err == ESP_OK) ? dap_probe_client_set(1, &x)
+                                              : ESP_FAIL;
+    ESP_LOGW(TAG, "  wide attach: client_set %s", esp_err_to_name(s_err));
+
+    const esp_err_t r_err = (s_err == ESP_OK)
+        ? dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id) : ESP_FAIL;
+    ESP_LOGW(TAG, "  wide attach: client_read %s -> 0x%04X (want 0x%04X)",
+             esp_err_to_name(r_err), (unsigned)id.reply,
+             (unsigned)CLIENT_ID_EXPECT);
+
+    /*
+     * A failed re-attach is not the end of the run.
+     *
+     * The client selected during the narrow attach survives the mode change -
+     * the telegram changes the framing, not the device's state - so a block
+     * read can go out without one, and whether *that* works is the question
+     * the whole exercise is here to answer.  Aborting on client_set meant the
+     * throughput sweep below had never once been reached.
+     */
+    const bool attached = (r_err == ESP_OK && id.reply == CLIENT_ID_EXPECT);
+
+    if (!attached) {
+        ESP_LOGW(TAG, "  wide re-attach did not take; going on to the bus "
+                      "reads with the client the narrow attach selected");
     }
 
     dap_probe_set_rw_mode(true);
     uint32_t mcds_id = 0;
-    if (dap_probe_enable_ocds() != ESP_OK ||
-        dap_probe_read32(0xFB718008u, &mcds_id) != ESP_OK ||
-        mcds_id != 0x00D6C007u) {
-        ESP_LOGE(TAG, "  wide mode attaches but a bus read came back "
-                      "0x%08" PRIX32, mcds_id);
-        wide_revert();
-        return;
+    const esp_err_t rd = dap_probe_read32(0xFB718008u, &mcds_id);
+    ESP_LOGW(TAG, "  wide bus read: %s -> 0x%08" PRIX32 " (want 0x00D6C007)",
+             esp_err_to_name(rd), mcds_id);
+
+    /* Try the block read regardless: it is a different command with an even
+     * payload, and it is the one that carries the throughput. */
+    static uint32_t probe_buf[8];
+    dap_probe_clear_error_state();
+    const esp_err_t br = dap_probe_blockread(CHECK_ADDR, probe_buf, 8);
+    ESP_LOGW(TAG, "  wide block read of 8 words: %s -> "
+                  "%08" PRIX32 " %08" PRIX32 " %08" PRIX32,
+             esp_err_to_name(br), probe_buf[0], probe_buf[1], probe_buf[2]);
+
+    if (rd != ESP_OK || mcds_id != 0x00D6C007u) {
+        if (br != ESP_OK) {
+            ESP_LOGE(TAG, "  neither a single read nor a block read works wide");
+            wide_revert();
+            return;
+        }
     }
     ESP_LOGW(TAG, "  attached wide: CLIENT_ID 0x%04X, miniMCDS ID "
                   "0x%08" PRIX32, (unsigned)id.reply, mcds_id);
