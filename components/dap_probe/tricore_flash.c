@@ -759,6 +759,49 @@ static esp_err_t install_loader(void)
                  (uint32_t)(assembled >> 32), (uint32_t)assembled);
 
         /*
+         * The same two words at every divider.
+         *
+         * If the first parcel is lost to turnaround - the device still letting
+         * go of the line after acknowledging the command frame while this end
+         * is already driving the next start bit - then slowing the wire down
+         * gives it time and the word arrives.  A divider that works is also a
+         * usable fallback, since even the slowest is quicker than the word
+         * path.
+         */
+        static char line[96];
+        {
+            static const uint8_t divs[] = { 0, 1, 2, 3, 5, 11 };
+            int n = 0;
+
+            for (size_t d = 0; d < sizeof(divs); d++) {
+                const uint32_t at = LOADER_BUFFER + 0x100u + 0x20u * (uint32_t)d;
+                uint32_t got[2] = {0};
+
+                for (int i = 0; i < 2; i++) {
+                    dap_probe_write32(at + 4u * i, 0xDEADBEEFu);
+                }
+                dap_phy_fpga_set_div(divs[d]);
+                const esp_err_t e = dap_phy_fpga_block_write(at, pattern, 2);
+                dap_phy_fpga_set_div(1);
+
+                for (int i = 0; i < 2; i++) {
+                    dap_probe_read32(at + 4u * i, &got[i]);
+                }
+                const bool good = (e == ESP_OK) &&
+                                  got[0] == pattern[0] && got[1] == pattern[1];
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " d%u=%s",
+                              divs[d],
+                              good ? "ok"
+                                   : (got[0] == 0u ? "zero"
+                                                   : (got[0] == 0xDEADBEEFu
+                                                      ? "none" : "junk")));
+                ESP_LOGW(TAG, "  div %u: %08" PRIX32 " %08" PRIX32 " (%s)",
+                         divs[d], got[0], got[1], esp_err_to_name(e));
+            }
+            ESP_LOGW(TAG, "  divider sweep:%s", line);
+        }
+
+        /*
          * Two words, on a freshly marked address.
          *
          * One word landed nothing while eight left a zero in the first slot,
@@ -823,18 +866,10 @@ static esp_err_t install_loader(void)
              */
             char why[256];
             snprintf(why, sizeof(why),
-                     "bw probe: %s read 0x%08" PRIX32 " want 0x%08" PRIX32
-                     ", long %08" PRIX32 " %08" PRIX32 " %08" PRIX32
-                     ", short %08" PRIX32 " %08" PRIX32 " %08" PRIX32
-                     ", one %08" PRIX32 " asm %08" PRIX32 ", two %08" PRIX32 " %08" PRIX32
-                     ", ack 0x%02X w%u lvl %u",
-                     esp_err_to_name(bw), back[0], pattern[0],
-                     back[0], back[1], back[2],
-                     shorts[0], shorts[1], shorts[2],
-                     one_back, (uint32_t)assembled, two[0], two[1],
-                     dap_phy_fpga_last_bw_status(),
-                     (unsigned)dap_phy_fpga_last_bw_wait(),
-                     (unsigned)dap_phy_fpga_last_bw_level());
+                     "bw probe: %s, 8w %08" PRIX32 " %08" PRIX32
+                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", divs:%s",
+                     esp_err_to_name(bw), back[0], back[1],
+                     one_back, (uint32_t)assembled, line);
             set_phase(TRICORE_FLASH_FAILED, why);
             return ESP_FAIL;
         }
