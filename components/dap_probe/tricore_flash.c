@@ -1241,7 +1241,49 @@ esp_err_t tricore_flash_write(const tricore_flash_region_t *regions,
 
     s_status.elapsed_ms = (uint32_t)((esp_timer_get_time() - started) / 1000);
     s_status.verified = ok;
+
+    /*
+     * Leave a board that runs, not one halted at its reset vector.
+     *
+     * The reference finishes the same way: reset, disarm the halt-after-reset
+     * trigger, then resume every core.  The reset matters as much as the
+     * resume - the cores have been halted with the flash mid-operation and the
+     * prefetch configuration changed under them, and starting a fresh image
+     * from the vector is the only sensible entry point for it.
+     *
+     * Only after a verified image.  A run that failed leaves the flash part
+     * written, and starting that is worse than leaving the target stopped
+     * where somebody can look at it.
+     */
+    if (ok) {
+        set_phase(TRICORE_FLASH_DONE, "starting the target");
+        if (reset_and_halt()) {
+            int running = 0, present = 0;
+            for (int core = 0; core < TRICORE_MAX_CORES; core++) {
+                if (!tricore_core_present(core)) {
+                    continue;
+                }
+                present++;
+                tricore_halt_release(core);
+                tricore_clear_debug_events(core);
+                if (tricore_resume(core, 500) == ESP_OK) {
+                    running++;
+                } else {
+                    ESP_LOGW(TAG, "CPU%d would not start", core);
+                }
+            }
+            /* Only CPU0 not running means the board is not running: the others
+             * are started by software on TC3xx, so a sibling still halted is
+             * the image's business rather than this code's. */
+            ESP_LOGI(TAG, "started %d of %d cores", running, present);
+            s_installed = false;
+        } else {
+            ESP_LOGW(TAG, "programmed, but the target would not reset to start");
+        }
+    }
+
     set_phase(ok ? TRICORE_FLASH_DONE : TRICORE_FLASH_FAILED,
-              ok ? "programmed and verified" : "the image does not match");
+              ok ? "programmed, verified and started"
+                 : "the image does not match");
     return ok ? ESP_OK : ESP_FAIL;
 }
