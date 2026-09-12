@@ -48,6 +48,8 @@ static const char *TAG = "TRICORE_FLASH";
 #define WDTCPU0_CON0     0xF0036100u
 #define WDTCPU0_CON1     0xF0036104u
 #define SCU_RSTSTAT      0xF0036050u
+#define SCU_PLLSTAT      0xF0036010u
+#define SCU_CCUCON0      0xF0036030u
 /* WDTxCON1.DR: stop the watchdog counting.  Writable only while that
  * watchdog's own ENDINIT is clear. */
 #define WDTCON1_DR       (1u << 3)
@@ -141,6 +143,48 @@ static const uint8_t LOADER_BLOB[] = {
 #define LOADER_STACK  0x70038000u
 /* Bigger chunks only save hand-offs to the stub; the bytes travel either way. */
 #define LOADER_BUFFER_BYTES (32u * 1024u)
+
+/*
+ * How long the stub waits for a page to program, in loop iterations.
+ *
+ * The stub reads no DMU status - on this device a status read issued by the
+ * core hangs it whenever a flash operation is in flight - so it paces itself
+ * with a spin loop and the host checks the error flags afterwards.  The blob
+ * is built with 4000, which is about 200 us at the 100 MHz backup clock a DAS
+ * DCO_RESET_AND_HALT leaves the part on, against the ~100 us a page needs.
+ *
+ * This probe gets there by a different route: an OCDS application reset
+ * restarts the cores but leaves the SCU alone, so the PLL stays where the
+ * application put it and the same loop is a third as long.  It was measured
+ * short - page 1 programmed, then page 2's first command cycle landed on a
+ * DMU still busy with page 1 and took a store bus error, DEADD 0xAF005554.
+ *
+ * 16000 is about 267 us at 300 MHz and 1.07 ms at the backup clock, so it is
+ * over the page time either way.  Over a 700 KB image it costs about six
+ * seconds.
+ */
+#define PROGRAM_SETTLE 16000u
+
+/*
+ * Where that constant sits in the blob, and what it looks like.
+ *
+ * The blob is the reference's, byte for byte, so the value cannot come from a
+ * rebuild - the TriCore compiler needs a licence server this probe has no
+ * business talking to.  Patching the immediate keeps the two provably the same
+ * file with one documented difference, rather than a second copy that drifts.
+ *
+ * MOV (RLC): const16 at bits 27:12, destination register at 31:28, opcode 0x3B.
+ * The guard below refuses to run if that word is not the MOV of 4000 into D4
+ * this expects, so a regenerated blob that moved the instruction fails loudly
+ * instead of having four bytes of its code overwritten.
+ *
+ * Checked against the toolchain rather than reasoned about: building the
+ * reference source with SETTLE=16000 gives a blob that differs from the
+ * committed one in exactly two bytes, at offsets 98 and 99, FA 40 -> E8 43 -
+ * which is what this writes.
+ */
+#define SETTLE_MOV_OFFSET 96u
+#define SETTLE_MOV_WORD(c) ((4u << 28) | (((c) & 0xFFFFu) << 12) | 0x3Bu)
 
 #define LOADER_CMD_PROGRAM  1u
 #define LOADER_CMD_CHECKSUM 3u
@@ -509,19 +553,21 @@ static esp_err_t link_up(void)
 /*
  * Reset the application and stop the cores before any of it runs.
  *
- * This is not tidiness, it is what makes the stub runnable at all.  The stub is
- * ordinary compiled code: it calls a subroutine, and a TriCore call saves the
- * upper context into a CSA taken from the free list at FCX.  Halting a running
- * application and redirecting its PC inherits whatever that application had
- * left in FCX - and on a target running PXROS that list belongs to the task
- * that happened to be executing, so the first call in the stub takes a context
- * management trap, lands on the application's trap vector at BTV, and the
- * handler traps again until the list is empty.  What comes back is a stub that
- * "never finished" with FCX 0 and a PC in flash.
+ * For the reason the sibling halt below already gives: nothing may be fetching
+ * out of the bank being written, and a reset is a surer way to get there than
+ * halting four cores one at a time.  The reference connects with
+ * DCO_RESET_AND_HALT for the same effect.
  *
- * After a reset with halt-after-reset armed, the startup software has built the
- * free list and nothing has consumed it.  The reference does the same thing by
- * connecting with DCO_RESET_AND_HALT before it touches the flash.
+ * Not for the core's context state.  Halt-after-reset stops the cores at the
+ * reset vector, before any startup code runs, so FCX and LCX are both zero
+ * afterwards - and that is the state the reference runs the stub in too: it
+ * resets, halts, and never resumes before handing over.  The stub is a leaf
+ * with no call in it, so it never asks for a context save area.
+ *
+ * Which is why a class 3 trap out of the stub is a mask rather than a cause:
+ * with no free list, whatever actually faulted could not be saved, and the FCU
+ * trap is what gets reported instead of the real one.  The syndrome registers
+ * read in run_loader() are what say what it was.
  */
 static bool reset_and_halt(void)
 {
@@ -562,6 +608,24 @@ static bool reset_and_halt(void)
     /* A halt-after-reset trigger left on TR0 re-halts the core on every
      * resume, which would stop the stub on its first instruction. */
     tricore_disarm_reset_trigger();
+
+    /*
+     * What the clock is doing, because the stub's pacing depends on it.
+     *
+     * program_page() reads no DMU status - on this device a status read from
+     * the core hangs it while an operation is in flight - and paces itself with
+     * a spin loop sized for about 200 us at the 100 MHz backup clock.  An OCDS
+     * application reset restarts the cores but leaves the SCU alone, so the PLL
+     * stays where the application put it; at 300 MHz the same loop is a third
+     * as long and lands the next page's first command on a flash that is still
+     * busy.  DAS's reset takes the whole device down to the backup clock, which
+     * is the difference this logs.
+     */
+    uint32_t pllstat = 0, ccucon0 = 0;
+    dap_probe_read32(SCU_PLLSTAT, &pllstat);
+    dap_probe_read32(SCU_CCUCON0, &ccucon0);
+    ESP_LOGI(TAG, "after the reset: PLLSTAT 0x%08" PRIX32 " CCUCON0 0x%08"
+                  PRIX32, pllstat, ccucon0);
 
     tricore_discover();
     return true;
@@ -629,6 +693,25 @@ static esp_err_t install_loader(void)
     static uint8_t padded[(sizeof(LOADER_BLOB) + 3u) & ~3u];
     memset(padded, 0, sizeof(padded));
     memcpy(padded, LOADER_BLOB, sizeof(LOADER_BLOB));
+
+    /* Lengthen the settle window; see PROGRAM_SETTLE. */
+    const uint32_t found = (uint32_t)padded[SETTLE_MOV_OFFSET] |
+                           ((uint32_t)padded[SETTLE_MOV_OFFSET + 1] << 8) |
+                           ((uint32_t)padded[SETTLE_MOV_OFFSET + 2] << 16) |
+                           ((uint32_t)padded[SETTLE_MOV_OFFSET + 3] << 24);
+    if (found != SETTLE_MOV_WORD(4000u)) {
+        ESP_LOGE(TAG, "the loader blob does not hold the settle constant where "
+                      "expected (+0x%X reads 0x%08" PRIX32 ")",
+                 (unsigned)SETTLE_MOV_OFFSET, found);
+        set_phase(TRICORE_FLASH_FAILED, "the loader blob is not the one this "
+                                        "code knows how to patch");
+        return ESP_FAIL;
+    }
+    const uint32_t settle = SETTLE_MOV_WORD(PROGRAM_SETTLE);
+    padded[SETTLE_MOV_OFFSET]     = (uint8_t)(settle);
+    padded[SETTLE_MOV_OFFSET + 1] = (uint8_t)(settle >> 8);
+    padded[SETTLE_MOV_OFFSET + 2] = (uint8_t)(settle >> 16);
+    padded[SETTLE_MOV_OFFSET + 3] = (uint8_t)(settle >> 24);
 
     if (write_block(LOADER_CODE, padded, sizeof(padded)) != ESP_OK) {
         set_phase(TRICORE_FLASH_FAILED, "could not write the loader to PSPR");
@@ -828,6 +911,22 @@ static esp_err_t run_loader(uint32_t cmd, uint32_t address, uint32_t count,
          * the tell that a reset happened at all: this code cleared it, and only
          * a reset puts it back.
          */
+        /*
+         * The trap syndrome, which needs no context to survive.
+         *
+         * DEADD carries the address that faulted, which is the one thing that
+         * ends the guessing: a data-side fault on the command interface says
+         * the stub wrote the CSI while the flash was still busy with the page
+         * before it, and an instruction-side one says something else entirely.
+         */
+        uint32_t dstr = 0, datr = 0, deadd = 0, pstr = 0;
+        dap_probe_read32(CPU0_BASE + 0x9010u, &dstr);
+        dap_probe_read32(CPU0_BASE + 0x9018u, &datr);
+        dap_probe_read32(CPU0_BASE + 0x901Cu, &deadd);
+        dap_probe_read32(CPU0_BASE + 0x9200u, &pstr);
+        ESP_LOGE(TAG, "DSTR 0x%08" PRIX32 " DATR 0x%08" PRIX32 " DEADD 0x%08"
+                      PRIX32 " PSTR 0x%08" PRIX32, dstr, datr, deadd, pstr);
+
         uint32_t rststat = 0, wdts = 0, wdtcpu0 = 0;
         dap_probe_read32(SCU_RSTSTAT, &rststat);
         dap_probe_read32(SCU_WDTS_CON0, &wdts);
