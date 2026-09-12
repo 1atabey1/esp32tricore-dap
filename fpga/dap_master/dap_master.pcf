@@ -90,3 +90,26 @@ set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
 # drives, and 30 leaves room above the 24 the ESP32 can produce.
 set_frequency clk 48
 set_frequency spi_sck 30
+
+# Every other BANK0 pad, read-only, for the DAP2 wiring hunt.  See the note in
+# dap_board_top.v: the target pin toggles and pin 34 does not see it, so either
+# the bench does not wire DAP2 or 34 is the wrong pad.  These say which.
+# No positive control is available: every pad known to reach the target is
+# already driven by this design, so a scan that sees nothing has to be read as
+# "no free BANK0 pad carries it" rather than as proof the scan itself works.
+set_io scan[0] 25
+set_io scan[1] 26
+set_io scan[2] 27
+set_io scan[3] 23
+set_io scan[4] 35
+set_io scan[5] 36
+set_io scan[6] 37
+set_io scan[7] 38
+set_io scan[8] 39
+set_io scan[9] 40
+set_io scan[10] 41
+set_io scan[11] 43
+set_io scan[12] 44
+set_io scan[13] 45
+set_io scan[14] 47
+set_io scan[15] 48

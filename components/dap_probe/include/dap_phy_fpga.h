@@ -112,6 +112,16 @@ esp_err_t dap_phy_fpga_set_wide(bool enable);
 bool      dap_phy_fpga_is_wide(void);
 
 /*
+ * Receive wide while still transmitting narrow, so DAP2 is read and never
+ * driven.
+ *
+ * For looking at DAP2 before the target has handed the pin over: in two-pin
+ * mode it belongs to the application, which drives it, and driving it from
+ * here as well is two push-pull drivers on one net through a 22 ohm resistor.
+ */
+esp_err_t dap_phy_fpga_set_rx_wide(bool enable);
+
+/*
  * Where in the window each line is sampled, in fabric clocks, 0 to 3.
  *
  * Tap 0 on both is exactly what narrow mode has always done.  The taps exist
@@ -145,6 +155,34 @@ bool      dap_phy_fpga_last_aligned(void);
  * phase.
  */
 uint8_t   dap_phy_fpga_line_witness(void);
+
+/*
+ * The level on every BANK0 pad this design does not otherwise use, bit n being
+ * the pad named scan[n] in the PCF.
+ *
+ * For chasing where a target signal lands: with the target toggling one of its
+ * own pins, the bit that follows names the pad it reaches, and no bit
+ * following says no free pad does.
+ */
+uint16_t  dap_phy_fpga_pad_scan(void);
+
+/*
+ * Send a frame the caller assembled, bit for bit.
+ *
+ *  is the whole thing - start bit, CMD, LEN, DATA, CRC6, trailing zero -
+ * with the first bit on the wire in bit 0, and  of them (at most 63).
+ * In wide mode consecutive pairs share a clock, bit 0 on DAP1 and bit 1 on
+ * DAP2, so a caller wanting the start bit on both lines puts a one in each of
+ * the first two positions.
+ *
+ * Nothing is assembled or corrected on the way out: no CRC is generated.  That
+ * is the point - the wide framing rule is not documented anywhere this project
+ * can reach, so it has to be found by trying candidates, and a candidate the
+ * fabric quietly fixed would test nothing.
+ */
+esp_err_t dap_phy_fpga_raw_frame(uint64_t bits, size_t nbits,
+                                 size_t reply_bits,
+                                 uint32_t *reply, uint16_t *wait_cycles);
 
 /*
  * One command and its reply.  `reply_bits` of zero means a bare acknowledge.

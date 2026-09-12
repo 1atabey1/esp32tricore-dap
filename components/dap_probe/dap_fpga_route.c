@@ -25,6 +25,7 @@
 #include "dap_phy.h"
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
+#include "tricore.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -280,9 +281,31 @@ esp_err_t dap_phy_fpga_attach(void)
 
     dap_exchange_t x;
     if (dap_probe_attach(&x, 3) != ESP_OK || x.reply != 0xAAAAAAAAu) {
-        ESP_LOGE(TAG, "the target did not answer sync through the fabric");
-        dap_phy_fpga_use(false);
-        return ESP_ERR_INVALID_STATE;
+        /*
+         * Reset the target and try once more before giving up.
+         *
+         * sync is answered from any state the *protocol* can be in, so a
+         * silent target usually means the two ends disagree about the physical
+         * mode - which is exactly what a wide-mode experiment that did not get
+         * to put things back leaves behind, and it survives a probe reboot
+         * because it is the target holding the state, not us.  The device's
+         * mode is cleared by a device reset, so TRST is the way out, and
+         * without this the only recovery was a human power-cycling the board.
+         */
+        ESP_LOGW(TAG, "no answer to sync; resetting the target and retrying");
+        dap_phy_fpga_set_wide(false);
+        dap_phy_fpga_set_trst(true);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        dap_phy_fpga_set_trst(false);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        dap_probe_clear_error_state();
+
+        if (dap_probe_attach(&x, 3) != ESP_OK || x.reply != 0xAAAAAAAAu) {
+            ESP_LOGE(TAG, "the target did not answer sync through the fabric");
+            dap_phy_fpga_use(false);
+            return ESP_ERR_INVALID_STATE;
+        }
+        ESP_LOGW(TAG, "the reset brought it back");
     }
 
     /*
@@ -335,6 +358,40 @@ esp_err_t dap_phy_fpga_attach(void)
 /* ------------------------------------------------------------------------ */
 /* Wide mode                                                                 */
 /* ------------------------------------------------------------------------ */
+
+/*
+ * The target's DAP2 pin, as an ordinary port pin.
+ *
+ * DAP2 is P21.7 on this part, and while the interface is in two-pin mode the
+ * port module owns it - which is the whole reason wide mode did not work: the
+ * application configures it as a push-pull output and holds it low, so
+ * Cerberus can put its protocol engine in wide mode, and does, but cannot
+ * drive the pad.
+ */
+#define P21_OUT     0xF003B500u
+#define P21_IOCR4   0xF003B514u
+#define P21_IN      0xF003B524u
+#define P21_PDISC   0xF003B560u
+
+#define DAP2_PIN    7u
+/* IOCR4 holds four five-bit fields for pins 4..7, pin n at bit 3 + 8*(n-4).
+ * 0x10 is push-pull general-purpose output; 0x00 is a plain input. */
+#define IOCR4_SHIFT(n)  (3u + 8u * ((n) - 4u))
+#define IOCR_PP_OUT     0x10u
+
+/*
+ * The target application's own setting for P21.7, put back on every exit.
+ *
+ * It configured that pin deliberately and is entitled to it again once the
+ * probe is done borrowing it.
+ */
+static uint32_t s_iocr4_saved;
+static bool     s_iocr4_dirty;
+
+/* Defined below; wide_revert needs them and comes first. */
+static void halt_application(void);
+static void resume_application(void);
+
 
 /*
  * DAPISC field positions, from the register layout: MODE is bits 5:4, and 01B
@@ -454,11 +511,13 @@ static bool dap2_line_free(void)
     char     l1[17], l2[17];
     unsigned ones = 0;
 
-    dap_phy_fpga_set_wide(true);
+    /* Receive wide, transmit narrow: DAP2 is read and never driven, which
+     * matters because the target still owns that pin here. */
+    dap_phy_fpga_set_rx_wide(true);
     dap_phy_fpga_set_raw_window(true);
     dap_phy_fpga_exchange(0x10u, 63, 0, 0, 32, &reply, &waited);
     dap_phy_fpga_set_raw_window(false);
-    dap_phy_fpga_set_wide(false);
+    dap_phy_fpga_set_rx_wide(false);
 
     for (int i = 0; i < 16; i++) {
         l1[i] = (reply & (1u << (2 * i)))     ? '1' : '0';
@@ -486,6 +545,7 @@ static bool dap2_line_free(void)
  * ever changes mode on a telegram it understood, so the probe has to speak the
  * old mode to ask for the new one.  That is true in both directions.
  */
+
 static void wide_revert(void)
 {
     dap_exchange_t x;
@@ -506,6 +566,537 @@ static void wide_revert(void)
         (void)dap_probe_attach(&x, 3);
     }
 
+    resume_application();
+
+    if (s_iocr4_dirty) {
+        s_iocr4_dirty = false;
+        if (dap_probe_write32(P21_IOCR4, s_iocr4_saved) == ESP_OK) {
+            ESP_LOGW(TAG, "  P21.7 given back to the application");
+        } else {
+            ESP_LOGE(TAG, "  P21.7 could not be given back; IOCR4 should be "
+                          "0x%08" PRIX32, s_iocr4_saved);
+        }
+        dap_probe_clear_error_state();
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Is DAP2 wired to the target at all?                                        */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * DAP2 is P21.7 on this part.  While the interface is in two-pin mode that pin
+ * is an ordinary port pin, which makes the wiring answerable from this end
+ * without a scope: the probe still has full bus access, so it can drive P21.7
+ * from the target side and look at what its own DAP2 pad reads.
+ *
+ * Three outcomes, and only one of them is a protocol problem:
+ *
+ *   the target pad follows and this board sees it  -> the net is good
+ *   the target pad follows and this board sees nothing -> the two are not
+ *       connected, and no amount of framing work will help
+ *   the target pad does not follow -> the pad is not under port control and
+ *       the test proved nothing either way
+ *
+ * The control - reading the target's own input register back at each level -
+ * is what separates the second from the third, and without it the first
+ * version of this test pointed confidently at the wrong conclusion on the
+ * wrong port.
+ *
+ * P21.7 is restored exactly as it was found.
+ */
+
+/*
+ * What DAP2 reads right now, as sixteen samples.
+ *
+ * Reuses the wide raw window: with the fabric wide the reply window is sampled
+ * on both lines and interleaved into the payload, so the odd bit positions are
+ * DAP2.  Returns how many of them read high.  Costs one frame the device does
+ * not understand and does not answer, which is harmless and changes nothing.
+ */
+static unsigned dap2_level_samples(void)
+{
+    uint32_t reply = 0;
+    uint16_t waited = 0;
+    unsigned ones = 0;
+
+    /* Receive wide, transmit narrow: DAP2 is read and never driven, which
+     * matters because the target still owns that pin here. */
+    dap_phy_fpga_set_rx_wide(true);
+    dap_phy_fpga_set_raw_window(true);
+    dap_phy_fpga_exchange(0x10u, 63, 0, 0, 32, &reply, &waited);
+    dap_phy_fpga_set_raw_window(false);
+    dap_phy_fpga_set_rx_wide(false);
+
+    for (int i = 0; i < 16; i++) {
+        if (reply & (1u << (2 * i + 1))) {
+            ones++;
+        }
+    }
+    return ones;
+}
+
+static void dap2_wiring_probe(void)
+{
+    uint32_t iocr4 = 0, pdisc = 0, out = 0, in = 0;
+
+    if (dap_probe_read32(P21_IOCR4, &iocr4) != ESP_OK ||
+        dap_probe_read32(P21_PDISC, &pdisc) != ESP_OK ||
+        dap_probe_read32(P21_OUT,   &out)   != ESP_OK ||
+        dap_probe_read32(P21_IN,    &in)    != ESP_OK) {
+        ESP_LOGW(TAG, "  port 21 unreadable, so the DAP2 wiring is untested");
+        return;
+    }
+
+    ESP_LOGW(TAG, "  P21 IOCR4 0x%08" PRIX32 " PDISC 0x%08" PRIX32
+                  " OUT 0x%08" PRIX32 " IN 0x%08" PRIX32, iocr4, pdisc, out, in);
+    ESP_LOGW(TAG, "    P21.7 (DAP2): PC 0x%02X, %s",
+             (unsigned)((iocr4 >> IOCR4_SHIFT(DAP2_PIN)) & 0x1Fu),
+             (pdisc & (1u << DAP2_PIN)) ? "pad disabled" : "pad enabled");
+
+    const uint32_t mask   = 0x1Fu << IOCR4_SHIFT(DAP2_PIN);
+    const uint32_t as_out = (iocr4 & ~mask) |
+                            (IOCR_PP_OUT << IOCR4_SHIFT(DAP2_PIN));
+
+    if (dap_probe_write32(P21_IOCR4, as_out) != ESP_OK) {
+        ESP_LOGW(TAG, "    P21.7: IOCR4 would not take the write");
+        return;
+    }
+
+    uint32_t in_lo = 0, in_hi = 0;
+
+    /*
+     * Every free BANK0 pad is read at both levels as well.
+     *
+     * The dedicated DAP2 pad seeing nothing has two causes - the bench does not
+     * wire DAP2 through, or package pin 34 is not the pad that reaches the
+     * connector - and only the second is fixable from here.  Pin 34 is the one
+     * of the four whose mapping was never confirmed by function; the other
+     * three are proven every time the link works.  So while the target's pin is
+     * being driven, every other pad is watched too.
+     */
+    dap_probe_write32(P21_OUT, out & ~(1u << DAP2_PIN));
+    dap_probe_read32(P21_IN, &in_lo);
+    const uint16_t scan_lo = dap_phy_fpga_pad_scan();
+    const unsigned lo = dap2_level_samples();
+
+    dap_probe_write32(P21_OUT, out | (1u << DAP2_PIN));
+    dap_probe_read32(P21_IN, &in_hi);
+    const uint16_t scan_hi = dap_phy_fpga_pad_scan();
+    const unsigned hi = dap2_level_samples();
+
+    /* Put the pin back before judging anything. */
+    dap_probe_write32(P21_OUT, out);
+    dap_probe_write32(P21_IOCR4, iocr4);
+    dap_probe_clear_error_state();
+
+    const bool moved = ((in_lo >> DAP2_PIN) & 1u) == 0u &&
+                       ((in_hi >> DAP2_PIN) & 1u) == 1u;
+
+    ESP_LOGW(TAG, "    P21.7: target pad %s (IN %u then %u) -> our DAP2 high "
+                  "in %u/16 then %u/16 samples%s",
+             moved ? "followed" : "did NOT follow",
+             (unsigned)((in_lo >> DAP2_PIN) & 1u),
+             (unsigned)((in_hi >> DAP2_PIN) & 1u), lo, hi,
+             (moved && lo == 0 && hi == 16)
+                 ? "   <== the net is good"
+                 : moved ? "   <== the pin moved and this board saw nothing"
+                         : "   <== inconclusive: the pad is not port-controlled");
+
+    /*
+     * Which free pad, if any, followed the target's pin.
+     *
+     * A pad that went from low to high with it is the one the signal actually
+     * reaches, whatever the schematic says.  Both words are printed either way,
+     * because "nothing followed" is only believable alongside the levels it is
+     * derived from - a scan word that is all ones or all zeros at both levels
+     * is a scan that is not reading anything.
+     */
+    static const uint8_t k_scan_pins[16] = {
+        25, 26, 27, 23, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 47, 48
+    };
+    const uint16_t rose = (uint16_t)(~scan_lo & scan_hi);
+
+    ESP_LOGW(TAG, "    free BANK0 pads: 0x%04X with the pin low, 0x%04X with it "
+                  "high", scan_lo, scan_hi);
+    if (rose == 0u) {
+        ESP_LOGW(TAG, "    no free pad followed it, so no pad on this FPGA "
+                      "sees the target's DAP2 - the bench does not wire it");
+    } else {
+        for (unsigned i = 0; i < 16; i++) {
+            if (rose & (1u << i)) {
+                ESP_LOGW(TAG, "    package pin %u followed the target's DAP2 "
+                              "- THAT is where it lands, not pin 34",
+                         k_scan_pins[i]);
+            }
+        }
+    }
+}
+
+/*
+ * Stop the application before borrowing its pin.
+ *
+ * Releasing P21.7 by writing IOCR4 is not enough on a running target: the
+ * application owns that pin and puts it back, so the release survives for
+ * however long it takes the next configuration pass to undo it - which is why
+ * the wiring probe kept reporting "the target pad did not follow" on some runs
+ * and not others, and why a wide frame sent afterwards found the pin driven
+ * again and put two outputs across a 22 ohm resistor.
+ *
+ * Halting the cores stops that.  Cerberus stays up - it is what does the
+ * halting - so the DAP link is unaffected, and a pin the application is no
+ * longer executing cannot be reconfigured behind us.
+ *
+ * The cores are resumed again on the way out.  Halting a target to test a
+ * probe feature and leaving it stopped would be its own kind of rude.
+ */
+static uint8_t s_halted_mask;
+
+static void halt_application(void)
+{
+    s_halted_mask = 0;
+
+    for (int core = 0; core < TRICORE_MAX_CORES; core++) {
+        if (!tricore_core_present(core)) {
+            continue;
+        }
+        if (tricore_halt(core, core, 200) == ESP_OK) {
+            s_halted_mask |= (uint8_t)(1u << core);
+        } else {
+            ESP_LOGW(TAG, "  CPU%d would not halt", core);
+        }
+    }
+    ESP_LOGW(TAG, "  halted cores 0x%02X so the application stops "
+                  "reconfiguring P21.7", s_halted_mask);
+}
+
+static void resume_application(void)
+{
+    for (int core = 0; core < TRICORE_MAX_CORES; core++) {
+        if (s_halted_mask & (1u << core)) {
+            tricore_resume(core, 200);
+        }
+    }
+    if (s_halted_mask) {
+        ESP_LOGW(TAG, "  cores resumed");
+    }
+    s_halted_mask = 0;
+}
+
+/*
+ * Hand P21.7 back so the debug interface can drive it.
+ *
+ * This is the thing that was actually wrong, and the port registers said so
+ * from the first time they were read: IOCR4 reads 0x80808080, which is PC7 =
+ * 0x10 - push-pull general-purpose output - so the target's own application
+ * owns the DAP2 pin and holds it low.  Cerberus can put its protocol engine in
+ * wide mode, and does, but it cannot drive a pad the port module is driving, so
+ * the odd bits go nowhere and every wide frame after that is unanswerable.
+ *
+ * Every symptom this chased for a long time follows from that one fact: the net
+ * idling low with nothing of ours driving it, DAP2 never going high while the
+ * target had the lines, and a reply that reads 0x0334 - exactly the even bits
+ * of a wide 0x0F10 - because DAP1 carried half of a frame whose other half was
+ * being held down.
+ *
+ * Setting PC7 to an input mode stops the port driving and leaves the pin to the
+ * interface.  The previous value is returned so it can be put back: the target's
+ * application configured that pin deliberately and is entitled to it again.
+ */
+#define IOCR_IN_NOPULL  0x00u
+
+/*
+ * Returns whether it is safe for this end to drive DAP2.
+ *
+ * That is a different question from whether anything was changed, and
+ * conflating the two is dangerous here: "already an input" needs no change and
+ * is safe, while "could not read or write IOCR4" also needs no change and is
+ * emphatically not.  The restore flag is set here rather than by the caller so
+ * the two cannot drift apart.
+ */
+static bool p21_7_release(uint32_t *saved_iocr4)
+{
+    if (dap_probe_read32(P21_IOCR4, saved_iocr4) != ESP_OK) {
+        ESP_LOGW(TAG, "  P21 IOCR4 unreadable; the pin's owner is unknown, so "
+                      "DAP2 will not be driven from here");
+        return false;
+    }
+
+    const unsigned pc = (unsigned)((*saved_iocr4 >> IOCR4_SHIFT(DAP2_PIN)) & 0x1Fu);
+    if ((pc & 0x10u) == 0u) {
+        ESP_LOGW(TAG, "  P21.7 is already an input (PC 0x%02X); nothing to "
+                      "release", pc);
+        return true;
+    }
+
+    const uint32_t mask = 0x1Fu << IOCR4_SHIFT(DAP2_PIN);
+    const uint32_t as_in = (*saved_iocr4 & ~mask) |
+                           (IOCR_IN_NOPULL << IOCR4_SHIFT(DAP2_PIN));
+
+    if (dap_probe_write32(P21_IOCR4, as_in) != ESP_OK) {
+        ESP_LOGW(TAG, "  P21 IOCR4 would not take the write");
+        return false;
+    }
+    dap_probe_clear_error_state();
+
+    uint32_t now = 0;
+    if (dap_probe_read32(P21_IOCR4, &now) != ESP_OK) {
+        ESP_LOGW(TAG, "  P21.7 write not confirmed; not driving DAP2");
+        return false;
+    }
+
+    const unsigned pc_now = (unsigned)((now >> IOCR4_SHIFT(DAP2_PIN)) & 0x1Fu);
+    ESP_LOGW(TAG, "  P21.7 released for the interface: IOCR4 0x%08" PRIX32
+                  " -> 0x%08" PRIX32 " (PC 0x%02X -> 0x%02X)",
+             *saved_iocr4, now, pc, pc_now);
+
+    if ((pc_now & 0x10u) != 0u) {
+        ESP_LOGE(TAG, "  P21.7 is still an output; not driving DAP2 into it");
+        return false;
+    }
+    s_iocr4_dirty = true;
+    return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Wide framing: candidate rules, tried against the device                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A frame as a bit sequence, first bit on the wire in bit 0.
+ *
+ * Kept as a plain integer because everything that fits the raw path fits in
+ * 63 bits: sync is 19 narrow and 22 wide, and the longest thing this needs to
+ * send is a block-read command at 59.
+ */
+typedef struct {
+    uint64_t bits;
+    unsigned n;
+} frame_bits_t;
+
+static void fb_push(frame_bits_t *f, unsigned bit)
+{
+    if (bit & 1u) {
+        f->bits |= 1ull << f->n;
+    }
+    f->n++;
+}
+
+static void fb_field(frame_bits_t *f, uint64_t value, unsigned nbits)
+{
+    for (unsigned i = 0; i < nbits; i++) {
+        fb_push(f, (unsigned)((value >> i) & 1u));
+    }
+}
+
+/*
+ * The DAP CRC6, over a bit sequence in transmission order.
+ *
+ * A right-shifting Galois LFSR, the same one dap_frame.c uses and the host
+ * test binary checks against the documented vectors.  Repeated here rather
+ * than shared because this one takes a bit sequence and that one takes fields,
+ * and the whole point of these candidates is that what counts as a field is
+ * the thing in question.
+ */
+static uint8_t crc6_of(uint64_t bits, unsigned n)
+{
+    uint8_t state = 0x20u;
+
+    for (unsigned i = 0; i < n; i++) {
+        const unsigned fb = (state ^ (unsigned)(bits >> i)) & 1u;
+        state = (uint8_t)((state >> 1) & 0x3Fu);
+        if (fb) {
+            state ^= 0x30u;
+        }
+    }
+    return state;
+}
+
+/*
+ * The candidate wide framing rules.
+ *
+ * All of them agree on what the device is being told - CMD, LEN and DATA are
+ * the same numbers - and differ only in how those become a bit stream once two
+ * bits share a clock.  That is the whole unknown: the narrow framing is
+ * documented and checked against vectors, and the wide one is described in
+ * exactly one place this project can reach, as a reconstruction.
+ *
+ * In the raw path the fabric puts even bit positions on DAP1 and odd ones on
+ * DAP2, so "the start bit goes on both lines" is expressed by putting a one in
+ * each of the first two positions, and "on DAP1 only" by letting the frame's
+ * next bit take the odd slot.
+ */
+typedef enum {
+    /*
+     * Every field padded to an even length and the pads covered by the CRC.
+     * This is the reconstruction the RTL originally implemented; the device
+     * rejects it, which is why the others exist.
+     */
+    WF_PAD_CRC = 0,
+    /* Padded the same way, but the CRC covers only the real bits. */
+    WF_PAD_NOCRC,
+    /*
+     * No padding at all: CMD, LEN, DATA and the CRC are one continuous stream
+     * split between the lines, so LEN starts on DAP2 because CMD's five bits
+     * leave the parity odd.  The CRC is then the narrow one unchanged.
+     */
+    WF_STREAM,
+    /*
+     * The narrow frame exactly, start bit included, split between the lines -
+     * which puts the start bit on DAP1 alone.
+     */
+    WF_STREAM_1START,
+    WF_COUNT
+} wide_framing_t;
+
+static const char *wf_name(wide_framing_t v)
+{
+    switch (v) {
+        case WF_PAD_CRC:       return "fields padded, CRC covers pads";
+        case WF_PAD_NOCRC:     return "fields padded, CRC skips pads";
+        case WF_STREAM:        return "no padding, one stream";
+        case WF_STREAM_1START: return "no padding, start bit on DAP1 only";
+        default:               return "?";
+    }
+}
+
+/*
+ * Assemble one candidate.
+ *
+ * `cmd`, `len_field` and `data`/`data_bits` are the frame's contents in the
+ * ordinary sense - LEN is the field that goes on the wire and data_bits is how
+ * many DATA bits follow it, which are not the same thing and never have been.
+ */
+static frame_bits_t wide_frame(wide_framing_t v, uint8_t cmd, uint8_t len_field,
+                               uint64_t data, unsigned data_bits)
+{
+    frame_bits_t f = { 0, 0 };
+    frame_bits_t c = { 0, 0 };      /* what the CRC is taken over */
+
+    switch (v) {
+        case WF_PAD_CRC:
+        case WF_PAD_NOCRC: {
+            const bool data_odd = (data_bits & 1u) != 0u;
+
+            fb_field(&c, cmd, 5);
+            if (v == WF_PAD_CRC) {
+                fb_push(&c, 0);                  /* CMD's pad, covered */
+            }
+            fb_field(&c, len_field, 6);
+            fb_field(&c, data, data_bits);
+            if (data_odd && v == WF_PAD_CRC) {
+                fb_push(&c, 0);                  /* DATA's pad, covered */
+            }
+
+            fb_push(&f, 1);  fb_push(&f, 1);     /* start bit on both lines */
+            fb_field(&f, cmd, 5);
+            fb_push(&f, 0);                      /* CMD is five bits */
+            fb_field(&f, len_field, 6);
+            fb_field(&f, data, data_bits);
+            if (data_odd) {
+                fb_push(&f, 0);
+            }
+            fb_field(&f, crc6_of(c.bits, c.n), 6);
+            fb_push(&f, 0);  fb_push(&f, 0);     /* trailing zero, both lines */
+            break;
+        }
+
+        case WF_STREAM: {
+            fb_field(&c, cmd, 5);
+            fb_field(&c, len_field, 6);
+            fb_field(&c, data, data_bits);
+
+            fb_push(&f, 1);  fb_push(&f, 1);
+            fb_field(&f, cmd, 5);
+            fb_field(&f, len_field, 6);
+            fb_field(&f, data, data_bits);
+            fb_field(&f, crc6_of(c.bits, c.n), 6);
+            fb_push(&f, 0);
+            if (f.n & 1u) {
+                fb_push(&f, 0);                  /* fill the last clock */
+            }
+            break;
+        }
+
+        case WF_STREAM_1START:
+        default: {
+            fb_field(&c, cmd, 5);
+            fb_field(&c, len_field, 6);
+            fb_field(&c, data, data_bits);
+
+            fb_push(&f, 1);                      /* start bit, DAP1 only */
+            fb_field(&f, cmd, 5);
+            fb_field(&f, len_field, 6);
+            fb_field(&f, data, data_bits);
+            fb_field(&f, crc6_of(c.bits, c.n), 6);
+            fb_push(&f, 0);
+            if (f.n & 1u) {
+                fb_push(&f, 0);
+            }
+            break;
+        }
+    }
+    return f;
+}
+
+/*
+ * Which framing rule does the device accept, and at which capture taps?
+ *
+ * sync is the probe here for the same reason it is everywhere else: it is
+ * answered from any state and its reply is a known constant, so a right answer
+ * cannot be a coincidence.  Every combination of rule and tap pair is tried,
+ * which is sixty-four frames and takes a few milliseconds.
+ *
+ * Sending the candidates rather than rebuilding the fabric for each is the
+ * whole reason the raw path exists: this loop used to be a twenty-minute
+ * bitstream build per guess.
+ */
+static bool wide_framing_sweep(wide_framing_t *rule, uint8_t *tap1_out,
+                               uint8_t *tap2_out)
+{
+    bool found = false;
+
+    ESP_LOGW(TAG, "  wide framing sweep (sync must answer 0xAAAAAAAA):");
+
+    for (unsigned v = 0; v < WF_COUNT; v++) {
+        const frame_bits_t f = wide_frame((wide_framing_t)v, 0x10u, 63, 0, 0);
+        char line[96];
+        int  n = snprintf(line, sizeof(line), "    %-34s %2u bits:",
+                          wf_name((wide_framing_t)v), f.n);
+
+        for (uint8_t t1 = 0; t1 < 4; t1++) {
+            for (uint8_t t2 = 0; t2 < 4; t2++) {
+                uint32_t reply = 0;
+                uint16_t waited = 0;
+
+                if (dap_phy_fpga_set_skew(t1, t2) != ESP_OK) {
+                    continue;
+                }
+                const esp_err_t err = dap_phy_fpga_raw_frame(f.bits, f.n, 32,
+                                                             &reply, &waited);
+                const bool ok = err == ESP_OK && reply == 0xAAAAAAAAu;
+
+                if (reply == 0xAAAAAAAAu || reply == 0x55555555u) {
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %u%u%c",
+                                  t1, t2, ok ? '!' : '~');
+                }
+                if (ok && !found) {
+                    found     = true;
+                    *rule     = (wide_framing_t)v;
+                    *tap1_out = t1;
+                    *tap2_out = t2;
+                }
+            }
+        }
+        if (n == (int)strlen(line)) {
+            /* nothing interesting printed */
+        }
+        ESP_LOGW(TAG, "%s", line);
+    }
+
+    ESP_LOGW(TAG, "    (tap pairs listed only where the reply looked like "
+                  "sync; ! exact, ~ lines swapped)");
+    return found;
 }
 
 /*
@@ -541,23 +1132,56 @@ static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
             }
 
             /*
-             * sync and nothing before it.
+             * One sync, and nothing before or after it.
              *
-             * An earlier version cleared the error state first, which sends a
-             * real IOINFO read - and a payload command emitted in a framing
-             * the device is not using is not a neutral act: it can leave the
-             * device far enough out of step that the sync after it fails too.
-             * Then every tap pair reads as "no answer" and the sweep says
-             * nothing about the taps at all.  sync is answered from any state,
-             * so it needs no preparation.
+             * Not dap_probe_attach(): that retries and flushes with a burst of
+             * idle clocks between attempts, which is right for getting a link
+             * up and wrong for a sweep - sixteen tap pairs times three
+             * attempts times a flush each is most of a minute spent proving
+             * the same thing sixteen times.
+             *
+             * And nothing before it either.  An earlier version cleared the
+             * error state first, which sends a real IOINFO read, and a payload
+             * command emitted in a framing the device is not using is not a
+             * neutral act: it can leave the device far enough out of step that
+             * the sync after it fails too, and then every cell reads as "no
+             * answer" and the sweep says nothing about the taps at all.  sync
+             * is answered from any state, so it needs no preparation.
              */
-            const bool ok = dap_probe_attach(&x, 3) == ESP_OK &&
+            /*
+             * A gap between frames.
+             *
+             * Wide frames are not free to repeat: this end drives DAP2 through
+             * a 22 ohm series resistor, and any moment the device has not let
+             * go of it yet is two push-pull drivers on one net.  One frame is
+             * survivable and sixteen back to back browned the board out into a
+             * boot loop - the firmware was fine, the rail was not.  Narrowing
+             * the enable to the frame proper removed most of the overlap; this
+             * removes the rest of the reason to care, at a cost of a few
+             * milliseconds across the whole sweep.
+             */
+            vTaskDelay(pdMS_TO_TICKS(5));
+
+            const bool ok = dap_probe_sync(&x) == ESP_OK &&
                             x.reply == 0xAAAAAAAAu;
             const bool aligned = dap_phy_fpga_last_aligned();
 
             n += snprintf(line + n, sizeof(line) - (size_t)n, "  %c%c",
                           ok ? 'D' : (x.reply == 0x55555555u ? 'x' : '.'),
                           aligned ? 'a' : '-');
+
+            /*
+             * Print the value whenever the device answered at all.
+             *
+             * A symbol per cell was enough while nothing replied; now that the
+             * start bit is arriving on both lines the reply itself is the
+             * evidence, and what it is wrong *by* says whether the two lines
+             * are swapped, offset by a bit, or being read at the wrong phase.
+             */
+            if (aligned || x.reply != 0u) {
+                ESP_LOGW(TAG, "      taps %u,%u -> 0x%08" PRIX32 "%s", t1, t2,
+                         x.reply, aligned ? "  (start bit on DAP2)" : "");
+            }
 
             if (ok && !found) {
                 found     = true;
@@ -574,12 +1198,78 @@ static bool wide_calibrate(uint8_t *tap1_out, uint8_t *tap2_out)
 }
 
 /*
+ * How far into the wide-mode sequence to go, from /api/dap_fpga?stage=N.
+ *
+ * Bring-up scaffolding, and it earned itself quickly: the sequence wedged the
+ * board hard enough to need a power cycle, and finding which step did it by
+ * rebuilding and reflashing per guess is a four-minute loop.  A stage limit
+ * makes it one request.  Zero, the default, runs everything.
+ */
+static int s_wide_stage;
+static int s_wide_tap1, s_wide_tap2;
+static int s_wide_trail = -1;   /* -1 leaves TRAIL alone */
+
+void dap_probe_fpga_wide_trail(int trail)
+{
+    s_wide_trail = trail;
+}
+
+void dap_probe_fpga_wide_stage(int stage)
+{
+    s_wide_stage = stage;
+}
+
+void dap_probe_fpga_wide_taps(int tap1, int tap2)
+{
+    s_wide_tap1 = tap1 & 3;
+    s_wide_tap2 = tap2 & 3;
+}
+
+#define WIDE_STAGE(n, revert)                                                 \
+    do {                                                                      \
+        if (s_wide_stage && s_wide_stage <= (n)) {                            \
+            ESP_LOGW(TAG, "  stopping after stage %d as asked", (n));         \
+            if (revert) { wide_revert(); }                                    \
+            return;                                                           \
+        }                                                                     \
+    } while (0)
+
+/*
  * Wide mode end to end: get the part to route the line, tell the device,
  * switch the fabric, find the taps, prove a real transaction, measure it.
  */
 static void wide_route_check(void)
 {
+    /*
+     * Opt-in, and off by default.
+     *
+     * Everything below drives DAP2, and on this bench that reliably takes the
+     * board down after one or two frames - see the note on stage 6.  The
+     * narrow path is solid and fast, the BMP target and the trace drain run on
+     * it, and a route check that leaves the board needing a reset every time
+     * it is run is worse than one that does not test an unfinished feature.
+     * So this only runs when /api/dap_fpga is asked for a stage.
+     */
+    if (s_wide_stage == 0) {
+        ESP_LOGW(TAG, "--- DAP wide mode: skipped (add ?stage=N to run it) ---");
+        return;
+    }
+
     ESP_LOGW(TAG, "--- DAP wide mode ---");
+
+    /*
+     * Trailing clocks, if the caller asked for a different number.
+     *
+     * A candidate explanation for the contention worth one frame to test: the
+     * trailing clocks after a reply are what give the device time to let go of
+     * the line, and the default of one was swept for DAP1 alone.  If DAP2 takes
+     * longer to release, every wide frame this end sends starts while the
+     * device is still driving it.
+     */
+    if (s_wide_trail >= 0) {
+        dap_phy_fpga_set_trail((uint8_t)s_wide_trail);
+        ESP_LOGW(TAG, "  trailing clocks set to %d for this run", s_wide_trail);
+    }
 
     /*
      * OIFM first, for the record rather than as a gate.
@@ -600,6 +1290,15 @@ static void wide_route_check(void)
     }
 
     /*
+     * Before any protocol theory: is the line even connected?
+     *
+     * This needs the device narrow and the bus reachable, which is true here
+     * and stops being true the moment the mode changes, so it goes first.
+     */
+    dap2_wiring_probe();
+    WIDE_STAGE(1, false);
+
+    /*
      * What the lines do with the fabric wide and the device still narrow.
      *
      * Informational, not a gate.  The transmitter drives real data onto DAP2
@@ -609,6 +1308,7 @@ static void wide_route_check(void)
      * the input path at all.
      */
     (void)dap2_line_free();
+    WIDE_STAGE(2, false);
 
     /*
      * Baseline: write the mode the device is already in and read it back.  If
@@ -625,6 +1325,25 @@ static void wide_route_check(void)
              base_ok ? "" : " NO VALID REPLY",
              (unsigned)((now >> DAPISC_MODE_SHIFT) & 3u));
     dap_probe_clear_error_state();
+
+    /*
+     * Take the pin off the application before asking for wide mode.
+     *
+     * Order matters: while the port module drives P21.7 the interface cannot,
+     * so a mode change made first produces a device that is wide and mute.
+     */
+    halt_application();
+
+    if (!p21_7_release(&s_iocr4_saved)) {
+        ESP_LOGE(TAG, "  the target still owns P21.7, so DAP2 cannot be driven "
+                      "from here - two push-pull drivers on one net through a "
+                      "22 ohm resistor is about 150 mA, and enough frames of it "
+                      "brown this board out");
+        wide_revert();
+        return;
+    }
+
+    WIDE_STAGE(3, false);
 
     /*
      * The mode change, as a handshake rather than a fire-and-forget write.
@@ -672,19 +1391,124 @@ static void wide_route_check(void)
              still_narrow ? "still answers - the mux did NOT switch"
                           : "no longer answers", probe.reply);
 
+    WIDE_STAGE(4, true);
+
     if (dap_phy_fpga_set_wide(true) != ESP_OK) {
         ESP_LOGE(TAG, "  the fabric would not switch to wide mode");
         wide_revert();
         return;
     }
 
+    /*
+     * The fabric's own framing first, across all sixteen tap pairs.
+     *
+     * Worth trying before the candidate rules now that the start bit arrives on
+     * both lines: that says the device is transmitting wide and the remaining
+     * question is where in the bit the two lines are sampled, which is exactly
+     * what the taps are.  The candidates only matter if no tap pair works,
+     * because then the frames being sent are not being understood at all.
+     */
+    WIDE_STAGE(5, true);
+
     uint8_t tap1 = 0, tap2 = 0;
-    if (!wide_calibrate(&tap1, &tap2)) {
-        ESP_LOGE(TAG, "  no capture tap pair read sync correctly in wide mode");
-        report_lines("after the sweep:");
+
+    /*
+     * Stage 6: exactly one wide frame.
+     *
+     * Everything up to and including switching the fabric to wide survives;
+     * sixteen wide frames do not.  Whether one does is the difference between
+     * something cumulative - two drivers on the DAP2 net, heating up over a
+     * sweep - and something that is wrong on the very first frame, and those
+     * need opposite fixes.
+     */
+    /*
+     * Stage 6: exactly one wide frame, and nothing else in the request.
+     *
+     * The count matters and is the whole reason this is its own stage.  One
+     * frame is survivable; a request that sent two - a sync and then a raw
+     * window to look at the lines - took the board down as reliably as a sweep
+     * of sixteen did.  A threshold that low is not software: driving DAP2 while
+     * the device is also driving it puts two push-pull outputs across a 22 ohm
+     * series resistor, and the rail does not survive much of that.
+     *
+     * So this sends one frame and reports what came back, and the sweep across
+     * tap pairs is done one HTTP request at a time from the host, which leaves
+     * the device back in narrow mode between attempts.
+     */
+    if (s_wide_stage == 6) {
+        dap_exchange_t one = {0};
+
+        dap_phy_fpga_set_skew((uint8_t)s_wide_tap1, (uint8_t)s_wide_tap2);
+        const esp_err_t e = dap_probe_sync(&one);
+        ESP_LOGW(TAG, "  taps %d,%d: sync %s, reply 0x%08" PRIX32 "%s",
+                 s_wide_tap1, s_wide_tap2, esp_err_to_name(e), one.reply,
+                 one.reply == 0xAAAAAAAAu ? "   <== CORRECT" : "");
         wide_revert();
         return;
     }
+
+    /*
+     * Stage 9: the device wide, this end never driving DAP2.
+     *
+     * This is the configuration worth having even if the other never works.
+     * Everything the throughput is for travels device to probe - a block read
+     * is a short command and a kilobyte of reply - so a link that receives on
+     * two lines and transmits on one would collect the whole benefit while
+     * leaving DAP2 an input at this end, and no amount of turnaround
+     * disagreement can then put two drivers on that net.
+     *
+     * Whether the device will answer a narrow command while its own protocol
+     * engine is wide is the open question, and it is one frame to find out.
+     */
+    if (s_wide_stage == 9) {
+        uint32_t raw = 0;
+        uint16_t waited = 0;
+        char l1[17], l2[17];
+
+        dap_phy_fpga_set_wide(false);      /* transmit narrow */
+        dap_phy_fpga_set_rx_wide(true);    /* sample both lines */
+        dap_phy_fpga_set_skew((uint8_t)s_wide_tap1, (uint8_t)s_wide_tap2);
+
+        dap_phy_fpga_set_raw_window(true);
+        dap_phy_fpga_exchange(0x10u, 63, 0, 0, 32, &raw, &waited);
+        dap_phy_fpga_set_raw_window(false);
+        dap_phy_fpga_set_rx_wide(false);
+
+        for (int i = 0; i < 16; i++) {
+            l1[i] = (raw & (1u << (2 * i)))     ? '1' : '0';
+            l2[i] = (raw & (1u << (2 * i + 1))) ? '1' : '0';
+        }
+        l1[16] = l2[16] = '\0';
+        ESP_LOGW(TAG, "  narrow command, wide device, taps %d,%d:",
+                 s_wide_tap1, s_wide_tap2);
+        ESP_LOGW(TAG, "    DAP1 %s", l1);
+        ESP_LOGW(TAG, "    DAP2 %s", l2);
+        report_lines("after it:");
+
+        wide_revert();
+        return;
+    }
+
+    const bool tap_ok = wide_calibrate(&tap1, &tap2);
+    WIDE_STAGE(7, true);
+
+    if (!tap_ok) {
+        ESP_LOGW(TAG, "  no tap pair worked with the assembled framing; "
+                      "trying the candidate rules");
+        report_lines("after the tap sweep:");
+
+        wide_framing_t rule = WF_PAD_CRC;
+        if (!wide_framing_sweep(&rule, &tap1, &tap2)) {
+            ESP_LOGE(TAG, "  no framing rule and tap pair got sync answered");
+            report_lines("after the framing sweep:");
+            wide_revert();
+            return;
+        }
+        ESP_LOGW(TAG, "  framing \"%s\" is the one the device wants",
+                 wf_name(rule));
+    }
+
+    WIDE_STAGE(8, true);
 
     dap_phy_fpga_set_skew(tap1, tap2);
     ESP_LOGW(TAG, "  taps DAP1 %u, DAP2 %u", tap1, tap2);

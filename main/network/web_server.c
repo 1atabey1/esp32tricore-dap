@@ -2587,6 +2587,39 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
 {
     if (check_auth(req) != ESP_OK) return ESP_OK;
 
+    /* ?stage=N stops the wide-mode sequence after step N - see the note on
+     * dap_probe_fpga_wide_stage().  Absent means run everything. */
+    int stage = 0;
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "stage", val, sizeof(val)) == ESP_OK) {
+            stage = atoi(val);
+        }
+    }
+    dap_probe_fpga_wide_stage(stage);
+
+    /* ?t1=&t2= pick the capture taps stage 6 uses. */
+    {
+        char val[8];
+        int t1 = 0, t2 = 0;
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            if (httpd_query_key_value(query, "t1", val, sizeof(val)) == ESP_OK) {
+                t1 = atoi(val);
+            }
+            if (httpd_query_key_value(query, "t2", val, sizeof(val)) == ESP_OK) {
+                t2 = atoi(val);
+            }
+        }
+        dap_probe_fpga_wide_taps(t1, t2);
+
+        int trail = -1;
+        if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) {
+            trail = atoi(val);
+        }
+        dap_probe_fpga_wide_trail(trail);
+    }
+
     dap_capture_begin();
     const esp_err_t err = dap_probe_fpga_route_check();
     dap_capture_end(req, err == ESP_OK

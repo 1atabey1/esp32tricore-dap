@@ -56,7 +56,23 @@ module tb_dap_frame;
     integer    nbits;
     reg        dap0_d;
 
+    /*
+     * Was DAP2 ever driven during the frame?
+     *
+     * Checking dat2_oe after `done` used to work and now cannot: the enable
+     * covers the frame proper and drops for the lead-in and the trailing zero,
+     * so by the time a frame finishes it is correctly low.  What the test
+     * actually means to assert is that wide mode drives DAP2 at some point and
+     * narrow mode never does, which is what this latch records.
+     */
+    reg saw_oe2;
+
     always @(posedge clk) begin
+        if (start) begin
+            saw_oe2 <= 1'b0;
+        end else if (dat2_oe) begin
+            saw_oe2 <= 1'b1;
+        end
         dap0_d <= dap0;
         if (!rst && dap0 && !dap0_d) begin
             captured[nbits]  <= dap1;
@@ -168,6 +184,7 @@ module tb_dap_frame;
 
         restart;
         dap0_d   = 1'b0;
+        saw_oe2  = 1'b0;
 
         repeat (4) @(posedge clk);
         rst = 1'b0;
@@ -332,13 +349,13 @@ module tb_dap_frame;
         /* DAP2 is an output only while wide mode is asked for.  Narrow mode
          * leaves the pad alone, which is the whole reason the enable is
          * separate from dat_oe. */
-        check_eq("dap2 driven in wide mode", {63'd0, dat2_oe}, 64'd1);
+        check_eq("dap2 driven in wide mode", {63'd0, saw_oe2}, 64'd1);
         wide = 1'b0;
         @(posedge clk) start = 1'b1;
         @(posedge clk) start = 1'b0;
         wait (done);
         @(posedge clk);
-        check_eq("dap2 released in narrow mode", {63'd0, dat2_oe}, 64'd0);
+        check_eq("dap2 released in narrow mode", {63'd0, saw_oe2}, 64'd0);
 
         /*
          * Raw frames: the host supplies the bits and the fabric shifts them.

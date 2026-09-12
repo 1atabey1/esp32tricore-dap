@@ -73,6 +73,7 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_RCRC        0x24
 #define REG_WAIT        0x25
 #define REG_FIFO        0x40
+#define REG_SCAN        0x41    /* 16-bit: every other BANK0 pad's level */
 
 #define CTRL_START_FRAME (1u << 0)
 #define CTRL_START_BLOCK (1u << 1)
@@ -91,6 +92,8 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define FLAG_TRST        (1u << 0)
 #define FLAG_RAW_WINDOW  (1u << 1)
 #define FLAG_WIDE        (1u << 2)
+#define FLAG_RAW_FRAME   (1u << 3)
+#define FLAG_RX_WIDE     (1u << 5)
 
 /*
  * The wide-mode start-bit alignment, in the reply group's spare slot.
@@ -496,6 +499,23 @@ esp_err_t dap_phy_fpga_set_wide(bool enable)
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
 }
 
+/*
+ * Sample both lines without driving DAP2.
+ *
+ * Looking at what DAP2 is doing must not mean driving it.  In two-pin mode
+ * that pin belongs to the target's application, which configures it as a
+ * push-pull output - so a wide transmission from this end puts two drivers on
+ * one net through a 22 ohm series resistor, about 150 mA, and enough frames of
+ * that brown the board out.  This receives wide and transmits narrow, which is
+ * safe against a target that has not handed the pin over yet.
+ */
+esp_err_t dap_phy_fpga_set_rx_wide(bool enable)
+{
+    s_flags = (uint8_t)((s_flags & ~FLAG_RX_WIDE) |
+                        (enable ? FLAG_RX_WIDE : 0u));
+    return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
+}
+
 bool dap_phy_fpga_is_wide(void)
 {
     return (s_flags & FLAG_WIDE) != 0u;
@@ -534,6 +554,63 @@ bool dap_phy_fpga_last_aligned(void)
     return (reg_read8(REG_LINES) & LINES_ALIGNED) != 0u;
 }
 
+/*
+ * Send a frame the caller assembled, bit for bit.
+ *
+ * `bits` is the whole thing - start bit, CMD, LEN, DATA, CRC6, trailing zero -
+ * with the first bit on the wire in bit 0, and `nbits` of them.  In wide mode
+ * consecutive pairs share a clock, bit 0 on DAP1 and bit 1 on DAP2, so a
+ * caller that wants the start bit on both lines puts a one in each of the
+ * first two positions.
+ *
+ * The fabric assembles nothing and checks nothing here: no CRC is generated
+ * and none is expected back unless the caller asks for one.  That is the
+ * point - the wide framing rule is not documented anywhere this project can
+ * reach, so it has to be found by trying candidates, and a candidate that the
+ * fabric would have "corrected" on the way out tests nothing.
+ */
+esp_err_t dap_phy_fpga_raw_frame(uint64_t bits, size_t nbits,
+                                 size_t reply_bits,
+                                 uint32_t *reply, uint16_t *wait_cycles)
+{
+    if (!s_ready || nbits == 0 || nbits > 63) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_flags |= FLAG_RAW_FRAME;
+    const esp_err_t ferr = reg_write8(REG_FLAGS, s_flags);
+
+    /* CMD and LEN are ignored in this mode; DBITS is the frame length. */
+    /* CMD and LEN go out as zero and are ignored; DBITS carries the length. */
+    const esp_err_t err = ferr == ESP_OK
+        ? dap_phy_fpga_exchange(0, 0, bits, nbits, reply_bits,
+                                reply, wait_cycles)
+        : ferr;
+
+    s_flags &= (uint8_t)~FLAG_RAW_FRAME;
+    reg_write8(REG_FLAGS, s_flags);
+    return err;
+}
+
+/*
+ * The level on every BANK0 pad this design does not otherwise use.
+ *
+ * Bit n is the pad named scan[n] in the PCF.  Only useful for chasing where a
+ * target signal actually lands: with the target toggling one of its pins, the
+ * bit that follows names the pad it reaches, and no bit following says no free
+ * pad reaches it.
+ */
+uint16_t dap_phy_fpga_pad_scan(void)
+{
+    uint8_t raw[2] = {0};
+
+    if (!s_ready) {
+        return 0;
+    }
+    reg_read(REG_SCAN, raw, sizeof(raw));
+    return (uint16_t)raw[0] | (uint16_t)((uint16_t)raw[1] << 8);
+}
+
 uint8_t dap_phy_fpga_line_witness(void)
 {
     return s_ready ? reg_read8(REG_LINES) : 0u;
@@ -546,9 +623,19 @@ uint8_t dap_phy_fpga_line_witness(void)
 /* ------------------------------------------------------------------------ */
 
 /* Poll STATUS until the sequencer reports done, or give up. */
+/*
+ * How long to spin before yielding, in microseconds.
+ *
+ * Every frame that is going to work finishes far inside this - a 1 kB block is
+ * about 2 ms at the slowest divider and a single frame is microseconds - so the
+ * fast path never gets here and never pays for a context switch.
+ */
+#define SPIN_BEFORE_YIELD_US  3000
+
 static esp_err_t wait_done(uint8_t *status_out)
 {
-    const int64_t deadline = esp_timer_get_time() + OP_TIMEOUT_MS * 1000;
+    const int64_t start    = esp_timer_get_time();
+    const int64_t deadline = start + OP_TIMEOUT_MS * 1000;
 
     for (;;) {
         const uint8_t st = reg_read8(REG_STATUS);
@@ -556,10 +643,26 @@ static esp_err_t wait_done(uint8_t *status_out)
             *status_out = st;
             return ESP_OK;
         }
-        if (esp_timer_get_time() >= deadline) {
+        const int64_t now = esp_timer_get_time();
+        if (now >= deadline) {
             *status_out = st;
             ESP_LOGE(TAG, "the fabric never reported done (status 0x%02X)", st);
             return ESP_ERR_TIMEOUT;
+        }
+
+        /*
+         * Yield once the frame is clearly not coming back.
+         *
+         * This loop used to spin flat out for the whole timeout, which is
+         * invisible while frames are answered and catastrophic when they are
+         * not: a sweep that sends eighty frames to a target that has stopped
+         * listening holds the CPU for twenty seconds without yielding, and the
+         * web server, WiFi and console all starve behind it.  That is how a
+         * wide-mode experiment turned into a board that had to be power-cycled
+         * - the firmware was fine, it simply never got scheduled.
+         */
+        if (now - start > SPIN_BEFORE_YIELD_US) {
+            vTaskDelay(1);
         }
     }
 }

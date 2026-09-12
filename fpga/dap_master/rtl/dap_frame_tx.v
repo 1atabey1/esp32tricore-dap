@@ -94,6 +94,18 @@ module dap_frame_tx #(
     /* DAP2 carries the odd bits, and is driven only in wide mode - a line the
      * design has no use for is better left an input than held at a level. */
     output reg                   dap2,
+    /*
+     * Held steady for the whole frame, not decoded from the state.
+     *
+     * Narrowing this to the frame proper - start bit through CRC, excluding the
+     * lead-in and the trailing zero - looked like an improvement and measurably
+     * was not: it turns the pad enable into a combinational function of the
+     * state, so it toggles at every field boundary, and on hardware that went
+     * from "one wide frame is survivable" to "every wide frame takes the board
+     * down".  A pad enable that switches repeatedly against a line someone else
+     * may be driving is worse than one that is asserted once and released once,
+     * even though it is asserted for fewer clocks in total.
+     */
     output reg                   dat2_oe
 );
     localparam [3:0] S_IDLE  = 4'd0,
@@ -130,6 +142,7 @@ module dap_frame_tx #(
     reg [62:0] data_r;
     reg        wide_r;
     reg        raw_r;
+
 
     /*
      * Field lengths are counted in clock periods, not bits, so wide mode

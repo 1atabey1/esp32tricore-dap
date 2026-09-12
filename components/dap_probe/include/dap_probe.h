@@ -185,6 +185,18 @@ esp_err_t dap_probe_spi_bringup(void);
 esp_err_t dap_probe_fpga_route_check(void);
 
 /*
+ * How far into the wide-mode sequence the route check should go, for bisecting
+ * a step that wedges the target.  Zero, the default, runs all of it.
+ */
+void dap_probe_fpga_wide_stage(int stage);
+
+/* Which capture taps stage 6 should use, one pair per request. */
+void dap_probe_fpga_wide_taps(int tap1, int tap2);
+
+/* Trailing clocks to use for a wide run; negative leaves the setting alone. */
+void dap_probe_fpga_wide_trail(int trail);
+
+/*
  * Sweep the attach variables that are cheap to vary in software - bit rate,
  * how many idle clocks precede the first frame, whether TRST is pulsed, and
  * which LEN the sync frame carries - and report every combination that draws a

@@ -24,7 +24,8 @@
  *   0x0A PARCELS  rw  block read: parcels minus one, so 0xFF is 256
  *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt),
  *                     2 wide mode (DAP1 even bits, DAP2 odd),
- *                     3 raw frame (DATA is the whole frame, DBITS its length)
+ *                     3 raw frame (DATA is the whole frame, DBITS its length),
+ *                     5 receive wide without driving DAP2
  *   0x0C LEAD     rw  idle clocks before each frame
  *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
  *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
@@ -37,6 +38,8 @@
  *                     3/4 DAP2 seen low/high while the target had the lines,
  *                     5/6 DAP1 seen low/high while the target had the lines
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
+ *   0x41 SCAN     ro  16-bit, low byte first: the level on every other BANK0
+ *                     pad, for finding which one a target signal reaches
  *
  * Everything the device turned out to be fussy about is a register rather than
  * a constant - DIV, TRAIL, MAXWAIT - because every one of those was settled on
@@ -64,7 +67,10 @@ module dap_top #(
     output reg  trst,
     /* Bidirectional in wide mode and an input otherwise: a line the design is
      * not using is better left undriven than held at a level. */
-    inout  wire dap2
+    inout  wire dap2,
+
+    /* Every other BANK0 pad, as inputs - see the note in the board top. */
+    input  wire [15:0] scan
 );
     /* ------------------------------------------------------------------ */
     /* Registers                                                           */
@@ -94,6 +100,22 @@ module dap_top #(
      */
     reg        r_raw     = 1'b0;
     /*
+     * FLAGS bit 5: sample both lines, drive only DAP1.
+     *
+     * Looking at what DAP2 is doing must not mean driving it.  While the
+     * target has that pin configured as a push-pull output - which it does, by
+     * default, because in two-pin mode DAP2 is an ordinary port pin the
+     * application owns - a wide transmission from this end puts two drivers on
+     * one net through a 22 ohm series resistor.  That is about 150 mA, and
+     * sixty-four frames of it browned the board out into a boot loop.
+     *
+     * With this bit the receiver deinterleaves both lines and the transmitter
+     * stays narrow, so DAP2 is only ever read.  It is what the wiring probe
+     * uses, and it is safe against a target that has not yet handed the pin
+     * over.
+     */
+    reg        r_rx_wide = 1'b0;
+    /*
      * Per-line capture tap, in fabric clocks back from the sample instant.
      *
      * Wide mode needs this and narrow mode does not: the silicon does not
@@ -115,6 +137,10 @@ module dap_top #(
     reg        s_done, s_timed_out, s_idle_high, s_crc_ok, s_overrun;
     /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
     reg        s_aligned;
+    /* The scan pads, through two stages like every other asynchronous input.
+     * They feed nothing but a register read, so the second stage is where they
+     * stop. */
+    reg [15:0] scan_meta, scan_sync;
 
     /*
      * Sticky witnesses: what levels each data line was seen at, split by who
@@ -356,6 +382,8 @@ module dap_top #(
          * delay narrow mode was tuned against.  Taps 1 to 3 walk the sample
          * one clock later each.
          */
+        scan_meta <= scan;
+        scan_sync <= scan_meta;
         dap1_tap  <= dap1_sync[r_skew1];
         dap2_tap  <= dap2_sync[r_skew2];
     end
@@ -383,7 +411,7 @@ module dap_top #(
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
-        .wide (r_wide),
+        .wide (r_wide | r_rx_wide),
         .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
@@ -577,6 +605,7 @@ module dap_top #(
             r_no_hunt <= 1'b0;         /* ordinary hunting is the operating mode */
             r_wide    <= 1'b0;         /* narrow until the host has run DAPISC */
             r_raw     <= 1'b0;
+            r_rx_wide <= 1'b0;
             r_skew1   <= 2'd0;
             r_skew2   <= 2'd0;
         end else begin
@@ -602,6 +631,7 @@ module dap_top #(
                         r_no_hunt <=  reg_wdata[1];
                         r_wide    <=  reg_wdata[2];
                         r_raw     <=  reg_wdata[3];
+                        r_rx_wide <=  reg_wdata[5];
                     end
                     7'h0F: begin
                         r_skew1 <= reg_wdata[1:0];
@@ -651,7 +681,7 @@ module dap_top #(
             q_rep    <= rd_rep;
             q_fifo   <= rd_fifo;
             q_grp    <= reg_addr[6:4];
-            q_port   <= (reg_addr == 7'h40);
+            q_port   <= (reg_addr[6:4] == 3'h4);
 
             /* Second stage: pick the control half, and carry everything else
              * along so the four groups still arrive together. */
@@ -702,7 +732,8 @@ module dap_top #(
             3'h0: rd_ctrl_hi = r_maxwait[7:0];         /* 0x08 */
             3'h1: rd_ctrl_hi = r_maxwait[15:8];
             3'h2: rd_ctrl_hi = r_parcels;
-            3'h3: rd_ctrl_hi = {4'd0, r_raw, r_wide, r_no_hunt, ~trst};
+            3'h3: rd_ctrl_hi = {2'd0, r_rx_wide, 1'b0,
+                                r_raw, r_wide, r_no_hunt, ~trst};
             3'h4: rd_ctrl_hi = {2'd0, r_lead};
             3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
             /*
@@ -757,7 +788,22 @@ module dap_top #(
         endcase
     end
 
-    wire [7:0] rd_fifo = fifo_empty ? 8'h00 : fifo_head;
+    /*
+     * The FIFO port, and the scan word beside it.
+     *
+     * This group is the right home for something read rarely: its mux is two
+     * entries wide, where the control group's is sixteen and putting anything
+     * extra there has cost this design several megahertz more than once.
+     */
+    reg [7:0] rd_fifo;
+
+    always @(*) begin
+        case (reg_addr[1:0])
+            2'd1:    rd_fifo = scan_sync[7:0];
+            2'd2:    rd_fifo = scan_sync[15:8];
+            default: rd_fifo = fifo_empty ? 8'h00 : fifo_head;
+        endcase
+    end
 endmodule
 
 `default_nettype wire
