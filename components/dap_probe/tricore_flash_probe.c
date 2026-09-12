@@ -61,7 +61,6 @@ static const char *TAG = "FLASH_PROBE";
  * the width live in dap_probe.c rather than a header, so they are repeated here
  * rather than widening that file's interface for one diagnostic.
  */
-#define IO_CONF             0x0u
 #define IOCONF_BITS         12u
 #define IOCONF_MODE_RW      (1u << 0)
 #define IOCONF_SVM          (1u << 7)
@@ -181,7 +180,7 @@ esp_err_t tricore_flash_probe_width(void)
     for (unsigned bit = 1; bit <= 6; bit++) {
         const uint16_t conf = IOCONF_MODE_RW | IOCONF_SVM | (uint16_t)(1u << bit);
 
-        if (dap_probe_client_write(IO_CONF, 4, conf, IOCONF_BITS, &x) != ESP_OK) {
+        if (dap_probe_client_write(DAP_IO_CONF, 4, conf, IOCONF_BITS, &x) != ESP_OK) {
             ESP_LOGW(TAG, "  IOCONF 0x%03X: not acknowledged", conf);
             continue;
         }

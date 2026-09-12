@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "dap_phy_fpga.h"
+#include "dap_frame.h"
 #include "dap_probe.h"
 #include "esp_log.h"
 #include <inttypes.h>
@@ -214,6 +215,7 @@ static const uint8_t LOADER_BLOB[] = {
  * halt" with nothing else wrong, and cost a round of debugging to notice.
  */
 #define HALT_LINE 1
+
 
 static bool s_installed;
 
@@ -686,6 +688,114 @@ static esp_err_t install_loader(void)
         tricore_halt_diag(0, "flash loader install");
         set_phase(TRICORE_FLASH_FAILED, "CPU0 would not halt");
         return ESP_FAIL;
+    }
+
+    /*
+     * A small block write first, on its own, before the blob.
+     *
+     * Eight words to the buffer the stub would use anyway, read back through
+     * the word path that is known to work.  The whole-blob write is 302 bytes
+     * across several frames and its failure says only "nothing arrived"; this
+     * says whether a single well-formed block write lands at all, and IOINFO
+     * says whether the device refused it or never understood it - BUS_WR_ERR
+     * means the command was decoded and the bus write failed, no error at all
+     * means it was never treated as a write.
+     */
+    if (s_use_blockwrite && dap_phy_fpga_ready()) {
+        static const uint32_t pattern[8] = {
+            0x0BADC0DEu, 0x11111111u, 0x22222222u, 0x33333333u,
+            0x44444444u, 0x55555555u, 0x66666666u, 0xA5A5A5A5u,
+        };
+        uint32_t back[8] = {0};
+        bool all_ok = true;
+
+        /* A marker underneath, so "parcel 0 arrived as zero" and "parcel 0
+         * never arrived" are different readings rather than the same one. */
+        for (int i = 0; i < 8; i++) {
+            dap_probe_write32(LOADER_BUFFER + 4u * i, 0xDEADBEEFu);
+        }
+
+        dap_probe_clear_error_state();
+        const esp_err_t bw = dap_phy_fpga_block_write(LOADER_BUFFER, pattern, 8);
+
+        for (int i = 0; i < 8; i++) {
+            if (dap_probe_read32(LOADER_BUFFER + 4u * i, &back[i]) != ESP_OK ||
+                back[i] != pattern[i]) {
+                all_ok = false;
+            }
+        }
+        ESP_LOGW(TAG, "block write probe: %s, %s", esp_err_to_name(bw),
+                 all_ok ? "all eight words landed" : "readback differs");
+        ESP_LOGW(TAG, "  wrote %08" PRIX32 " %08" PRIX32 " %08" PRIX32
+                      " ... read %08" PRIX32 " %08" PRIX32 " %08" PRIX32,
+                 pattern[0], pattern[1], pattern[2], back[0], back[1], back[2]);
+
+        /* What the device thought of it.  BUS_WR_ERR means the command was
+         * decoded and the bus write failed; no error at all means it was never
+         * treated as a write. */
+        dap_exchange_t info = {0};
+        if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
+            ESP_LOGW(TAG, "  IOINFO after the block write:");
+            dap_probe_log_ioinfo((uint16_t)info.reply);
+        }
+
+        /*
+         * The same eight words again, without the address field.
+         *
+         * A word write first, to leave IOADDR pointing where the device's own
+         * post-increment would put it, then the short form so the device uses
+         * that rather than one this end encoded.  If the words land this way
+         * and not the other, the optional address field is what is wrong; if
+         * neither lands, it is not the address at all.
+         */
+        uint32_t shorts[4] = {0};
+        for (int i = 0; i < 4; i++) {
+            dap_probe_write32(LOADER_BUFFER + 0x40u + 4u * i, 0u);
+        }
+        dap_probe_write32(LOADER_BUFFER + 0x40u, 0u);
+        dap_phy_fpga_block_write_no_address(true);
+        const esp_err_t bw2 = dap_phy_fpga_block_write(0, pattern, 8);
+        dap_phy_fpga_block_write_no_address(false);
+        for (int i = 0; i < 4; i++) {
+            dap_probe_read32(LOADER_BUFFER + 0x40u + 4u * i, &shorts[i]);
+        }
+        ESP_LOGW(TAG, "  short form (no address): %s -> 0x%08" PRIX32
+                      " 0x%08" PRIX32, esp_err_to_name(bw2), shorts[0],
+                 shorts[1]);
+
+        /* A word-path write of the same pattern, as the control: if this also
+         * fails the problem is not the block write at all. */
+        uint32_t control = 0;
+        if (!all_ok) {
+            for (int i = 0; i < 8; i++) {
+                dap_probe_write32(LOADER_BUFFER + 4u * i, pattern[i]);
+            }
+            dap_probe_read32(LOADER_BUFFER, &control);
+            ESP_LOGW(TAG, "  control, word writes: 0x%08" PRIX32 " (want 0x%08"
+                          PRIX32 ")", control, pattern[0]);
+
+            /*
+             * Report it where it can be read without the console.
+             *
+             * This is the minimal repro - eight words, one frame - so stopping
+             * here says more than letting the 302-byte blob fail afterwards
+             * with nothing but "it did not arrive".
+             */
+            char why[200];
+            snprintf(why, sizeof(why),
+                     "bw probe: %s read 0x%08" PRIX32 " want 0x%08" PRIX32
+                     ", long %08" PRIX32 " %08" PRIX32 " %08" PRIX32
+                     ", short %08" PRIX32 " %08" PRIX32 " %08" PRIX32
+                     ", ack 0x%02X w%u lvl %u",
+                     esp_err_to_name(bw), back[0], pattern[0],
+                     back[0], back[1], back[2],
+                     shorts[0], shorts[1], shorts[2],
+                     dap_phy_fpga_last_bw_status(),
+                     (unsigned)dap_phy_fpga_last_bw_wait(),
+                     (unsigned)dap_phy_fpga_last_bw_level());
+            set_phase(TRICORE_FLASH_FAILED, why);
+            return ESP_FAIL;
+        }
     }
 
     /* The blob is not a multiple of four, so it is padded to a word; the stub

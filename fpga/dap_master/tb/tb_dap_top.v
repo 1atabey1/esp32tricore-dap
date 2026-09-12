@@ -525,10 +525,24 @@ module tb_dap_top;
         rd(7'h43, scratch);
         check("write fifo took 12 bytes", {24'd0, scratch}, 32'd12);
 
+        /*
+         * The host's order, not a convenient one.
+         *
+         * dap_phy_fpga_block_write() fills the FIFO, then writes DATA, then
+         * CMD/LEN/DBITS/RBITS as one burst, then PARCELS, then starts.  This
+         * test used to skip DATA entirely and set PARCELS first, which is the
+         * one sequence the firmware never issues.
+         */
+        burst[0] = 8'h00; burst[1] = 8'h00; burst[2] = 8'h00; burst[3] = 8'h40;
+        burst[4] = 8'h00; burst[5] = 8'h00; burst[6] = 8'h00; burst[7] = 8'h00;
+        wr_burst(7'h10, 8);                    /* DATA, the command payload */
+
+        burst[0] = 8'h09;                      /* CMD: client_blockwrite */
+        burst[1] = 8'd40;                      /* LEN */
+        burst[2] = 8'd40;                      /* DBITS */
+        burst[3] = 8'd0;                       /* RBITS: a bare acknowledge */
+        wr_burst(7'h03, 4);
         wr(7'h0A, 8'd2);                       /* PARCELS: three words */
-        wr(7'h03, 8'h09);                      /* CMD: client_blockwrite */
-        wr(7'h04, 8'd40);                      /* LEN */
-        wr(7'h05, 8'd40);                      /* DBITS */
         capture_parcels = 1'b1;
         parcels_seen = 0;
 

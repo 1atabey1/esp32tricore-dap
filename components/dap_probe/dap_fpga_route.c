@@ -42,8 +42,6 @@ static const char *TAG = "DAP_FPGA_RT";
  * live in dap_probe.c rather than a header; repeated here rather than widening
  * that file's interface for one diagnostic.
  */
-#define IO_CLIENT_ID      0xFu
-#define CLIENT_ID_EXPECT  0x0260u
 
 /*
  * Clocks issued after a reply, with the target still driving.
@@ -78,14 +76,14 @@ static bool try_trail(uint8_t trail, uint16_t *id_out)
      */
     const esp_err_t set_err = dap_probe_client_set(1, &x);
     const int       set_wait = x.wait_cycles;
-    const esp_err_t err = dap_probe_client_read(IO_CLIENT_ID, 4, 16, &x);
+    const esp_err_t err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
 
     ESP_LOGW(TAG, "    client_set %s (wait %d), client_read %s (wait %d)",
              esp_err_to_name(set_err), set_wait, esp_err_to_name(err),
              x.wait_cycles);
 
     *id_out = (uint16_t)x.reply;
-    return (err == ESP_OK) && (x.reply == CLIENT_ID_EXPECT);
+    return (err == ESP_OK) && (x.reply == DAP_CLIENT_ID_EXPECT);
 }
 
 /*
@@ -341,8 +339,8 @@ esp_err_t dap_phy_fpga_attach(void)
         if (dap_probe_client_set(1, &x) != ESP_OK) {
             continue;
         }
-        id_err = dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id);
-        if (id_err == ESP_OK && id.reply == CLIENT_ID_EXPECT) {
+        id_err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &id);
+        if (id_err == ESP_OK && id.reply == DAP_CLIENT_ID_EXPECT) {
             ESP_LOGI(TAG, "attached through the fabric: CLIENT_ID 0x%04X on "
                           "attempt %d", (unsigned)id.reply, attempt + 1);
             return ESP_OK;
@@ -352,7 +350,7 @@ esp_err_t dap_phy_fpga_attach(void)
     }
 
     ESP_LOGE(TAG, "CLIENT_ID came back 0x%04X, not 0x%04X",
-             (unsigned)id.reply, CLIENT_ID_EXPECT);
+             (unsigned)id.reply, DAP_CLIENT_ID_EXPECT);
     return ESP_FAIL;
 }
 
@@ -1777,10 +1775,10 @@ static void wide_route_check(void)
     ESP_LOGW(TAG, "  wide attach: client_set %s", esp_err_to_name(s_err));
 
     const esp_err_t r_err = (s_err == ESP_OK)
-        ? dap_probe_client_read(IO_CLIENT_ID, 4, 16, &id) : ESP_FAIL;
+        ? dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &id) : ESP_FAIL;
     ESP_LOGW(TAG, "  wide attach: client_read %s -> 0x%04X (want 0x%04X)",
              esp_err_to_name(r_err), (unsigned)id.reply,
-             (unsigned)CLIENT_ID_EXPECT);
+             (unsigned)DAP_CLIENT_ID_EXPECT);
 
     /*
      * A failed re-attach is not the end of the run.
@@ -1791,7 +1789,7 @@ static void wide_route_check(void)
      * the whole exercise is here to answer.  Aborting on client_set meant the
      * throughput sweep below had never once been reached.
      */
-    const bool attached = (r_err == ESP_OK && id.reply == CLIENT_ID_EXPECT);
+    const bool attached = (r_err == ESP_OK && id.reply == DAP_CLIENT_ID_EXPECT);
 
     if (!attached) {
         ESP_LOGW(TAG, "  wide re-attach did not take; going on to the bus "
