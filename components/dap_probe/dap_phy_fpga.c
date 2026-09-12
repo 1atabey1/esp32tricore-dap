@@ -904,7 +904,9 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
 static bool     s_bw_no_address;
 
 static uint64_t s_bw_data;
+static unsigned s_bw_pad_words;
 static uint16_t s_bw_level;
+static uint16_t s_bw_level_after;
 static uint8_t  s_bw_status;
 static uint16_t s_bw_wait;
 
@@ -945,6 +947,22 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
             *out++ = (uint8_t)(value >> 24);
         }
         if (reg_write(REG_WFIFO, s_buf, n * 4) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+
+    /*
+     * Surplus words, for counting what the data phase really consumes.
+     *
+     * With more in the FIFO than the parcels need, the level afterwards is
+     * pushed minus consumed, and consumed is the only number in question: two
+     * parcels that take eight bytes leave a different remainder from two
+     * parcels that take eight while a third word is quietly popped before the
+     * data phase begins.  Without the surplus both stories end at zero.
+     */
+    for (unsigned e = 0; e < s_bw_pad_words; e++) {
+        static const uint8_t filler[4] = { 0xA5u, 0x5Au, 0xA5u, 0x5Au };
+        if (reg_write(REG_WFIFO, filler, sizeof(filler)) != ESP_OK) {
             return ESP_FAIL;
         }
     }
@@ -1017,6 +1035,21 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
     }
 
     /*
+     * And the level once it is over.
+     *
+     * Pushed minus consumed.  A state machine that pops one word before the
+     * data phase starts would take four bytes more than the parcels account
+     * for, so this is what separates "the FIFO gave up exactly what the
+     * parcels needed" from "something ate a word on the way in".
+     */
+    {
+        uint8_t lo = 0, hi = 0;
+        reg_read(REG_WLEVEL, &lo, 1);
+        reg_read(REG_WLEVEL + 1, &hi, 1);
+        s_bw_level_after = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    }
+
+    /*
      * Keep what the fabric said about the last acknowledge.
      *
      * A block write is acknowledged with a bare start bit and nothing else, so
@@ -1051,6 +1084,16 @@ void dap_phy_fpga_block_write_no_address(bool enable)
 uint64_t dap_phy_fpga_last_bw_data(void)
 {
     return s_bw_data;
+}
+
+void dap_phy_fpga_block_write_pad(unsigned words)
+{
+    s_bw_pad_words = words;
+}
+
+uint16_t dap_phy_fpga_last_bw_level_after(void)
+{
+    return s_bw_level_after;
 }
 
 uint16_t dap_phy_fpga_last_bw_level(void)

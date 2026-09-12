@@ -833,6 +833,29 @@ static esp_err_t install_loader(void)
          * 0xDEADBEEF marker - a different value, or an error, says the address
          * never landed where this end thinks it did.
          */
+        /*
+         * Two parcels with four spare words behind them.
+         *
+         * 24 bytes should be left of 24 pushed beyond the two the parcels
+         * take; 20 would mean a third word came out of the FIFO without ever
+         * reaching the wire.
+         */
+        unsigned pad_left = 0;
+        {
+            const uint32_t at = LOADER_BUFFER + 0x180u;
+            dap_phy_fpga_block_write_pad(4);
+            dap_phy_fpga_block_write(at, pattern, 2);
+            dap_phy_fpga_block_write_pad(0);
+            pad_left = dap_phy_fpga_last_bw_level_after();
+            ESP_LOGW(TAG, "  two parcels, four spare words: %u bytes left of "
+                          "16 surplus", pad_left);
+        }
+
+        const uint32_t two_asm = (uint32_t)dap_phy_fpga_last_bw_data();
+        const unsigned two_lvl = dap_phy_fpga_last_bw_level_after();
+        ESP_LOGW(TAG, "  after two words: DATA 0x%08" PRIX32 " (want 0x%08X),"
+                      " FIFO %u left of 8", two_asm, 0x22222223u, two_lvl);
+
         dap_exchange_t tail = {0};
         const esp_err_t te = dap_probe_client_read(DAP_IO_READ_WORD, 5, 32,
                                                    &tail);
@@ -886,9 +909,10 @@ static esp_err_t install_loader(void)
             char why[256];
             snprintf(why, sizeof(why),
                      "bw probe: %s, 8w %08" PRIX32 " %08" PRIX32
-                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", tail %08" PRIX32 ", divs:%s",
+                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", 2asm %08" PRIX32 " left %u pad %u, tail %08" PRIX32 ", divs:%s",
                      esp_err_to_name(bw), back[0], back[1],
-                     one_back, (uint32_t)assembled, ioaddr_tail, line);
+                     one_back, (uint32_t)assembled, two_asm, two_lvl, pad_left,
+                     ioaddr_tail, line);
             set_phase(TRICORE_FLASH_FAILED, why);
             return ESP_FAIL;
         }

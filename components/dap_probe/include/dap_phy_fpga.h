@@ -169,6 +169,12 @@ void      dap_phy_fpga_block_write_no_address(bool enable);
 
 /* Bytes the write FIFO held just before the last block write started. */
 uint16_t  dap_phy_fpga_last_bw_level(void);
+/* Push this many extra words into the write FIFO beyond the parcels the next
+ * block write will send, so the level afterwards counts what it consumed. */
+void      dap_phy_fpga_block_write_pad(unsigned words);
+
+/* ... and once the transfer has finished. */
+uint16_t  dap_phy_fpga_last_bw_level_after(void);
 
 /* DATA as the fabric left it after the last block write, which for a one-word
  * transfer is the parcel it assembled: start bit in bit 0, word above it. */
