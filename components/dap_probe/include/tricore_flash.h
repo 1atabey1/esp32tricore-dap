@@ -61,6 +61,9 @@ typedef struct {
     uint32_t sectors;
     uint32_t sectors_done;
     uint32_t elapsed_ms;
+    /* DMU_HF_ERRSR as it read when something went wrong, which names which of
+     * OPER/SQER/PROER/PVER/EVER the flash refused on. */
+    uint32_t errsr;
     bool     verified;
     char     message[128];
 } tricore_flash_status_t;
@@ -76,6 +79,13 @@ typedef struct {
  */
 esp_err_t tricore_flash_write(const tricore_flash_region_t *regions,
                               size_t count);
+
+/*
+ * Whether bulk transfers use client_blockwrite.  Off forces the word-at-a-time
+ * path, which is correct and far slower - useful for telling a fabric problem
+ * from everything else in one request.
+ */
+void tricore_flash_set_blockwrite(bool enable);
 
 /* A snapshot of what the flash task is doing, for progress reporting. */
 void tricore_flash_get_status(tricore_flash_status_t *out);

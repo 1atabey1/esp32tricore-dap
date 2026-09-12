@@ -338,6 +338,16 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* ?slow=1 forces the word-at-a-time path, to tell a fabric problem from
+     * everything else without a rebuild. */
+    char query[32], val[8];
+    bool fast = true;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "slow", val, sizeof(val)) == ESP_OK) {
+        fast = (atoi(val) == 0);
+    }
+    tricore_flash_set_blockwrite(fast);
+
     /*
      * Its own task, at a low priority.  The flash takes seconds and the web
      * server runs every request from one task, so doing it here would block the
@@ -379,10 +389,11 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
     const int n = snprintf(line, sizeof(line),
         "phase=%s running=%d total=%" PRIu32 " done=%" PRIu32
         " sectors=%" PRIu32 " sectors_done=%" PRIu32 " ms=%" PRIu32
-        " verified=%d image_bytes=%" PRIu32 " message=%s\n",
+        " verified=%d errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
+        " message=%s\n",
         phase_name(st.phase), s_flash_task ? 1 : 0, st.total_bytes,
         st.done_bytes, st.sectors, st.sectors_done, st.elapsed_ms,
-        st.verified ? 1 : 0, s_image.bytes, st.message);
+        st.verified ? 1 : 0, st.errsr, s_image.bytes, st.message);
 
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
