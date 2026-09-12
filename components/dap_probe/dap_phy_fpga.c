@@ -903,6 +903,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
  */
 static bool     s_bw_no_address;
 
+static uint64_t s_bw_data;
 static uint16_t s_bw_level;
 static uint8_t  s_bw_status;
 static uint16_t s_bw_wait;
@@ -998,6 +999,24 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
     const esp_err_t err = wait_done(&status);
 
     /*
+     * What the fabric assembled into DATA for the last parcel it sent.
+     *
+     * DATA is readable, and the parcel is built in it a byte at a time, so
+     * after a one-word block write this is literally the bits that went on the
+     * wire: the start bit in bit 0 and the word above it.  It separates "the
+     * assembly produced zero" from "the assembly was right and the wire lost
+     * it", which is the one fork the testbench cannot settle because it passes.
+     */
+    {
+        uint8_t raw[8] = {0};
+        reg_read(REG_DATA, raw, sizeof(raw));
+        s_bw_data = 0;
+        for (int i = 7; i >= 0; i--) {
+            s_bw_data = (s_bw_data << 8) | raw[i];
+        }
+    }
+
+    /*
      * Keep what the fabric said about the last acknowledge.
      *
      * A block write is acknowledged with a bare start bit and nothing else, so
@@ -1027,6 +1046,11 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
 void dap_phy_fpga_block_write_no_address(bool enable)
 {
     s_bw_no_address = enable;
+}
+
+uint64_t dap_phy_fpga_last_bw_data(void)
+{
+    return s_bw_data;
 }
 
 uint16_t dap_phy_fpga_last_bw_level(void)

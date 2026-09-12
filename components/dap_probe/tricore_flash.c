@@ -740,6 +740,46 @@ static esp_err_t install_loader(void)
         }
 
         /*
+         * One word on its own, and what the fabric assembled for it.
+         *
+         * With a single parcel, DATA still holds that parcel when the transfer
+         * ends, so reading it back says whether the zero was assembled or
+         * happened on the wire.  0x0BADC0DE should read as the word shifted up
+         * by one with the start bit under it: 0x175B81BD.
+         */
+        uint32_t one_back = 0xDEADBEEFu;
+        dap_probe_write32(LOADER_BUFFER + 0x80u, 0xDEADBEEFu);
+        const esp_err_t bw1 =
+            dap_phy_fpga_block_write(LOADER_BUFFER + 0x80u, pattern, 1);
+        const uint64_t assembled = dap_phy_fpga_last_bw_data();
+        dap_probe_read32(LOADER_BUFFER + 0x80u, &one_back);
+        ESP_LOGW(TAG, "  one-word block write: %s, landed 0x%08" PRIX32
+                      ", DATA assembled 0x%08" PRIX32 "%08" PRIX32,
+                 esp_err_to_name(bw1), one_back,
+                 (uint32_t)(assembled >> 32), (uint32_t)assembled);
+
+        /*
+         * Two words, on a freshly marked address.
+         *
+         * One word landed nothing while eight left a zero in the first slot,
+         * and those cannot both be "parcel 0 is dropped".  Two says which:
+         * if the marker survives at +0 and pattern[1] appears at +4, parcel 0
+         * is never written and the others land at their own index.
+         */
+        uint32_t two[3] = {0};
+        for (int i = 0; i < 3; i++) {
+            dap_probe_write32(LOADER_BUFFER + 0xC0u + 4u * i, 0xDEADBEEFu);
+        }
+        const esp_err_t bw3 =
+            dap_phy_fpga_block_write(LOADER_BUFFER + 0xC0u, pattern, 2);
+        for (int i = 0; i < 3; i++) {
+            dap_probe_read32(LOADER_BUFFER + 0xC0u + 4u * i, &two[i]);
+        }
+        ESP_LOGW(TAG, "  two-word block write: %s -> %08" PRIX32 " %08" PRIX32
+                      " %08" PRIX32, esp_err_to_name(bw3), two[0], two[1],
+                 two[2]);
+
+        /*
          * The same eight words again, without the address field.
          *
          * A word write first, to leave IOADDR pointing where the device's own
@@ -781,15 +821,17 @@ static esp_err_t install_loader(void)
              * here says more than letting the 302-byte blob fail afterwards
              * with nothing but "it did not arrive".
              */
-            char why[200];
+            char why[256];
             snprintf(why, sizeof(why),
                      "bw probe: %s read 0x%08" PRIX32 " want 0x%08" PRIX32
                      ", long %08" PRIX32 " %08" PRIX32 " %08" PRIX32
                      ", short %08" PRIX32 " %08" PRIX32 " %08" PRIX32
+                     ", one %08" PRIX32 " asm %08" PRIX32 ", two %08" PRIX32 " %08" PRIX32
                      ", ack 0x%02X w%u lvl %u",
                      esp_err_to_name(bw), back[0], pattern[0],
                      back[0], back[1], back[2],
                      shorts[0], shorts[1], shorts[2],
+                     one_back, (uint32_t)assembled, two[0], two[1],
                      dap_phy_fpga_last_bw_status(),
                      (unsigned)dap_phy_fpga_last_bw_wait(),
                      (unsigned)dap_phy_fpga_last_bw_level());

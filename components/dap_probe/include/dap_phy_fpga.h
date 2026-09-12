@@ -170,6 +170,10 @@ void      dap_phy_fpga_block_write_no_address(bool enable);
 /* Bytes the write FIFO held just before the last block write started. */
 uint16_t  dap_phy_fpga_last_bw_level(void);
 
+/* DATA as the fabric left it after the last block write, which for a one-word
+ * transfer is the parcel it assembled: start bit in bit 0, word above it. */
+uint64_t  dap_phy_fpga_last_bw_data(void);
+
 uint8_t   dap_phy_fpga_last_bw_status(void);
 uint16_t  dap_phy_fpga_last_bw_wait(void);
 

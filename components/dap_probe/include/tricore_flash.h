@@ -65,7 +65,7 @@ typedef struct {
      * OPER/SQER/PROER/PVER/EVER the flash refused on. */
     uint32_t errsr;
     bool     verified;
-    char     message[224];
+    char     message[288];
 } tricore_flash_status_t;
 
 /*
