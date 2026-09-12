@@ -191,6 +191,27 @@ esp_err_t logic_analyzer_handler(httpd_req_t *req) {
     return httpd_resp_send(req, (const char *)logic_analyzer_start, logic_analyzer_size);
 }
 
+/*
+ * GET /trace.html - the trace capture page.
+ *
+ * The drain endpoints underneath it have existed for a while and were driven by
+ * hand with curl, which is fine for proving the framing and useless for
+ * collecting a capture.  The stream endpoint deliberately returns after about a
+ * second so it cannot monopolise the single-task web server, so something has
+ * to keep reconnecting - and the probe's 64 kB ring is only about 160 ms of a
+ * three-signal capture, so that something has to be prompt about it.  A page
+ * that reconnects immediately and writes each chunk straight to disk is what
+ * turns those endpoints into a backend someone can actually capture with.
+ */
+esp_err_t trace_page_handler(httpd_req_t *req) {
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+    extern const unsigned char trace_start[] asm("_binary_trace_html_start");
+    extern const unsigned char trace_end[]   asm("_binary_trace_html_end");
+
+    return httpd_resp_send(req, (const char *)trace_start,
+                           (size_t)(trace_end - trace_start));
+}
+
 esp_err_t help_handler(httpd_req_t *req) {
     extern const unsigned char help_start[] asm("_binary_help_html_start");
     extern const unsigned char help_end[]   asm("_binary_help_html_end");
@@ -2854,6 +2875,13 @@ httpd_uri_t uri_logic_analyzer = {
     .user_ctx = NULL
 };
 
+httpd_uri_t uri_trace_page = {
+    .uri = "/trace.html",
+    .method = HTTP_GET,
+    .handler = trace_page_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_help = {
     .uri = "/help",
     .method = HTTP_GET,
@@ -3115,6 +3143,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_file_upload);
     httpd_register_uri_handler(*http_handle, &uri_file_delete);
     httpd_register_uri_handler(*http_handle, &uri_logic_analyzer);
+    httpd_register_uri_handler(*http_handle, &uri_trace_page);
     httpd_register_uri_handler(*http_handle, &uri_help);
     //httpd_register_uri_handler(*http_handle, &uri_logic_analyzer_data);
     httpd_register_uri_handler(*http_handle, &uri_log_error);

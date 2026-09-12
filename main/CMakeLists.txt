@@ -48,6 +48,7 @@ idf_component_register(
     EMBED_FILES
         "web/website.html"
         "web/logic_analyzer.html"
+        "web/trace.html"
         "web/help.html"
         "web/ez32.svg"
         "web/favicon.ico"
