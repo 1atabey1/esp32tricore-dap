@@ -495,13 +495,52 @@ and irrelevant; on single-word register access it is two clocks against a
 is eleven per frame, which this project copied before checking whether the
 device asked for it.
 
-Wide mode, if it is ever used: `DAP1` carries the even bits and `DAP2` the odd
-ones, the start bit is driven on both lines in parallel as an alignment check,
-and any field with an odd bit count is padded by one bit which *is* covered by
-the CRC6. The device ignores the padding except on `CMD`, where the pad bit must
-be `0`. Note the skew caveat in the timing section: the two upstream lines are
-not guaranteed to match, so wide mode needs a per-line capture phase calibrated
-against `sync`'s `0xAAAAAAAA`, which is FPGA work.
+Wide mode: `DAP1` carries the even bits and `DAP2` the odd ones, the start bit is
+driven on both lines in parallel as an alignment check, and the per-line capture
+phase has to be calibrated against `sync`'s `0xAAAAAAAA` because the two upstream
+lines are not guaranteed to match. That much is confirmed on hardware.
+
+The padding rule this section used to state - every field padded to an even bit
+count, the pad covered by the CRC6, zero on `CMD` - was a reconstruction and is
+**not** confirmed. It was implemented, the device rejected every frame built
+that way, and three other candidates fared no better. It is recorded here as
+unverified rather than removed, because the measurement that would settle it has
+not been made yet: see below for why.
+
+**What was established on hardware, 2026-09-12.** The probe side is built and
+verified in simulation, and the link gets as far as the device answering:
+
+- `DAP2` is wired and package pin 34 is the right pad. Driving the target's
+  `P21.7` from the bus gives 0/16 samples high with the pin low and 16/16 with
+  it high, and none of sixteen other `BANK0` pads follow it.
+- The device does switch. After the long `dapisc` telegram with `MODE = 01B` it
+  drives `DAP2`, the start bit appears on both lines, and the reply to that
+  telegram reads `0x0334` where the register should read `0x0F10` - exactly what
+  `DAP1` alone carries of a wide `0x0F10`.
+- One wide `sync` answers `0xCCCCCCCC` rather than `0xAAAAAAAA`. Deinterleaved,
+  that is both lines carrying the same alternating stream *in phase*, which is
+  what a `DAP2` sampled half a bit from where it belongs looks like. At divider
+  0 a bit is two fabric clocks, so half a bit is one tap step - the calibration
+  mechanism already covers it, in either direction, since delaying one line is
+  the same as advancing the other.
+- `OIFM.DAPMODE` `000B` is the reset value and already permits three-pin wide
+  mode. It is not a two-pin strapping and needs nothing written to it.
+
+**What blocks it is the target's application, and it is an electrical hazard.**
+In two-pin mode `DAP2` is `P21.7`, an ordinary port pin, and this target's
+firmware configures it as a push-pull output and holds it low - `IOCR4` reads
+`0x80808080`, so `PC7` is `0x10`. Writing the pin back to an input works and
+does not stay worked, because the application puts it back. A wide frame sent
+while that is true puts two push-pull drivers across the 22R series network,
+about 150 mA, and the probe board browns out: one frame is survivable, two are
+not, and a sweep of sixteen takes it down every time. It cost this bench a
+board that needed a physical power cycle to recover.
+
+So the sequence halts the cores before borrowing the pin, and the wide path is
+opt-in behind `/api/dap_fpga?stage=N` rather than part of the route check. **Do
+not drive `DAP2` without first confirming the target is not driving it** - the
+receive-wide flag (`FLAGS` bit 5) samples both lines while transmitting narrow
+and is safe by construction, and is what the wiring probe uses.
 
 **Host link: WiFi for streaming, USB for bring-up.** USB full speed caps near
 1 MB/s, which is under the six-signal case's 800 kB/s once framing is counted, so
