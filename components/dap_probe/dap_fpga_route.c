@@ -803,7 +803,39 @@ static void resume_application(void)
  * interface.  The previous value is returned so it can be put back: the target's
  * application configured that pin deliberately and is entitled to it again.
  */
+/*
+ * What P21.7 has to become, and what is still a guess.
+ *
+ * The requirement is exact: PC7's bit 4 is the direction, so any 0x1x value
+ * leaves the port's push-pull driver on and that is the contention which browns
+ * the board out.  Turning that driver off is what hands the pad to the OCDS,
+ * and every input encoding does it.
+ *
+ * Which input encoding is the open part.  0x00 is the bare minimum - stop
+ * driving, no pull device - and leaves the line floating through every
+ * half-duplex turnaround.  0x02 adds a pull-up, which is the better guess on
+ * two counts: DAP lines idle high, which is what the receiver's idle_high
+ * detection keys off, and the pin read as DAP0 in the Port 22 dump is itself
+ * 0x02.  Neither has been confirmed against a working wide link, so it is a
+ * parameter rather than a constant - /api/dap_fpga?pc=N picks it, and the
+ * default is the one with the better argument behind it.
+ */
 #define IOCR_IN_NOPULL  0x00u
+#define IOCR_IN_PULLUP  0x02u
+
+static uint8_t s_dap2_pc = IOCR_IN_PULLUP;
+
+void dap_probe_fpga_dap2_mode(int pc)
+{
+    /* Refuse an output mode outright: it is the one setting that can damage
+     * something, and a typo in a query string should not reach the pad. */
+    if (pc >= 0 && (pc & 0x10) == 0) {
+        s_dap2_pc = (uint8_t)(pc & 0x1F);
+    } else if (pc >= 0) {
+        ESP_LOGE(TAG, "  refusing PC 0x%02X for P21.7: that is an output mode",
+                 (unsigned)pc);
+    }
+}
 
 /*
  * Returns whether it is safe for this end to drive DAP2.
@@ -831,7 +863,7 @@ static bool p21_7_release(uint32_t *saved_iocr4)
 
     const uint32_t mask = 0x1Fu << IOCR4_SHIFT(DAP2_PIN);
     const uint32_t as_in = (*saved_iocr4 & ~mask) |
-                           (IOCR_IN_NOPULL << IOCR4_SHIFT(DAP2_PIN));
+                           ((uint32_t)s_dap2_pc << IOCR4_SHIFT(DAP2_PIN));
 
     if (dap_probe_write32(P21_IOCR4, as_in) != ESP_OK) {
         ESP_LOGW(TAG, "  P21 IOCR4 would not take the write");
@@ -846,6 +878,9 @@ static bool p21_7_release(uint32_t *saved_iocr4)
     }
 
     const unsigned pc_now = (unsigned)((now >> IOCR4_SHIFT(DAP2_PIN)) & 0x1Fu);
+    ESP_LOGW(TAG, "  P21.7 set to PC 0x%02X (input, %s)", (unsigned)s_dap2_pc,
+             s_dap2_pc == IOCR_IN_PULLUP ? "pull-up" :
+             s_dap2_pc == IOCR_IN_NOPULL ? "no pull device" : "other");
     ESP_LOGW(TAG, "  P21.7 released for the interface: IOCR4 0x%08" PRIX32
                   " -> 0x%08" PRIX32 " (PC 0x%02X -> 0x%02X)",
              *saved_iocr4, now, pc, pc_now);

@@ -197,6 +197,15 @@ void dap_probe_fpga_wide_taps(int tap1, int tap2);
 void dap_probe_fpga_wide_trail(int trail);
 
 /*
+ * The port mode to put the target's DAP2 pin (P21.7) into before wide mode.
+ *
+ * Must be an input encoding - bit 4 clear - because an output one leaves the
+ * port driving the pad the interface needs, and two push-pull drivers across
+ * the 22R network is what brings this board down.  Output modes are refused.
+ */
+void dap_probe_fpga_dap2_mode(int pc);
+
+/*
  * Sweep the attach variables that are cheap to vary in software - bit rate,
  * how many idle clocks precede the first frame, whether TRST is pulsed, and
  * which LEN the sync frame carries - and report every combination that draws a

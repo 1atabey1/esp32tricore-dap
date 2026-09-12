@@ -2792,6 +2792,11 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
             trail = atoi(val);
         }
         dap_probe_fpga_wide_trail(trail);
+
+        /* ?pc=N is the port mode P21.7 is put into; input encodings only. */
+        if (httpd_query_key_value(query, "pc", val, sizeof(val)) == ESP_OK) {
+            dap_probe_fpga_dap2_mode((int)strtol(val, NULL, 0));
+        }
     }
 
     dap_capture_begin();
