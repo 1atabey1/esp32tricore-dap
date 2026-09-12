@@ -2581,16 +2581,6 @@ static esp_err_t fpga_load_handler(httpd_req_t *req)
     }
 
     /*
-     * Internal DMA-capable RAM, not PSRAM.
-     *
-     * The FPGA is configured by an SPI DMA transfer, and DMA cannot reliably
-     * source from PSRAM - the bitstream that reaches the device is then not the
-     * one that was uploaded, and the only symptom is CDONE failing to come up,
-     * which looks exactly like a bad bitstream.  The embedded image works
-     * because it is sent from flash-mapped rodata.  Cost is ~104 kB of the
-     * ~178 kB of DMA-capable heap, freed as soon as the transfer is done.
-     */
-    /*
      * PSRAM is fine: the bitstream is bit-banged out a byte at a time by the
      * CPU, not DMAed, so where it lives does not matter and 104 kB of internal
      * RAM is not available contiguously anyway.

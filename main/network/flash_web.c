@@ -44,7 +44,7 @@ static const char *TAG = "FLASH_WEB";
 
 /* How much image the probe will hold.  TC38x program flash is larger than this,
  * but an application image that needs more than 2 MB is not what this is for. */
-#define IMAGE_MAX_BYTES (2u * 1024u * 1024u)
+#define IMAGE_MAX_BYTES (3u * 1024u * 1024u)
 
 typedef struct {
     uint8_t *data;          /* PSRAM, IMAGE_MAX_BYTES, 0xFF-filled */

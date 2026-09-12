@@ -449,6 +449,7 @@ static void tricore_detach(target_s *target)
 
     /* Leave the target as we found it: running, with none of our triggers
      * armed to halt it again later. */
+    ESP_LOGI(TAG, "Detaching...");
     tricore_bp_clear_kind(core, TRICORE_BP_USER);
     tricore_bp_clear_kind(core, TRICORE_BP_STEP);
     tricore_bp_clear_kind(core, TRICORE_BP_WATCH);
