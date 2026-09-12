@@ -38,6 +38,17 @@
 #define UART_PORT_SEL_KEY           "uart_psel"
 #define DISABLE_USB_DAP_KEY         "dis_usb_dap"
 
+/*
+ * Which bitstream the FPGA is configured with at boot: "dap" (the default) or
+ * "stock".
+ *
+ * The DAP image replaces the logic analyser, XVC and the Port C passthrough
+ * that the CPU-driven DAP path runs over, so this is a real either/or rather
+ * than a preference - and it is settable so there is a way back that does not
+ * need a host with the other bitstream file to hand.
+ */
+#define FPGA_IMAGE_KEY              "fpga_image"
+
 #define CFG_FILE_PATH               "/data/target/"
 
 esp_err_t storage_init_filesystem(void);

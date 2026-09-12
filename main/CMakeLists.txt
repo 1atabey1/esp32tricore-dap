@@ -6,6 +6,7 @@ set(sources
     network/network_adapter.c
     network/network_mngr.c
     network/web_server.c
+    network/flash_web.c
     network/network_mngr_ota.c
     network/descriptors.c
     network/uart_websocket.c
@@ -34,6 +35,7 @@ set(dependencies
     blackmagic_esp32
     lcd
     CherryDAP
+    dap_probe
 )
 
 idf_component_register(
@@ -47,12 +49,15 @@ idf_component_register(
     EMBED_FILES
         "web/website.html"
         "web/logic_analyzer.html"
+        "web/trace.html"
+        "web/flash.html"
         "web/help.html"
         "web/ez32.svg"
         "web/favicon.ico"
         "ice40up5k/bitstream.bin"
-        "cacert.pem"
-        "prvtkey.pem"
+        # Built from fpga/dap_master; copied in rather than embedded from the
+        # build tree, which is not in the repository, so a fresh clone builds.
+        "ice40up5k/dap_master.bin"
 )
 
 set(host "esp-idf")

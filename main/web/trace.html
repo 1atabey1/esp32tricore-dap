@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TriCore trace</title>
+<style>
+  :root {
+    --bg:#11141a; --panel:#191d26; --line:#272d3a; --ink:#e6e9ef;
+    --dim:#8b93a7; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb454; --bad:#ff5f56;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui, sans-serif;
+  }
+  header {
+    padding:16px 20px; border-bottom:1px solid var(--line);
+    display:flex; align-items:baseline; gap:16px; flex-wrap:wrap;
+  }
+  h1 { font-size:17px; margin:0; font-weight:600; }
+  header a { color:var(--dim); text-decoration:none; font-size:13px; }
+  header a:hover { color:var(--accent); }
+  main { padding:20px; max-width:1100px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:18px; }
+  button {
+    background:var(--panel); color:var(--ink); border:1px solid var(--line);
+    border-radius:7px; padding:8px 15px; font-size:14px; cursor:pointer;
+  }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.4; cursor:default; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#08121f; font-weight:600; }
+  button.primary:hover:not(:disabled) { color:#08121f; filter:brightness(1.1); }
+  button.stop { border-color:var(--bad); color:var(--bad); }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:10px; }
+  .cell {
+    background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:11px 13px;
+  }
+  .cell .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .cell .v { font-family:var(--mono); font-size:19px; margin-top:3px; }
+  .v.ok { color:var(--ok); } .v.warn { color:var(--warn); } .v.bad { color:var(--bad); }
+
+  h2 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px;
+       margin:24px 0 9px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12.5px; }
+  th { text-align:left; color:var(--dim); font-weight:500; padding:5px 9px;
+       border-bottom:1px solid var(--line); font-size:11px; text-transform:uppercase; }
+  td { padding:4px 9px; border-bottom:1px solid #1e222c; white-space:nowrap; }
+  tr.gap td { color:var(--warn); }
+  .scroll { max-height:320px; overflow:auto; border:1px solid var(--line); border-radius:9px; }
+  #log {
+    font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; color:var(--dim);
+    background:var(--panel); border:1px solid var(--line); border-radius:9px;
+    padding:11px 13px; max-height:180px; overflow:auto;
+  }
+  .note { color:var(--dim); font-size:12.5px; max-width:70ch; }
+  .pill { font-family:var(--mono); font-size:12px; padding:2px 8px; border-radius:20px;
+          border:1px solid var(--line); color:var(--dim); }
+  .pill.on { color:var(--ok); border-color:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>TriCore trace</h1>
+  <span id="state" class="pill">idle</span>
+  <a href="/">&larr; probe</a>
+  <a href="/logic_analyzer.html">logic analyzer</a>
+</header>
+
+<main>
+  <div class="row">
+    <button id="start" class="primary">Start capture</button>
+    <button id="stop" class="stop" disabled>Stop</button>
+    <button id="selftest">Self-test</button>
+    <button id="save" disabled>Save to file&hellip;</button>
+    <button id="download" disabled>Download buffered</button>
+    <button id="clear">Clear</button>
+  </div>
+
+  <p class="note" id="sink">
+    Captured data is held in memory until you download it. <b>Save to file</b> writes
+    each chunk straight to disk as it arrives, so a long capture is limited by the
+    disk rather than by this tab &mdash; pick that before starting if you intend to
+    run for more than a few seconds.
+  </p>
+
+  <h2>Stream</h2>
+  <div class="grid">
+    <div class="cell"><div class="k">Payload received</div><div class="v" id="s_bytes">0 B</div></div>
+    <div class="cell"><div class="k">Rate</div><div class="v" id="s_rate">0 kB/s</div></div>
+    <div class="cell"><div class="k">Paragraphs</div><div class="v" id="s_records">0</div></div>
+    <div class="cell"><div class="k">Gaps seen</div><div class="v" id="s_gaps">0</div></div>
+    <div class="cell"><div class="k">Framing errors</div><div class="v" id="s_bad">0</div></div>
+    <div class="cell"><div class="k">Transport</div><div class="v" id="s_tx" style="font-size:15px">-</div></div>
+  </div>
+
+  <h2>Probe counters</h2>
+  <div class="grid">
+    <div class="cell"><div class="k">Published</div><div class="v" id="p_par">0</div></div>
+    <div class="cell"><div class="k">Lost (overwritten)</div><div class="v" id="p_lost">0</div></div>
+    <div class="cell"><div class="k">Laps</div><div class="v" id="p_laps">0</div></div>
+    <div class="cell"><div class="k">Unit overruns</div><div class="v" id="p_ovr">0</div></div>
+    <div class="cell"><div class="k">Read errors</div><div class="v" id="p_rderr">0</div></div>
+    <div class="cell"><div class="k">Ring free</div><div class="v" id="p_free">0 B</div></div>
+    <div class="cell"><div class="k">Ring dropped</div><div class="v" id="p_drop">0 B</div></div>
+    <div class="cell"><div class="k">FIFONOW</div><div class="v" id="p_fifo">-</div></div>
+    <div class="cell"><div class="k">Slowest pass</div><div class="v" id="p_poll">0 us</div></div>
+  </div>
+
+  <h2>Recent paragraphs</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>seq</th><th>TRAM offset</th><th>bytes</th><th>lost</th><th>first words</th></tr></thead>
+      <tbody id="recs"></tbody>
+    </table>
+  </div>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+</main>
+
+<script>
+/*
+ * The probe publishes complete 1 kB paragraphs, each behind a 20-byte header:
+ *
+ *   u32 magic "DTRP" | u32 seq | u32 tram_offset | u16 length | u16 flags | u32 lost
+ *
+ * The magic is there so a reader that joins late, or loses bytes, can find the
+ * next boundary instead of silently decoding rubbish - which matters because a
+ * TRAM lap produces no error message from the target, so a stream that fell
+ * behind still parses as valid.  This decoder therefore resynchronises by
+ * hunting for the magic rather than trusting its own position.
+ *
+ * The stream endpoint is deliberately bounded: the probe's web server runs
+ * every request from one task, so a response held open forever would block
+ * /api/dap_trace/stop as well.  It returns after about a second and this
+ * reconnects, which the probe's 64 kB ring covers.
+ */
+const MAGIC = 0x50525444;        // "DTRP" little-endian
+const HDR   = 20;
+
+const el = id => document.getElementById(id);
+const fmtBytes = n =>
+  n < 1024 ? n + " B" :
+  n < 1048576 ? (n / 1024).toFixed(1) + " kB" :
+  (n / 1048576).toFixed(2) + " MB";
+
+let running = false;      // our streaming loop, not the probe's drain
+let abort = null;
+let sock = null;          // the WebSocket, when one is up
+let transport = "-";
+let carry = new Uint8Array(0);   // bytes left over from the last chunk
+let writer = null;               // FileSystemWritableFileStream, when chosen
+let memory = [];                 // fallback sink
+
+const st = { bytes:0, records:0, gaps:0, bad:0, t0:0, lastSeq:null };
+
+function log(msg) {
+  const d = new Date().toTimeString().slice(0, 8);
+  el("log").textContent += `[${d}] ${msg}\n`;
+  el("log").scrollTop = el("log").scrollHeight;
+}
+
+function setState(on) {
+  el("state").textContent = on ? "capturing" : "idle";
+  el("state").classList.toggle("on", on);
+  el("start").disabled = on;
+  el("stop").disabled = !on;
+  el("selftest").disabled = on;
+  el("save").disabled = on;
+}
+
+/* ---- the decoder ------------------------------------------------------- */
+
+function concat(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0); out.set(b, a.length);
+  return out;
+}
+
+/*
+ * Pull whole records out of `buf`, returning what is left over.
+ *
+ * Anything before a magic word is counted as a framing error rather than
+ * skipped quietly: it means bytes were lost, and a decoder that hides that
+ * produces a plausible trace with a hole in it.
+ */
+function consume(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let i = 0;
+
+  while (buf.length - i >= HDR) {
+    if (dv.getUint32(i, true) !== MAGIC) {
+      // Hunt for the next boundary, counting what we walked past.
+      let j = i + 1;
+      while (j + 4 <= buf.length && dv.getUint32(j, true) !== MAGIC) j++;
+      if (j + 4 > buf.length) { st.bad += buf.length - i; return buf.slice(buf.length); }
+      st.bad += j - i;
+      i = j;
+      continue;
+    }
+
+    const len = dv.getUint16(i + 12, true);
+    if (buf.length - i < HDR + len) break;      // wait for the rest
+
+    const seq    = dv.getUint32(i + 4, true);
+    const offset = dv.getUint32(i + 8, true);
+    const flags  = dv.getUint16(i + 14, true);
+    const lost   = dv.getUint32(i + 16, true);
+
+    st.records++;
+    if (flags & 1) st.gaps++;
+    if (st.lastSeq !== null && seq !== st.lastSeq + 1) st.gaps++;
+    st.lastSeq = seq;
+
+    addRecord(seq, offset, len, lost, flags & 1,
+              buf.subarray(i + HDR, i + HDR + Math.min(len, 16)));
+    i += HDR + len;
+  }
+  return buf.slice(i);
+}
+
+const recs = el("recs");
+function addRecord(seq, offset, len, lost, gap, head) {
+  const tr = document.createElement("tr");
+  if (gap) tr.className = "gap";
+  const hex = Array.from(head).map(b => b.toString(16).padStart(2, "0")).join(" ");
+  tr.innerHTML =
+    `<td>${seq}</td><td>0x${offset.toString(16).padStart(8, "0")}</td>` +
+    `<td>${len}</td><td>${lost || ""}</td><td>${hex}</td>`;
+  recs.prepend(tr);
+  while (recs.children.length > 200) recs.lastChild.remove();
+}
+
+/* ---- the transport ----------------------------------------------------- */
+
+async function sink(chunk) {
+  if (writer) { await writer.write(chunk); }
+  else { memory.push(chunk); el("download").disabled = false; }
+}
+
+/*
+ * The preferred transport.
+ *
+ * The chunked endpoint below returns after about a second by design - the
+ * probe's web server runs every request from one task, so a response held open
+ * for a whole capture would block /api/dap_trace/stop too - and every
+ * reconnect is a window in which the probe's 64 kB ring has to hold everything
+ * the target produces, which at three signals is about 160 ms of headroom.
+ *
+ * A WebSocket has no such window: the upgrade returns immediately, the probe
+ * pushes frames from a task of its own, and the connection simply stays up.
+ * This is the one to use for a capture that matters; the fallback exists for
+ * browsers or proxies that will not carry one.
+ */
+function pumpWebSocket() {
+  return new Promise(resolve => {
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") +
+                location.host + "/ws/trace";
+    let ws;
+    try { ws = new WebSocket(url); } catch (e) { resolve(false); return; }
+
+    ws.binaryType = "arraybuffer";
+    let opened = false;
+
+    ws.onopen = () => {
+      opened = true;
+      sock = ws;
+      transport = "websocket";
+      el("state").textContent = "capturing (websocket)";
+      log("streaming over a websocket");
+      resolve(true);
+    };
+
+    ws.onmessage = async ev => {
+      const chunk = new Uint8Array(ev.data);
+      st.bytes += chunk.length;
+      await sink(chunk);
+      carry = consume(concat(carry, chunk));
+      render();
+    };
+
+    ws.onerror = () => {
+      if (!opened) { resolve(false); }        // fall back, quietly
+    };
+
+    ws.onclose = () => {
+      sock = null;
+      if (!opened) { resolve(false); return; }
+      if (running) {
+        log("websocket closed; falling back to the chunked stream");
+        transport = "chunked";
+        el("state").textContent = "capturing (chunked)";
+        pump();
+      }
+    };
+  });
+}
+
+async function pump() {
+  st.t0 = performance.now();
+  while (running) {
+    abort = new AbortController();
+    let res;
+    try {
+      res = await fetch("/api/dap_trace/stream", { signal: abort.signal, cache: "no-store" });
+    } catch (e) {
+      if (!running) break;
+      log("stream request failed: " + e.message);
+      await new Promise(r => setTimeout(r, 300));
+      continue;
+    }
+    if (!res.ok) { log("stream returned " + res.status); break; }
+
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        st.bytes += value.length;
+        await sink(value);
+        carry = consume(concat(carry, value));
+        render();
+      }
+    } catch (e) {
+      if (running) log("stream dropped: " + e.message);
+    }
+    /* The endpoint returns about once a second by design; reconnect at once so
+     * the probe's ring has as little time as possible to fill. */
+  }
+}
+
+function render() {
+  const secs = (performance.now() - st.t0) / 1000;
+  el("s_bytes").textContent = fmtBytes(st.bytes);
+  el("s_rate").textContent = secs > 0.2
+    ? (st.bytes / 1024 / secs).toFixed(1) + " kB/s" : "-";
+  el("s_records").textContent = st.records;
+  const g = el("s_gaps"); g.textContent = st.gaps;
+  g.className = "v" + (st.gaps ? " warn" : " ok");
+  const b = el("s_bad"); b.textContent = st.bad;
+  b.className = "v" + (st.bad ? " bad" : " ok");
+  el("s_tx").textContent = transport;
+}
+
+async function poll() {
+  try {
+    const txt = await (await fetch("/api/dap_trace/stats", { cache: "no-store" })).text();
+    const kv = {};
+    txt.trim().split(/\s+/).forEach(p => {
+      const [k, v] = p.split("=");
+      kv[k] = v;
+    });
+    const num = k => parseInt(kv[k] ?? "0", 10) || 0;
+    el("p_par").textContent   = num("paragraphs");
+    el("p_lost").textContent  = num("lost");
+    el("p_lost").className    = "v" + (num("lost") ? " bad" : " ok");
+    el("p_laps").textContent  = num("laps");
+    el("p_laps").className    = "v" + (num("laps") ? " warn" : " ok");
+    el("p_ovr").textContent   = num("overruns");
+    el("p_ovr").className     = "v" + (num("overruns") ? " warn" : " ok");
+    el("p_rderr").textContent = num("read_errors");
+    el("p_rderr").className   = "v" + (num("read_errors") ? " bad" : " ok");
+    el("p_free").textContent  = fmtBytes(num("queue_free"));
+    el("p_drop").textContent  = fmtBytes(num("queue_dropped"));
+    el("p_drop").className    = "v" + (num("queue_dropped") ? " bad" : " ok");
+    el("p_fifo").textContent  = kv["fifonow"] ?? "-";
+    el("p_poll").textContent  = num("poll_us_max") + " us";
+  } catch (e) { /* the probe is busy streaming; try again next tick */ }
+}
+setInterval(poll, 1000);
+poll();
+
+/* ---- controls ---------------------------------------------------------- */
+
+el("start").onclick = async () => {
+  try {
+    const r = await fetch("/api/dap_trace/start", { cache: "no-store" });
+    log("start: " + (await r.text()).trim());
+    if (!r.ok) return;
+  } catch (e) { log("start failed: " + e.message); return; }
+
+  st.bytes = st.records = st.gaps = st.bad = 0;
+  st.lastSeq = null;
+  carry = new Uint8Array(0);
+  running = true;
+  setState(true);
+  st.t0 = performance.now();
+
+  /* Try the websocket first and fall back without fuss if it will not open. */
+  if (!await pumpWebSocket()) {
+    transport = "chunked";
+    el("state").textContent = "capturing (chunked)";
+    log("no websocket; using the chunked stream, which reconnects every second");
+    pump();
+  }
+};
+
+el("stop").onclick = async () => {
+  running = false;
+  if (sock) { sock.close(); sock = null; }
+  if (abort) abort.abort();
+  setState(false);
+  try { log("stop: " + (await (await fetch("/api/dap_trace/stop")).text()).trim()); }
+  catch (e) { log("stop failed: " + e.message); }
+  if (writer) {
+    await writer.close();
+    writer = null;
+    log("file closed");
+    el("sink").textContent = "File closed. Choose Save to file again for the next capture.";
+  }
+};
+
+el("selftest").onclick = async () => {
+  log("self-test: running");
+  try {
+    const r = await fetch("/api/dap_trace/selftest", { cache: "no-store" });
+    log((await r.text()).trim());
+  } catch (e) { log("self-test failed: " + e.message); }
+};
+
+/*
+ * Writing to disk as it arrives, where the browser allows it.
+ *
+ * The probe's ring is 64 kB and a three-signal capture fills it in about
+ * 160 ms, so the thing that must never block is the reader.  Accumulating in
+ * memory works for short captures and stops being reasonable well before the
+ * disk does.
+ */
+el("save").onclick = async () => {
+  if (!window.showSaveFilePicker) {
+    log("this browser has no file-system access; buffered download only");
+    return;
+  }
+  try {
+    const h = await window.showSaveFilePicker({
+      suggestedName: "tricore-trace-" + Date.now() + ".dtrp",
+      types: [{ description: "DAP trace stream", accept: { "application/octet-stream": [".dtrp"] } }]
+    });
+    writer = await h.createWritable();
+    el("sink").textContent = "Writing straight to " + h.name + " as data arrives.";
+    log("writing to " + h.name);
+  } catch (e) { log("save cancelled"); }
+};
+
+el("download").onclick = () => {
+  const blob = new Blob(memory, { type: "application/octet-stream" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "tricore-trace-" + Date.now() + ".dtrp";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+el("clear").onclick = () => {
+  memory = []; recs.innerHTML = ""; el("log").textContent = "";
+  st.bytes = st.records = st.gaps = st.bad = 0; st.lastSeq = null;
+  el("download").disabled = true;
+  render();
+};
+
+setState(false);
+render();
+</script>
+</body>
+</html>

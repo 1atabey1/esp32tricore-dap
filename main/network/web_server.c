@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -27,12 +28,18 @@
 #include "../gpio_loopback_test.h"
 #include "../esp32jtag_common.h"
 #include "../port_cfg.h"
+#include "dap_probe.h"
+#include "dap_trace.h"
+#include "tricore_bmp.h"
+#include "tricore_flash_probe.h"
+#include "tricore.h"
+#include "dap_phy_fpga.h"
 #include "../ice40up5k/ice.h"
 #include "../version_info.h"
 #include "version.h"        /* BM FIRMWARE_VERSION from blackmagic_esp32 component */
 #include "mbedtls/base64.h"
 
-static esp_err_t check_auth(httpd_req_t *req) {
+esp_err_t check_auth(httpd_req_t *req) {
     char *buf = NULL;
     size_t buf_len = 0;
 
@@ -99,6 +106,8 @@ trigger_edge_t gbl_channel_triggers[16] = {TRIGGER_DISABLED};
 //defined in main.c for comm between webserver and ice.c data capture
 extern SemaphoreHandle_t capture_start_semaphore;
 extern SemaphoreHandle_t capture_done_semaphore;
+
+void flash_web_register(httpd_handle_t server);
 
 static const char *TAG = "web-server";
 
@@ -182,6 +191,27 @@ esp_err_t logic_analyzer_handler(httpd_req_t *req) {
     const size_t logic_analyzer_size = (logic_analyzer_end - logic_analyzer_start);
 
     return httpd_resp_send(req, (const char *)logic_analyzer_start, logic_analyzer_size);
+}
+
+/*
+ * GET /trace.html - the trace capture page.
+ *
+ * The drain endpoints underneath it have existed for a while and were driven by
+ * hand with curl, which is fine for proving the framing and useless for
+ * collecting a capture.  The stream endpoint deliberately returns after about a
+ * second so it cannot monopolise the single-task web server, so something has
+ * to keep reconnecting - and the probe's 64 kB ring is only about 160 ms of a
+ * three-signal capture, so that something has to be prompt about it.  A page
+ * that reconnects immediately and writes each chunk straight to disk is what
+ * turns those endpoints into a backend someone can actually capture with.
+ */
+esp_err_t trace_page_handler(httpd_req_t *req) {
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+    extern const unsigned char trace_start[] asm("_binary_trace_html_start");
+    extern const unsigned char trace_end[]   asm("_binary_trace_html_end");
+
+    return httpd_resp_send(req, (const char *)trace_start,
+                           (size_t)(trace_end - trace_start));
 }
 
 esp_err_t help_handler(httpd_req_t *req) {
@@ -1944,6 +1974,1003 @@ esp_err_t reset_to_factory_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/*
+ * Tee the log into the HTTP response while a DAP run is in progress.
+ *
+ * The serial console is not a reliable transport for these runs on this bench:
+ * the board reaches WSL over usbip, and a burst of a few hundred log lines
+ * loses most of them (vhci_hcd reports urb->status -104 while it happens),
+ * while the once-per-30s heartbeat survives.  That made a passing bring-up
+ * indistinguishable from a silent one.  Returning the report in the response
+ * body removes the console from the loop entirely.
+ *
+ * Other tasks logging at the same time land in the buffer too, which is
+ * harmless - their lines are tagged - and the hook is removed before the
+ * response is sent.
+ */
+#define DAP_CAPTURE_BYTES (96 * 1024)
+
+/*
+ * One socket write per pass of the trace stream loop.  4 kB is four TRAM
+ * paragraphs plus their headers, so a caught-up drain empties in a single
+ * write and a backlog drains without a delay between writes.
+ */
+#define DAP_TRACE_CHUNK_BYTES 4096
+
+/*
+ * How many empty 5 ms passes to wait after the drain stops before closing the
+ * stream.  The drain task may still be finishing a paragraph when the stop
+ * arrives, and cutting the connection there would lose it.
+ */
+#define DAP_TRACE_DRAIN_TAIL_PASSES 20
+
+/*
+ * How many empty 5 ms passes to wait while the drain is still running before
+ * returning anyway.  Half a second of silence means nothing is being traced,
+ * and there is no reason to keep the single-threaded web server occupied.
+ */
+#define DAP_TRACE_IDLE_PASSES 100
+
+/*
+ * Longest a single stream response may run.  esp_http_server handles requests
+ * from one task, so this is how long every other endpoint waits behind it.
+ */
+#define DAP_TRACE_STREAM_MAX_MS 1000
+
+static char           *s_dap_cap;
+static size_t          s_dap_cap_len;
+static vprintf_like_t  s_dap_cap_prev;
+
+static int dap_capture_vprintf(const char *format, va_list args)
+{
+    if (s_dap_cap) {
+        va_list copy;
+        va_copy(copy, args);
+        const size_t room = DAP_CAPTURE_BYTES - 1 - s_dap_cap_len;
+        if (room > 1) {
+            const int n = vsnprintf(s_dap_cap + s_dap_cap_len, room, format, copy);
+            if (n > 0) {
+                s_dap_cap_len += ((size_t)n < room) ? (size_t)n : room - 1;
+            }
+        }
+        va_end(copy);
+    }
+    return s_dap_cap_prev ? s_dap_cap_prev(format, args) : 0;
+}
+
+static void dap_capture_begin(void)
+{
+    s_dap_cap_len = 0;
+    s_dap_cap = heap_caps_malloc(DAP_CAPTURE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dap_cap) {
+        return;
+    }
+    s_dap_cap[0] = '\0';
+    s_dap_cap_prev = esp_log_set_vprintf(dap_capture_vprintf);
+}
+
+/* Restore logging and send whatever was captured, with `verdict` on the end. */
+static void dap_capture_end(httpd_req_t *req, const char *verdict)
+{
+    if (s_dap_cap) {
+        esp_log_set_vprintf(s_dap_cap_prev);
+        s_dap_cap_prev = NULL;
+    }
+    httpd_resp_set_type(req, "text/plain");
+    if (s_dap_cap) {
+        s_dap_cap[s_dap_cap_len] = '\0';
+        /*
+         * Only if there is something to send.  A zero-length chunk is the
+         * terminator in chunked encoding, so sending the buffer unconditionally
+         * ended the response before the verdict went out - an endpoint that
+         * logged nothing returned 200 with an empty body, which reads exactly
+         * like a handler that crashed.
+         */
+        if (s_dap_cap_len > 0) {
+            httpd_resp_send_chunk(req, s_dap_cap, s_dap_cap_len);
+        }
+        free(s_dap_cap);
+        s_dap_cap = NULL;
+    }
+    httpd_resp_send_chunk(req, verdict, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/*
+ * GET /api/dap_bringup - run the DAP bring-up checkpoints on demand.
+ *
+ * This exists so a bring-up run costs nothing but an HTTP request.  Doing it
+ * at boot means resetting this board, and resetting this board disturbs the
+ * target: its Port C pins move while the target is coming out of reset, which
+ * was enough to leave a TC38x powered but not running its application.  With
+ * an endpoint the target can stay up across as many attempts as we like.
+ *
+ * Port C must be in SWD/JTAG mode for the pins to reach the connector.
+ */
+static esp_err_t dap_bringup_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board");
+        return ESP_OK;
+    }
+
+    dap_capture_begin();
+    err = dap_probe_bringup_report();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== DAP bring-up PASSED ===\n"
+        : "\n=== DAP bring-up did not complete ===\n");
+    return ESP_OK;
+}
+
+/*
+ * GET /api/dap_spi - Phase 1c: run the same checkpoints with GP-SPI clocking,
+ * then measure both backends.  Separate from /api/dap_bringup because the
+ * bit-bang result is the reference the SPI numbers are compared against, and
+ * because a failed SPI experiment reverts rather than sticking.
+ */
+static esp_err_t dap_spi_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board");
+        return ESP_OK;
+    }
+
+    dap_capture_begin();
+    err = dap_probe_spi_bringup();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== GP-SPI backend PASSED ===\n"
+        : "\n=== GP-SPI backend did not pass ===\n");
+    return ESP_OK;
+}
+
+/*
+ * GET /api/dap_trace/start  - attach, enable OCDS, and start the drain
+ * GET /api/dap_trace/stop
+ * GET /api/dap_trace/stats  - one line of counters
+ * GET /api/dap_trace/stream - the drained stream as it arrives
+ *
+ * The stream is binary and self-framing: every paragraph carries a
+ * dap_trace_record_t header with a magic word, a sequence number, and a gap
+ * flag counting the paragraphs the target overwrote before the probe could
+ * read them.  That last part is the point of the whole exercise - a TRAM lap
+ * produces no ERR message, so a stream without an explicit marker parses as
+ * valid and is quietly wrong.
+ *
+ * Nothing here configures tracing.  The MCDS configuration is the host's
+ * 54-write list; a drain that invented its own would be measuring itself.
+ */
+static esp_err_t dap_trace_start_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board\n");
+        return ESP_OK;
+    }
+
+    /*
+     * The same opening the bring-up uses, because the drain needs exactly what
+     * it establishes: an attached device, the Cerberus IOClient selected, RW
+     * mode for bus access, and OCDS on - without which the whole miniMCDS
+     * register space bus-errors and the FIFO reads come back empty.
+     */
+    dap_capture_begin();
+
+    dap_exchange_t x;
+    err = dap_probe_attach(&x, 3);
+    if (err == ESP_OK) {
+        dap_probe_client_set(1, &x);
+        dap_probe_clear_error_state();
+        dap_probe_set_rw_mode(true);
+        dap_probe_enable_ocds();
+        err = dap_trace_start();
+    }
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== draining ===\n"
+        : "\n=== could not start the drain ===\n");
+    return ESP_OK;
+}
+
+/*
+ * GET /api/dap_trace/selftest - prove the drain works on a target that is not
+ * tracing.
+ *
+ * Without this, "the drain ran and published nothing" is indistinguishable
+ * from "the drain is broken", which is the state the backend was in: it had
+ * never moved a byte on hardware because nothing here configures the miniMCDS
+ * to emit anything.  See dap_trace_selftest() for what it does and does not
+ * prove.
+ */
+static esp_err_t dap_trace_selftest_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "DAP PHY unavailable on this board\n");
+        return ESP_OK;
+    }
+
+    dap_capture_begin();
+
+    dap_exchange_t x;
+    err = dap_probe_attach(&x, 3);
+    if (err == ESP_OK) {
+        dap_probe_client_set(1, &x);
+        dap_probe_clear_error_state();
+        dap_probe_set_rw_mode(true);
+        dap_probe_enable_ocds();
+        err = dap_trace_selftest();
+    }
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== trace drain verified ===\n"
+        : "\n=== trace drain NOT verified ===\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stop_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_trace_stop();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "stopped\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stats_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_trace_stats_t st;
+    char line[384];
+
+    dap_trace_get_stats(&st);
+    const int n = snprintf(line, sizeof(line),
+        "running=%d paragraphs=%" PRIu32 " bytes=%" PRIu32 " lost=%" PRIu32
+        " laps=%" PRIu32 " overruns=%" PRIu32 " read_errors=%" PRIu32
+        " fifonow=0x%08" PRIX32 " queue_free=%" PRIu32 " queue_dropped=%" PRIu32
+        " poll_us_max=%" PRIu32 "\n",
+        st.running ? 1 : 0, st.paragraphs, st.bytes, st.lost, st.laps,
+        st.overruns, st.read_errors, st.fifonow, st.queue_free,
+        st.queue_dropped, st.poll_us_max);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
+    return ESP_OK;
+}
+
+static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    /*
+     * Chunked, and deliberately bounded rather than held open forever.
+     *
+     * esp_http_server services every request from one task, so a handler that
+     * streams until the capture ends blocks the whole web server while it runs
+     * - including /api/dap_trace/stop, which would leave no way to stop the
+     * drain but a reset.  So this returns after DAP_TRACE_STREAM_MAX_MS, or
+     * sooner if the ring goes quiet, and the host reconnects.  The 64 kB ring
+     * covers the gap between requests.
+     *
+     * That bound is also the limit of this transport.  A sustained three-signal
+     * capture is about 400 kB/s, which fills the ring in roughly 160 ms, so a
+     * host that takes longer than that to reconnect loses paragraphs - and they
+     * are reported as gaps rather than lost silently, which is the point of the
+     * record header.  Sustained capture wants a dedicated socket with its own
+     * task; this endpoint is for bring-up and for verifying the framing.
+     */
+    const int64_t deadline = esp_timer_get_time() + DAP_TRACE_STREAM_MAX_MS * 1000;
+
+    uint8_t *buf = heap_caps_malloc(DAP_TRACE_CHUNK_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = heap_caps_malloc(DAP_TRACE_CHUNK_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "no buffer for the stream\n");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    int idle = 0;
+    for (;;) {
+        const size_t n = dap_trace_read(buf, DAP_TRACE_CHUNK_BYTES);
+
+        if (n) {
+            idle = 0;
+            if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
+                break;                  /* the host went away */
+            }
+            if (esp_timer_get_time() >= deadline) {
+                break;                  /* hand the server back; the host returns */
+            }
+            continue;                   /* there may be more waiting already */
+        }
+
+        dap_trace_stats_t st;
+        dap_trace_get_stats(&st);
+        if (!st.running && idle > DAP_TRACE_DRAIN_TAIL_PASSES) {
+            break;                      /* stopped, and the ring has run dry */
+        }
+        if (idle > DAP_TRACE_IDLE_PASSES || esp_timer_get_time() >= deadline) {
+            break;                      /* nothing arriving; do not hold the server */
+        }
+        idle++;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    free(buf);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Trace over a WebSocket                                                     */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Why this exists alongside /api/dap_trace/stream.
+ *
+ * esp_http_server runs every request from one task, so a plain HTTP response
+ * that streamed for the length of a capture would block every other endpoint -
+ * including /api/dap_trace/stop, which would leave no way to stop the drain but
+ * a reset.  The chunked endpoint therefore returns after about a second and the
+ * client reconnects, and the gap between requests is covered by a 64 kB ring
+ * that a three-signal capture fills in roughly 160 ms.  It works for bring-up
+ * and it is not a transport for a sustained capture.
+ *
+ * A WebSocket has neither problem.  The handler returns as soon as the upgrade
+ * is done, so the server task is free, and the frames are pushed afterwards
+ * from a task of this file's own through httpd_ws_send_frame_async.  There is
+ * no reconnect, so there is no window in which the ring has to hold anything.
+ *
+ * One connection at a time, deliberately: the drained stream is consumed
+ * destructively - dap_trace_read() empties the ring - so two readers would each
+ * get an arbitrary half of the capture, which is worse than a refusal.
+ */
+
+#define TRACE_WS_CHUNK   4096
+#define TRACE_WS_IDLE_MS 5
+
+static httpd_handle_t s_trace_ws_hd;
+static int            s_trace_ws_fd = -1;
+static TaskHandle_t   s_trace_ws_task;
+static volatile bool  s_trace_ws_run;
+
+static void trace_ws_close(void)
+{
+    s_trace_ws_fd = -1;
+    s_trace_ws_hd = NULL;
+    s_trace_ws_run = false;
+}
+
+/*
+ * Push whatever the drain has produced, for as long as the socket lives.
+ *
+ * Sends are synchronous from this task's point of view but asynchronous with
+ * respect to the server task, which is the whole point.  A failed send means
+ * the peer is gone: there is nothing useful to do but stop, and continuing
+ * would spin on a dead descriptor.
+ */
+static void trace_ws_task(void *arg)
+{
+    uint8_t *buf = heap_caps_malloc(TRACE_WS_CHUNK,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = heap_caps_malloc(TRACE_WS_CHUNK, MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "trace ws: no buffer");
+        trace_ws_close();
+        s_trace_ws_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "trace ws: streaming to fd %d", s_trace_ws_fd);
+
+    while (s_trace_ws_run && s_trace_ws_fd >= 0) {
+        const size_t n = dap_trace_read(buf, TRACE_WS_CHUNK);
+
+        if (n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
+            continue;
+        }
+
+        httpd_ws_frame_t pkt = {
+            .final   = true,
+            .type    = HTTPD_WS_TYPE_BINARY,
+            .payload = buf,
+            .len     = n,
+        };
+
+        const esp_err_t err = httpd_ws_send_frame_async(s_trace_ws_hd,
+                                                        s_trace_ws_fd, &pkt);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "trace ws: send failed (%s); closing",
+                     esp_err_to_name(err));
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "trace ws: stopped");
+    free(buf);
+    trace_ws_close();
+    s_trace_ws_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/*
+ * GET /ws/trace - the upgrade, and nothing else.
+ *
+ * esp_http_server calls this once with method GET to perform the handshake and
+ * again for every frame the client sends.  The sender task is started on the
+ * handshake; incoming frames are read and discarded, because the client has
+ * nothing to say - it stops by closing, and /api/dap_trace/stop remains
+ * reachable throughout precisely because this handler does not linger.
+ */
+static esp_err_t trace_ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        if (s_trace_ws_fd >= 0) {
+            ESP_LOGW(TAG, "trace ws: already streaming to fd %d",
+                     s_trace_ws_fd);
+            return ESP_FAIL;      /* refuse rather than split the stream */
+        }
+        s_trace_ws_hd  = req->handle;
+        s_trace_ws_fd  = httpd_req_to_sockfd(req);
+        s_trace_ws_run = true;
+
+        if (xTaskCreate(trace_ws_task, "trace_ws", 4096, NULL, 5,
+                        &s_trace_ws_task) != pdPASS) {
+            ESP_LOGE(TAG, "trace ws: could not start the sender");
+            trace_ws_close();
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+
+    /*
+     * A frame from the client.  Read it so the socket does not stall, and use
+     * it only to notice a close.
+     */
+    httpd_ws_frame_t pkt = {0};
+    uint8_t scratch[64];
+
+    pkt.payload = scratch;
+    if (httpd_ws_recv_frame(req, &pkt, sizeof(scratch)) != ESP_OK) {
+        s_trace_ws_run = false;
+        return ESP_OK;
+    }
+    if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ESP_LOGI(TAG, "trace ws: client closed");
+        s_trace_ws_run = false;
+    }
+    return ESP_OK;
+}
+
+httpd_uri_t uri_trace_ws = {
+    .uri          = "/ws/trace",
+    .method       = HTTP_GET,
+    .handler      = trace_ws_handler,
+    .user_ctx     = NULL,
+    .is_websocket = true,
+};
+
+/*
+ * POST /api/fpga_load - configure the FPGA from an uploaded bitstream.
+ *
+ * Loaded at runtime rather than swapped into the embedded image on purpose.
+ * The DAP-only bitstream replaces the logic analyser, XVC and the Port C
+ * passthrough that the CPU-driven DAP path runs over, so if it is wrong there
+ * is nothing left to debug it with.  Loading it transiently means the boot
+ * default stays the stock image and a reboot is the whole recovery procedure.
+ *
+ *     curl -sk -u admin:admin --data-binary @dap_master.bin \
+ *          https://<board>/api/fpga_load
+ */
+/*
+ * GET /api/fpga_image?sel=dap|stock - which bitstream boots, and load it now.
+ *
+ * The two are mutually exclusive: the DAP image replaces the logic analyser,
+ * XVC and the Port C passthrough the CPU-driven DAP path runs over.  DAP is
+ * the default, so this is mainly the way back - and it matters that it exists
+ * without needing a host holding the other bitstream file, which is all
+ * /api/fpga_load can offer.
+ *
+ * With no `sel` it reports the current setting and changes nothing.
+ */
+static esp_err_t fpga_image_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    char query[64] = {0};
+    char sel[16]   = {0};
+    bool have_sel = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "sel", sel, sizeof(sel)) == ESP_OK) {
+        have_sel = true;
+    }
+
+    if (have_sel) {
+        if (strcmp(sel, "dap") != 0 && strcmp(sel, "stock") != 0) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "sel must be dap or stock\n");
+            return ESP_OK;
+        }
+        if (storage_write(FPGA_IMAGE_KEY, sel, strlen(sel) + 1) != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "could not save the setting\n");
+            return ESP_OK;
+        }
+    }
+
+    char *current = NULL;
+    const bool stock = (storage_alloc_and_read(FPGA_IMAGE_KEY, &current) == ESP_OK &&
+                        current && strcmp(current, "stock") == 0);
+    free(current);
+
+    dap_capture_begin();
+
+    if (have_sel) {
+        extern const unsigned char bitstream_bin_start[]  asm("_binary_bitstream_bin_start");
+        extern const unsigned char bitstream_bin_end[]    asm("_binary_bitstream_bin_end");
+        extern const unsigned char dap_master_bin_start[] asm("_binary_dap_master_bin_start");
+        extern const unsigned char dap_master_bin_end[]   asm("_binary_dap_master_bin_end");
+
+        /* The fabric is about to be replaced, so the host's picture of it is
+         * stale either way - see dap_phy_fpga_invalidate(). */
+        dap_phy_fpga_invalidate();
+
+        const gpio_config_t cfg_out = {
+            .mode         = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        const gpio_config_t cfg_in = {
+            .mode         = GPIO_MODE_INPUT,
+            .pin_bit_mask = (1ULL << AEL_PIN_NUM_MISO),
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&cfg_out);
+        gpio_config(&cfg_in);
+
+        const uint8_t status = stock
+            ? ICE_FPGA_Config(bitstream_bin_start,
+                              (uint32_t)(bitstream_bin_end - bitstream_bin_start))
+            : ICE_FPGA_Config(dap_master_bin_start,
+                              (uint32_t)(dap_master_bin_end - dap_master_bin_start));
+        ESP_LOGW(TAG, "loaded the %s bitstream: CDONE %s", stock ? "stock" : "DAP",
+                 status == 0 ? "up" : "DID NOT COME UP");
+    }
+
+    char verdict[96];
+    snprintf(verdict, sizeof(verdict), "\n=== boot bitstream: %s ===\n",
+             stock ? "stock" : "DAP master");
+    dap_capture_end(req, verdict);
+    return ESP_OK;
+}
+
+static esp_err_t fpga_load_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    const int total = req->content_len;
+    if (total <= 0 || total > 512 * 1024) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "implausible bitstream size\n");
+        return ESP_OK;
+    }
+
+    /*
+     * Internal DMA-capable RAM, not PSRAM.
+     *
+     * The FPGA is configured by an SPI DMA transfer, and DMA cannot reliably
+     * source from PSRAM - the bitstream that reaches the device is then not the
+     * one that was uploaded, and the only symptom is CDONE failing to come up,
+     * which looks exactly like a bad bitstream.  The embedded image works
+     * because it is sent from flash-mapped rodata.  Cost is ~104 kB of the
+     * ~178 kB of DMA-capable heap, freed as soon as the transfer is done.
+     */
+    /*
+     * PSRAM is fine: the bitstream is bit-banged out a byte at a time by the
+     * CPU, not DMAed, so where it lives does not matter and 104 kB of internal
+     * RAM is not available contiguously anyway.
+     */
+    uint8_t *image = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (image == NULL) {
+        image = heap_caps_malloc(total, MALLOC_CAP_8BIT);
+    }
+    if (image == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "no room for the bitstream\n");
+        return ESP_OK;
+    }
+
+    int got = 0;
+    while (got < total) {
+        const int n = httpd_req_recv(req, (char *)image + got, total - got);
+        if (n <= 0) {
+            free(image);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "upload did not complete\n");
+            return ESP_OK;
+        }
+        got += n;
+    }
+
+    dap_capture_begin();
+    ESP_LOGW(TAG, "configuring the FPGA from %d uploaded bytes", got);
+
+    /*
+     * Whatever the fabric held, it is about to stop holding it.  Without this
+     * the next route check finds the link already "up", skips the probe that
+     * proves the DAP image is loaded, and runs against a register file back at
+     * its reset values - which showed up as sync returning zero on a route
+     * that had worked a minute earlier, with nothing pointing at the reload.
+     */
+    dap_phy_fpga_invalidate();
+
+    /*
+     * Put the configuration pins back under GPIO control first.
+     *
+     * ICE_FPGA_Config bit-bangs the bitstream with gpio_set_level, and a pad
+     * routed to the SPI peripheral ignores that completely - the writes go
+     * nowhere and CDONE simply never comes up, which looks exactly like a bad
+     * bitstream.  At boot this works because ICE_Init() calls
+     * init_gpio_spipins_as_gpio() after bringing SPI2 up; nothing does that for
+     * a load requested later, once SPI2 owns the pads again.
+     *
+     * gpio_config() is what does the work: it resets the pad's IO_MUX function
+     * to GPIO, which re-routing the matrix output alone would not.
+     */
+    const gpio_config_t cfg_out = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    const gpio_config_t cfg_in = {
+        .mode         = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_MISO),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg_out);
+    gpio_config(&cfg_in);
+
+    const uint8_t status = ICE_FPGA_Config(image, (uint32_t)got);
+    free(image);
+
+    /*
+     * A non-zero status means CDONE never came up, which is the FPGA saying it
+     * did not accept the image - a truncated upload, or a bitstream built for
+     * another device.  Worth failing loudly: the board carries on working
+     * either way, and a half-configured FPGA is the sort of thing that would
+     * otherwise be blamed on the protocol later.
+     */
+    char verdict[96];
+    snprintf(verdict, sizeof(verdict),
+             "\n=== FPGA config %s (status %u) ===\n",
+             status == 0 ? "accepted, CDONE up" : "REFUSED", status);
+    dap_capture_end(req, verdict);
+    return ESP_OK;
+}
+
+/*
+ * GET /api/fpga_pins - read the ESP32 side of the FPGA link as plain GPIO.
+ *
+ * For the question a loaded-but-silent bitstream raises: can the fabric drive
+ * these pads as user IO at all once configuration is over?  Loading an image
+ * that holds MISO at a known level and reading it here answers that with one
+ * bit, without trusting the SPI peripheral, the register map or the protocol.
+ */
+static esp_err_t fpga_pins_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    /* Read them as inputs, which costs the SPI routing - restored by the next
+     * dap_phy_fpga_init(), which re-points these pads itself. */
+    gpio_set_direction(AEL_PIN_NUM_MISO, GPIO_MODE_INPUT);
+
+    /*
+     * Drive the clock and data pins by hand and report what comes back, so a
+     * pass-through bitstream can prove which ESP32 pin reaches which FPGA pad.
+     * The MISO mapping was confirmed this way; SCK and MOSI never were, and an
+     * unverified assumption there looks exactly like a slave that ignores the
+     * clock.  gpio_config, not gpio_set_direction: only the former puts the
+     * pad's IO_MUX back to GPIO after the SPI peripheral has had it.
+     */
+    const gpio_config_t drive = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << AEL_PIN_NUM_CLK) | (1ULL << AEL_PIN_NUM_MOSI),
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&drive);
+
+    int miso_clk[2], miso_mosi[2];
+    for (int level = 0; level < 2; level++) {
+        gpio_set_level(AEL_PIN_NUM_CLK, level);
+        gpio_set_level(AEL_PIN_NUM_MOSI, 0);
+        esp_rom_delay_us(50);
+        miso_clk[level] = gpio_get_level(AEL_PIN_NUM_MISO);
+
+        gpio_set_level(AEL_PIN_NUM_CLK, 0);
+        gpio_set_level(AEL_PIN_NUM_MOSI, level);
+        esp_rom_delay_us(50);
+        miso_mosi[level] = gpio_get_level(AEL_PIN_NUM_MISO);
+    }
+    gpio_set_level(AEL_PIN_NUM_CLK, 0);
+    gpio_set_level(AEL_PIN_NUM_MOSI, 0);
+
+    char line[224];
+    const int n = snprintf(line, sizeof(line),
+        "miso_gpio%d=%d cdone_gpio42=%d  clk_drive[0,1]->miso[%d,%d]  "
+        "mosi_drive[0,1]->miso[%d,%d]\n",
+        AEL_PIN_NUM_MISO, gpio_get_level(AEL_PIN_NUM_MISO), gpio_get_level(42),
+        miso_clk[0], miso_clk[1], miso_mosi[0], miso_mosi[1]);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
+    return ESP_OK;
+}
+
+httpd_uri_t uri_fpga_pins = {
+    .uri      = "/api/fpga_pins",
+    .method   = HTTP_GET,
+    .handler  = fpga_pins_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_fpga_load = {
+    .uri      = "/api/fpga_load",
+    .method   = HTTP_POST,
+    .handler  = fpga_load_handler,
+    .user_ctx = NULL
+};
+
+/*
+ * GET /api/dap_fpga - bring the fabric DAP master up and prove the route.
+ *
+ * Checked in the order that makes a failure name itself: the register file
+ * answers at all, then a sync frame comes back, then a block read matches what
+ * the CPU path reads from the same address.  The last one is the point - it is
+ * the same data by two independent routes.
+ */
+static esp_err_t dap_fpga_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    /* ?stage=N stops the wide-mode sequence after step N - see the note on
+     * dap_probe_fpga_wide_stage().  Absent means run everything. */
+    int stage = 0;
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "stage", val, sizeof(val)) == ESP_OK) {
+            stage = atoi(val);
+        }
+    }
+    dap_probe_fpga_wide_stage(stage);
+
+    /* ?dcmd=N sends the dapisc telegram as command N instead of the default. */
+    {
+        char dval[8];
+        int dcmd = -1;
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+            httpd_query_key_value(query, "dcmd", dval, sizeof(dval)) == ESP_OK) {
+            dcmd = atoi(dval);
+        }
+        dap_probe_fpga_dapisc_cmd(dcmd);
+    }
+
+    /* ?t1=&t2= pick the capture taps stage 6 uses. */
+    {
+        char val[8];
+        int t1 = 0, t2 = 0;
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            if (httpd_query_key_value(query, "t1", val, sizeof(val)) == ESP_OK) {
+                t1 = atoi(val);
+            }
+            if (httpd_query_key_value(query, "t2", val, sizeof(val)) == ESP_OK) {
+                t2 = atoi(val);
+            }
+        }
+        dap_probe_fpga_wide_taps(t1, t2);
+
+        int trail = -1;
+        if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) {
+            trail = atoi(val);
+        }
+        dap_probe_fpga_wide_trail(trail);
+
+        /* ?pc=N is the port mode P21.7 is put into; input encodings only. */
+        if (httpd_query_key_value(query, "pc", val, sizeof(val)) == ESP_OK) {
+            dap_probe_fpga_dap2_mode((int)strtol(val, NULL, 0));
+        }
+    }
+
+    dap_capture_begin();
+    const esp_err_t err = dap_probe_fpga_route_check();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== the fabric route works ===\n"
+        : "\n=== the fabric route did not come up ===\n");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_fpga = {
+    .uri      = "/api/dap_fpga",
+    .method   = HTTP_GET,
+    .handler  = dap_fpga_handler,
+    .user_ctx = NULL
+};
+
+/*
+ * GET /api/dap_gdb/attach - register the TC3xx as a Black Magic Probe target
+ * GET /api/dap_gdb/status
+ *
+ * There is no second GDB server.  Black Magic's is already listening on 4242
+ * and already implements everything above the target; this only registers the
+ * cores in its target list, after which
+ *
+ *     (gdb) target extended-remote <board>:4242
+ *     (gdb) attach 1
+ *
+ * works.  On request rather than at boot because attaching drives Port C, and
+ * doing that unasked while somebody is using the probe for something else is
+ * how the target ends up held in reset.
+ */
+static esp_err_t dap_gdb_attach_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_capture_begin();
+    const esp_err_t err = tricore_bmp_probe();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== registered; target extended-remote <board>:4242, then attach 1 ===\n"
+        : "\n=== could not attach to the target ===\n");
+    return ESP_OK;
+}
+
+static esp_err_t dap_gdb_status_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    char   line[256];
+    size_t n = 0;
+
+    n += (size_t)snprintf(line + n, sizeof(line) - n, "cores=%d",
+                          tricore_core_count());
+    for (int i = 0; i < tricore_core_count(); i++) {
+        const int core = tricore_core_index(i);
+        n += (size_t)snprintf(line + n, sizeof(line) - n, " cpu%d=%s", core,
+                              tricore_is_halted(core) ? "halted" : "running");
+    }
+    n += (size_t)snprintf(line + n, sizeof(line) - n, "\n");
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, line, n);
+    return ESP_OK;
+}
+
+/*
+ * GET /api/dap_flash_probe - can this probe load a flash page?
+ *
+ * The one open question standing between GDB `load` and this target.  Writes
+ * nothing to flash; see tricore_flash_probe.c for what it does and why that is
+ * safe.  Needs /api/dap_gdb/attach first, for the cores.
+ */
+static esp_err_t dap_flash_probe_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    dap_capture_begin();
+    const esp_err_t err = tricore_flash_probe_width();
+    dap_capture_end(req, err == ESP_OK
+        ? "\n=== a page load was accepted; flashing can come across ===\n"
+        : "\n=== no page load was accepted; flashing stays on DAS ===\n");
+    return ESP_OK;
+}
+
+httpd_uri_t uri_dap_flash_probe = {
+    .uri      = "/api/dap_flash_probe",
+    .method   = HTTP_GET,
+    .handler  = dap_flash_probe_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_gdb_attach = {
+    .uri      = "/api/dap_gdb/attach",
+    .method   = HTTP_GET,
+    .handler  = dap_gdb_attach_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_gdb_status = {
+    .uri      = "/api/dap_gdb/status",
+    .method   = HTTP_GET,
+    .handler  = dap_gdb_status_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_start = {
+    .uri      = "/api/dap_trace/start",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_start_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_fpga_image = {
+    .uri      = "/api/fpga_image",
+    .method   = HTTP_GET,
+    .handler  = fpga_image_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_selftest = {
+    .uri      = "/api/dap_trace/selftest",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_selftest_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stop = {
+    .uri      = "/api/dap_trace/stop",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stop_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stats = {
+    .uri      = "/api/dap_trace/stats",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stats_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_trace_stream = {
+    .uri      = "/api/dap_trace/stream",
+    .method   = HTTP_GET,
+    .handler  = dap_trace_stream_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_spi = {
+    .uri      = "/api/dap_spi",
+    .method   = HTTP_GET,
+    .handler  = dap_spi_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_dap_bringup = {
+    .uri      = "/api/dap_bringup",
+    .method   = HTTP_GET,
+    .handler  = dap_bringup_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_reset_to_factory = {
     .uri       = "/reset_to_factory",
     .method    = HTTP_POST,
@@ -2016,6 +3043,13 @@ httpd_uri_t uri_logic_analyzer = {
     .uri = "/logic_analyzer.html",
     .method = HTTP_GET,
     .handler = logic_analyzer_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_trace_page = {
+    .uri = "/trace.html",
+    .method = HTTP_GET,
+    .handler = trace_page_handler,
     .user_ctx = NULL
 };
 
@@ -2219,51 +3253,48 @@ httpd_uri_t uri_test_result = {
     .user_ctx = NULL
 };
 
-#include "esp_https_server.h"
-
-extern const unsigned char cacert_pem_start[] asm("_binary_cacert_pem_start");
-extern const unsigned char cacert_pem_end[]   asm("_binary_cacert_pem_end");
-extern const unsigned char prvtkey_pem_start[] asm("_binary_prvtkey_pem_start");
-extern const unsigned char prvtkey_pem_end[]   asm("_binary_prvtkey_pem_end");
-
+/*
+ * Plain HTTP, not HTTPS.
+ *
+ * This probe sits on a bench network and every client is a browser on the same
+ * LAN, so TLS was buying a certificate warning rather than security - the
+ * certificate is self-signed and checked in, which anyone on that network can
+ * read.  What it cost was real: mbedTLS on an ESP32 encrypts every byte of the
+ * trace stream in software, and the trace stream is the one thing here that is
+ * supposed to run at over a megabyte a second.  The websocket added in the
+ * previous commit was a wss:// socket for exactly that reason and could not
+ * have reached the rate the drain produces.
+ *
+ * The credentials still apply: check_auth() runs on every endpoint as before.
+ * They now travel in the clear, which on a bench LAN they effectively did
+ * anyway.  If this ever faces a network that is not a bench, the answer is a
+ * real certificate and a reverse proxy, not a self-signed one on the probe.
+ */
 esp_err_t web_server_start(httpd_handle_t *http_handle) {
-    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-    // Note: mbedtls requires PEM to be null-terminated. Embedded files might not be.
-    // We allocate a buffer, copy, and adhere to requirements.
-    
-    size_t cacert_len = cacert_pem_end - cacert_pem_start;
-    size_t prvtkey_len = prvtkey_pem_end - prvtkey_pem_start;
+    /*
+     * 34 handlers are registered below, and httpd_register_uri_handler()
+     * returns an error rather than complaining loudly when the table is full -
+     * so a cap set too low takes the *last* endpoints registered off the air
+     * with no sign of it but a 404.  Kept well clear of the count.
+     */
+    config.max_uri_handlers = 56;
+    config.stack_size = 10240;
+    /*
+     * The trace websocket holds one socket for the length of a capture, and
+     * the flasher's upload holds another.  The default of four leaves too
+     * little room for a browser that also wants the page and its polling.
+     */
+    config.max_open_sockets = 7;
+    config.lru_purge_enable = true;
+    config.server_port = 80;
 
-    // Allocate buffers with space for \0
-    uint8_t *cacert_buf = calloc(1, cacert_len + 1);
-    uint8_t *prvtkey_buf = calloc(1, prvtkey_len + 1);
-
-    if (!cacert_buf || !prvtkey_buf) {
-        ESP_LOGE(TAG, "Failed to allocate memory for SSL certs");
-        free(cacert_buf);
-        free(prvtkey_buf);
-        return ESP_ERR_NO_MEM;
-    }
-
-    memcpy(cacert_buf, cacert_pem_start, cacert_len);
-    cacert_buf[cacert_len] = '\0';
-
-    memcpy(prvtkey_buf, prvtkey_pem_start, prvtkey_len);
-    prvtkey_buf[prvtkey_len] = '\0';
-
-    config.servercert = cacert_buf;
-    config.servercert_len = cacert_len + 1; // Include null terminator
-    config.prvtkey_pem = prvtkey_buf;
-    config.prvtkey_len = prvtkey_len + 1; // Include null terminator
-
-    config.httpd.max_uri_handlers = 30;
-    config.httpd.stack_size = 10240; // Increased stack for SSL operations
-
-    ESP_LOGI(TAG, "Starting HTTPS Server on port: '%d'", config.httpd.server_port);
-    esp_err_t ret = httpd_ssl_start(http_handle, &config);
+    ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
+    esp_err_t ret = httpd_start(http_handle, &config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start web server! Error: %d", ret);
+        return ret;
     }
 
     httpd_register_uri_handler(*http_handle, &uri_get_main_page);
@@ -2274,11 +3305,31 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_file_upload);
     httpd_register_uri_handler(*http_handle, &uri_file_delete);
     httpd_register_uri_handler(*http_handle, &uri_logic_analyzer);
+    httpd_register_uri_handler(*http_handle, &uri_trace_page);
+    httpd_register_uri_handler(*http_handle, &uri_trace_ws);
+
+    /* The flasher's page and its three endpoints, registered together from
+     * the module that owns them. */
+    flash_web_register(*http_handle);
     httpd_register_uri_handler(*http_handle, &uri_help);
     //httpd_register_uri_handler(*http_handle, &uri_logic_analyzer_data);
     httpd_register_uri_handler(*http_handle, &uri_log_error);
     httpd_register_uri_handler(*http_handle, &uri_ota_upload);
     httpd_register_uri_handler(*http_handle, &uri_reset_to_factory);
+    httpd_register_uri_handler(*http_handle, &uri_dap_spi);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_start);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_selftest);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_image);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stop);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stats);
+    httpd_register_uri_handler(*http_handle, &uri_dap_trace_stream);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_load);
+    httpd_register_uri_handler(*http_handle, &uri_fpga_pins);
+    httpd_register_uri_handler(*http_handle, &uri_dap_fpga);
+    httpd_register_uri_handler(*http_handle, &uri_dap_gdb_attach);
+    httpd_register_uri_handler(*http_handle, &uri_dap_flash_probe);
+    httpd_register_uri_handler(*http_handle, &uri_dap_gdb_status);
+    httpd_register_uri_handler(*http_handle, &uri_dap_bringup);
 
     httpd_register_err_handler(*http_handle, HTTPD_404_NOT_FOUND, not_found_handler);
     ESP_ERROR_CHECK(uart_websocket_add_handlers(*http_handle));

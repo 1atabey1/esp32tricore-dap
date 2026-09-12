@@ -1,7 +1,12 @@
 CMakeCache.txt
 CMakeFiles
 CMakeScripts
-Makefile
+# Anchored: this is CMake's generated top-level Makefile.  Unanchored it also
+# matched fpga/dap_master/Makefile and components/dap_probe/test/Makefile, both
+# of which are hand-written build recipes - and the FPGA one carries the clock
+# constraint and the pinned placer seed the bitstream's timing depends on, so
+# leaving it out of the repo meant a clone could not reproduce the bitstream.
+/Makefile
 cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
@@ -25,3 +30,7 @@ components/jimtcl/tmp/
 dependencies.lock
 managed_components/
 components/jimtcl/src/
+
+# Python tooling
+.venv/
+__pycache__/

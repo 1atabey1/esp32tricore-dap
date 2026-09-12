@@ -34,6 +34,11 @@
 #include "gdb_main.h"
 #include "boards/board_profile.h"
 #include "port_cfg.h"
+#include "dap_probe.h"
+#include "tricore_bmp.h"
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+#include "dap_phy.h"
+#endif
 #include "xvc_server.h"
 #include "esp32jtag_common.h"
 #include "ice.h"
@@ -185,13 +190,40 @@ esp_err_t load_fpga(void)
 
     extern const unsigned char bitstream_bin_start[] asm("_binary_bitstream_bin_start");
     extern const unsigned char bitstream_bin_end[]   asm("_binary_bitstream_bin_end");
-    const size_t sz = (bitstream_bin_end - bitstream_bin_start);
+    extern const unsigned char dap_master_bin_start[] asm("_binary_dap_master_bin_start");
+    extern const unsigned char dap_master_bin_end[]   asm("_binary_dap_master_bin_end");
 
-    ESP_LOGI(TAG, "Configuring FPGA, bin file size=%ld", sz);
+    /*
+     * The DAP master by default, not the stock image.
+     *
+     * The two are mutually exclusive: the DAP bitstream replaces the logic
+     * analyser, XVC and the Port C passthrough the CPU-driven DAP path runs
+     * over.  It is the default because it is what this board is for now - the
+     * fabric master reaches 730 kB/s against the CPU path's 453 - and because
+     * a probe that needs a bitstream uploaded before it works is a probe that
+     * does not work after a power cycle.
+     *
+     * Set fpga_image to "stock" in NVS to get the other one back; that is the
+     * way out that does not need a host holding the bitstream file.
+     */
+    bool  want_stock = false;
+    char *choice     = NULL;
+    if (storage_alloc_and_read(FPGA_IMAGE_KEY, &choice) == ESP_OK && choice) {
+        want_stock = (strcmp(choice, "stock") == 0);
+        free(choice);
+    }
+
+    const unsigned char *image = want_stock ? bitstream_bin_start
+                                            : dap_master_bin_start;
+    const size_t sz = want_stock ? (size_t)(bitstream_bin_end - bitstream_bin_start)
+                                 : (size_t)(dap_master_bin_end - dap_master_bin_start);
+
+    ESP_LOGI(TAG, "Configuring FPGA with the %s bitstream, %u bytes",
+             want_stock ? "stock" : "DAP master", (unsigned)sz);
 
     uint8_t cfg_stat;
     int8_t retry = 3;
-    while ((cfg_stat = ICE_FPGA_Config(bitstream_bin_start, sz)) && (--retry)) {
+    while ((cfg_stat = ICE_FPGA_Config(image, sz)) && (--retry)) {
         ESP_LOGW(TAG, "FPGA configured ERROR - status = %d retry=%d", cfg_stat, retry);
     }
     if (retry)
@@ -223,6 +255,42 @@ static spi_device_handle_t spi_device_1_manual_handle;
 static spi_device_handle_t spi_device_2_hw_handle;
 static spi_device_handle_t spi_device_3_hw_handle;
 static spi_device_handle_t spi_device_4_hw_handle;
+/*
+ * Release SPI2 so the DAP probe can clock with hardware instead of GPIO.
+ *
+ * SPI2 carries the XVC devices, and SPI3 carries the FPGA bitstream loader,
+ * every logic-analyser capture and the LCD - so SPI2 is the only one of the
+ * two that can be given away without breaking the pin path the probe itself
+ * depends on.  XVC is JTAG over the network, which is exactly the thing DAP
+ * replaces, so nothing that matters is lost; a reboot brings it back.
+ *
+ * Called from the DAP backend when it finds SPI2 already initialised.  The XVC
+ * task is only started when the port configuration selects FPGA+XVC, and DAP
+ * needs Port C in SWD/JTAG mode instead, so in the configuration this runs in
+ * there is no task holding these handles.
+ */
+esp_err_t spi_release_xvc_bus(void)
+{
+    spi_device_handle_t *devs[3] = {
+        &spi_device_2_hw_handle, &spi_device_3_hw_handle, &spi_device_4_hw_handle
+    };
+
+    if (g_board->has_xvc && gbl_pd_cfg == PD_FPGA_XVC) {
+        ESP_LOGE(TAG, "refusing to free SPI2: the XVC server is using it");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (*devs[i]) {
+            spi_bus_remove_device(*devs[i]);
+            *devs[i] = NULL;
+        }
+    }
+    const esp_err_t err = spi_bus_free(XVC_SPI_HOST);
+    ESP_LOGW(TAG, "released SPI2 from XVC for the DAP probe: %s", esp_err_to_name(err));
+    return err;
+}
+
 esp_err_t spi_master_init(void){
     if (!g_board->has_fpga) {
         ESP_LOGI(TAG, "SPI/FPGA fabric init skipped for board '%s'", g_board->name);
@@ -913,6 +981,251 @@ bool sreset_is_asserted(void)
  *   2 = PORTD_OUT_COUNTER_HI — drive cnt1[7:4]  (counter high nibble)
  *   3 = PORTD_OUT_GPIO       — drive data_reg_1[3:0] directly (value = 0..15)
  */
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+/*
+ * Watch the DAP wires with the board's own logic analyser.
+ *
+ * Port C is logic-analyser channels 8..11, which is exactly where the DAP
+ * signals sit: PC01=ch8 (DAP2), PC02=ch9 (DAP0 clock), PC03=ch10 (DAP1 data),
+ * PC04=ch11 (TRST).  The capture block samples the pads, so this works while
+ * Port C is muxed to Black Magic Probe rather than to the analyser - which is
+ * the whole point, since that is the configuration the probe runs in.
+ *
+ * The question this answers first: does our clock actually reach the connector?
+ * The self-drive check only ever proved the bidirectional pin, and DAP0 and
+ * TRST share a register-controlled output enable rather than GPIO 45's.  So the
+ * trigger is armed on the clock channel: if the capture never triggers, the
+ * clock is not getting out, and no amount of protocol theory matters.
+ */
+extern uint8_t *psram_buffer;   /* the 128 KB capture landing buffer, in ice.c */
+
+#define DAP_LA_CH_DAP2   8
+#define DAP_LA_CH_DAP0   9
+#define DAP_LA_CH_DAP1  10
+#define DAP_LA_CH_TRST  11
+
+static void dap_la_summarise(const uint16_t *samples, size_t count)
+{
+    static const char *names[4] = { "DAP2/PC01", "DAP0/PC02", "DAP1/PC03", "TRST/PC04" };
+
+    for (int c = 0; c < 4; c++) {
+        const int ch = DAP_LA_CH_DAP2 + c;
+        int  edges = 0;
+        int  high  = 0;
+        int  first_edge = -1;
+        int  prev = (samples[0] >> ch) & 1;
+
+        for (size_t i = 0; i < count; i++) {
+            const int bit = (samples[i] >> ch) & 1;
+            high += bit;
+            if (bit != prev) {
+                edges++;
+                if (first_edge < 0) {
+                    first_edge = (int)i;
+                }
+                prev = bit;
+            }
+        }
+        ESP_LOGI(TAG, "  ch%-2d %-10s edges=%-6d high=%d%%  first edge at sample %d",
+                 ch, names[c], edges, (int)((100L * high) / (long)count), first_edge);
+    }
+}
+
+/* Arm the analyser on the clock channel and hand back once it is waiting. */
+static void dap_la_arm(void)
+{
+    gbl_sample_rate_reg  = 2;         /* 132/3 = 44 MHz, 64 Ki samples ~ 1.49 ms */
+    gbl_trigger_enabled  = true;
+    gbl_trigger_mode_or  = true;
+    gbl_trigger_position = 5;
+    for (int i = 0; i < 16; i++) {
+        gbl_channel_triggers[i] = TRIGGER_DISABLED;
+    }
+    gbl_channel_triggers[DAP_LA_CH_DAP0] = TRIGGER_RISING;
+    start_capture(false);
+}
+
+/* Wait for the capture to complete, read it back and summarise it. */
+static bool dap_la_collect(const char *what)
+{
+    for (int attempt = 0; attempt < 20 && !gbl_triggered_flag; attempt++) {
+        read_capture_status();
+        if (!gbl_triggered_flag) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (!gbl_triggered_flag) {
+        ESP_LOGE(TAG, "  %s: no trigger - the clock never reached PC02", what);
+        return false;
+    }
+
+    read_and_return_capture();
+    const uint16_t *samples = (const uint16_t *)(psram_buffer + 4);
+    const size_t    count   = (ICE_CAPTURE_BUFFER_SIZE - 4) / sizeof(uint16_t);
+
+    ESP_LOGI(TAG, "  %s:", what);
+    dap_la_summarise(samples, count);
+    return true;
+}
+
+/*
+ * Which level of the direction pin lets our data out?
+ *
+ * Drives an alternating pattern on DAP1 with the direction pin held at each
+ * level in turn, and watches the connector.  Exactly one of the two should show
+ * the pattern on ch10; whichever it is settles the polarity, and if neither
+ * does then the FPGA is not passing our data at all in this port mode.
+ */
+static void dap_la_direction_polarity(void)
+{
+    for (int dir = 0; dir <= 1; dir++) {
+        dap_la_arm();
+        dap_phy_force_dir(dir);
+        dap_phy_training_pattern(32);   /* 128 clocks, DAP1 alternating */
+        char label[48];
+        snprintf(label, sizeof(label), "dir=%d, 128 clocks of alternating DAP1", dir);
+        dap_la_collect(label);
+    }
+}
+
+/*
+ * Is anything actually attached to the data line?
+ *
+ * Hold DAP1 low with the probe driving, then release it and watch how fast the
+ * pad comes back up.  The rise is an RC against whatever pull-up is on the net:
+ *
+ *   only the ICE40's own input pull-up (~100 k) into pad plus a little cable
+ *   capacitance takes microseconds - hundreds of samples at 44 MHz;
+ *   a target pin with its own pull-up of a few tens of k is several times
+ *   faster; a target holding the line down means it never rises at all.
+ *
+ * This distinguishes a bare floating pad from a connected target pin, which is
+ * the one thing the edge counts cannot tell apart.
+ */
+static void dap_la_release_time(void)
+{
+    ESP_LOGI(TAG, "  release test: hold DAP1 low, let go, time the rise");
+
+    for (int start_level = 0; start_level <= 1; start_level++) {
+        dap_phy_force_dir(0);
+        dap_phy_drive_data(start_level);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        gbl_sample_rate_reg  = 2;
+        gbl_trigger_enabled  = true;
+        gbl_trigger_mode_or  = true;
+        gbl_trigger_position = 5;
+        for (int i = 0; i < 16; i++) {
+            gbl_channel_triggers[i] = TRIGGER_DISABLED;
+        }
+        gbl_channel_triggers[DAP_LA_CH_DAP0] = TRIGGER_RISING;
+        start_capture(false);
+
+        dap_phy_idle_clocks(1, start_level);   /* marker, data still held */
+        dap_phy_turnaround_to_read();          /* release */
+
+        char label[72];
+        snprintf(label, sizeof(label),
+                 "released from %s: does the net move on its own?",
+                 start_level ? "high" : "low");
+        dap_la_collect(label);
+    }
+}
+
+/*
+ * Which of the four Port C wires is attached to a target pull-up?
+ *
+ * A powered target's DAP1 sits behind a pull-up on any sane debug header,
+ * while its DAP0 is a probe-clocked input with nothing pulling it.  So:
+ * drive every pin we can reach low, then tri-state the whole port by taking
+ * Port C out of SWD/JTAG mode, and watch which channels come back up.  The
+ * ones that rise are connected to something that pulls; the ones that hold
+ * low are inert.
+ *
+ * This identifies the real DAP1 without anyone tracing a wire, and it works
+ * regardless of how the cables happen to be arranged.
+ */
+static void dap_la_find_pulled_pins(bool restore_portc, bool use_portb, bool use_portd)
+{
+    ESP_LOGI(TAG, "  pull-up hunt: drive Port C low, tri-state it, see what rises");
+
+    /*
+     * Only the data line is driven low here.  An earlier version pulled all
+     * four Port C pins down, which is how this board stopped the target's
+     * application: one of these wires reaches a pin the target samples at
+     * reset, so a low pulse per boot of ours was rebooting it into another
+     * mode.  Never drive a wire whose target-side function is unknown.
+     */
+    dap_phy_force_dir(0);
+    dap_phy_drive_data(0);                 /* PC03 (data) only */
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    gbl_sample_rate_reg  = 2;
+    gbl_trigger_enabled  = true;
+    gbl_trigger_mode_or  = true;           /* any of the four may fire */
+    gbl_trigger_position = 5;
+    for (int i = 0; i < 16; i++) {
+        gbl_channel_triggers[i] = TRIGGER_DISABLED;
+    }
+    for (int ch = DAP_LA_CH_DAP2; ch <= DAP_LA_CH_TRST; ch++) {
+        gbl_channel_triggers[ch] = TRIGGER_RISING;
+    }
+    start_capture(false);
+
+    /* cfgpc = 0 takes Port C to high impedance: nothing on our side drives it. */
+    set_cfga(false, use_portb, false, use_portd, true, true);
+
+    if (!dap_la_collect("tri-stated - a channel at high% is pulled by the target")) {
+        ESP_LOGW(TAG, "    nothing rose: no target pull-up on any Port C wire");
+    }
+
+    if (restore_portc) {
+        set_cfga(false, use_portb, true, use_portd, true, true);
+    }
+}
+
+static bool b_use_portb_cached, b_use_portd_cached;
+
+static void dap_la_capture_test(void)
+{
+    if (!g_board->has_logic_analyzer) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "=== DAP wire capture: arming on the clock channel ===");
+
+    /*
+     * This runs before start_background_tasks(), so logic_analyzer_init() has
+     * not allocated the landing buffer yet.  Allocating it here is safe and
+     * idempotent: the allocation in ice.c is guarded on psram_buffer == NULL.
+     */
+    if (psram_buffer == NULL) {
+        psram_buffer = heap_caps_malloc(ICE_CAPTURE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        if (psram_buffer == NULL) {
+            ESP_LOGE(TAG, "  no PSRAM for the capture buffer");
+            return;
+        }
+    }
+
+    if (dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ) != ESP_OK) {
+        ESP_LOGE(TAG, "  PHY init failed, nothing to capture");
+        return;
+    }
+    dap_la_arm();                     /* armed, waiting for the clock's first edge */
+    dap_exchange_t x;
+    dap_probe_sync(&x);               /* the traffic we want to see on the wire */
+    dap_la_collect("sync frame plus reply window");
+
+    /* Then settle what the sync capture only hints at. */
+    dap_la_direction_polarity();
+    dap_la_release_time();
+    /* restore_portc = false: leave the port high impedance afterwards so the
+     * board holds nothing against the target between sessions. */
+    dap_la_find_pulled_pins(false, b_use_portb_cached, b_use_portd_cached);
+    ESP_LOGW(TAG, "Port C left high impedance; re-enable it before debugging");
+}
+#endif /* CONFIG_AEL_DAP_BRINGUP_AT_BOOT */
+
 esp_err_t set_portd_output(uint8_t mode, uint8_t value)
 {
     if (!g_board->has_fpga) {
@@ -1223,7 +1536,78 @@ void app_main(void) {
     set_cfga(b_use_porta, b_use_portb, b_use_portc, b_use_portd, true, !SPI_nGPIO); // use_portc, not use_porta, swdio, SPI not gpio
 
     set_la_input_sel(false);
+
+#if CONFIG_AEL_DAP_BRINGUP_AT_BOOT
+    b_use_portb_cached = b_use_portb;
+    b_use_portd_cached = b_use_portd;
+    dap_la_capture_test();
+
+    /*
+     * Sweep the ADC channels the schematic wires to the port pins through 100 K
+     * dividers (R108: PA01, PB01; R109: PC01, PD01).  With a target attached
+     * this is a four-point voltmeter on the connector, which is the cheapest
+     * way to tell an unpowered target from a protocol problem.  Raw counts are
+     * logged rather than scaled volts: the divider ratio is only known for the
+     * one channel the firmware already scales.
+     */
+    for (int ch = ADC_CHANNEL_0; ch <= ADC_CHANNEL_4; ch++) {
+        adc_oneshot_chan_cfg_t cfg = {
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        if (adc_oneshot_config_channel(gbl_adc_handle, ch, &cfg) != ESP_OK) {
+            continue;
+        }
+        int raw = 0;
+        if (adc_oneshot_read(gbl_adc_handle, ch, &raw) == ESP_OK) {
+            ESP_LOGI(TAG, "port ADC ch%d raw=%d", ch, raw);
+        }
+    }
+
+    /* Port C is now routed to the S3's GPIO, which is what the DAP probe needs.
+     * Run before start_background_tasks() so BMP's gdb thread is not also
+     * holding these pins. */
+    if (b_use_portc) {
+        if (dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ) == ESP_OK) {
+            dap_probe_bringup_report();
+        }
+    } else {
+        ESP_LOGW(TAG, "DAP bring-up skipped: Port C is not in SWD/JTAG mode");
+    }
+#endif
+
     start_background_tasks();
+
+#if AEL_BOARD_HAS_DAP_PROBE
+    /*
+     * After start_background_tasks(), because BMP's platform_init() runs in
+     * there and leaves GPIO 40 - our TRST - low.  On a bench where that pin is
+     * the target's reset, losing this call leaves the target powered but held
+     * in reset, which is exactly what happened when the boot-time bring-up was
+     * disabled: the bring-up had been releasing it as a side effect.
+     */
+    dap_probe_park_idle();
+
+    /*
+     * Register the TriCore with BMP's GDB server, so port 4242 has a target
+     * to attach to without anyone first poking an HTTP endpoint.
+     *
+     * After start_background_tasks() for two reasons: platform_init() runs in
+     * there and drives TRST, and target_new() appends to a list BMP owns.
+     *
+     * A failure here is logged and otherwise ignored.  It means no target was
+     * found - no board attached, or powered down - and that is a normal state
+     * for a probe sitting on a desk, not a reason to hold up the rest of the
+     * boot.  /api/dap_gdb/attach retries it once there is something to find.
+     */
+    if (b_use_portc) {
+        if (tricore_bmp_probe() != ESP_OK) {
+            ESP_LOGW(TAG, "no TriCore registered with GDB yet - attach later "
+                          "with /api/dap_gdb/attach");
+        }
+    }
+#endif
+
     if (g_board->has_lcd) {
         draw_port_cfg_info();
     }

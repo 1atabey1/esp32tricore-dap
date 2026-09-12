@@ -1,0 +1,92 @@
+# Pin constraints for the DAP-only bitstream, ICE40UP5K SG48.
+#
+# Only the target-facing pins are here, and only because they are confirmed two
+# independent ways:
+#
+#   * the schematic (docs/esp32jtag_sch_v1.4.png) maps FPGA IO08..IO11 through
+#     the 22R network R106 to connector pins PC01..PC04, all in BANK0 on
+#     VIO_VAR;
+#   * the stock bitstream configures exactly those IOBs - iceunpack shows tiles
+#     (13,31), (16,31) and (17,31) carrying IOB configuration, and the bit
+#     counts match the tile sharing: 40 bits where both blocks of a tile are in
+#     use, 20 where only one is.
+#
+# Every one of those package pins is at y=31 in the icebox database, which is
+# the UP5K top edge and therefore BANK0 - so the reading is self-consistent as
+# well as corroborated.
+#
+# Which PC0x pin carries which DAP signal comes from the board profile, which
+# was established on this bench rather than assumed:
+#
+#     PC01 = DAP2, PC02 = DAP0 (clock), PC03 = DAP1 (data), PC04 = TRST
+#
+# dap2 (IO08 -> PC01, package pin 34) was deliberately left unconstrained for a
+# long time, on the grounds that an unconstrained iCE40 pad stays an input and
+# that is what a target line nothing intends to drive should see.  Wide mode
+# gives it a use, so it is constrained now - but it is still tristated except
+# while a wide frame is going out, so the "nothing intends to drive it" case is
+# preserved rather than traded away.
+set_io dap2     34   # IO08 -> PC01, the odd bits in wide mode
+
+set_io dap0     32   # IO09 -> PC02, the clock this master generates
+set_io dap1     31   # IO10 -> PC03, the bidirectional data line
+set_io trst     28   # IO11 -> PC04, target reset on this bench
+
+# The ESP32 link, which is the FPGA's own configuration SPI reused as user IO
+# once the bitstream is loaded.  That is not a liberty: the stock image already
+# does logic-analyser capture readback over these same pins, so post-config
+# reuse is demonstrated on this board rather than assumed from the datasheet.
+#
+# Confirmed the same two ways as the pins above, plus a third:
+#
+#   * the firmware names one set of pins for both jobs - ICE_SPI_* (the live
+#     #else branch; both board-variant macros are commented out) and
+#     AEL_PIN_NUM_* are the same four GPIOs, so configuration and runtime data
+#     share one bus;
+#   * ICE_CRST_PIN 46 and ICE_CDONE_PIN 42 match the schematic's GPIO46 ->
+#     creset_b and GPIO42 -> CDONE exactly, which independently validates the
+#     schematic reading for this bank;
+#   * all four IOBs carry configuration in the stock bitstream and sit at y=0,
+#     the UP5K bottom edge, which is BANK1 as the schematic shows.
+#
+# The crossover is forced by the roles and does not depend on reading rows off
+# a drawing: the ESP32 is master, so its MOSI reaches the FPGA's slave-in and
+# its MISO comes from the FPGA's slave-out.
+#
+# The FPGA is the slave here: sck, si and ss are inputs, so is the only output.
+#
+# These are MEASURED, and three of the four are not what the pad names suggest.
+# A bitstream echoing one package pin onto SPI_SO, with the host driving one
+# GPIO at a time, gave:
+#
+#     pkg 14 drives GPIO39          -> the host's MISO
+#     pkg 15 follows GPIO38         -> the host's SCK,  not SPI_SI as named
+#     pkg 16 follows nothing driven -> the host's CS0,  idle high
+#     pkg 17 follows GPIO14         -> the host's MOSI, not SPI_SS as named
+#
+# The earlier guess - sck 16, si 15, ss 17 - was a rotation of this, and it cost
+# a long hunt: configuration works either way, because the config logic is
+# hardwired to these pads whatever a bitstream calls them, so the one thing that
+# looked like proof of the pinout could never have tested it.  The symptom was a
+# slave that saw a select and almost no clock, since the host's clock was
+# arriving on the pin the design was reading as data.
+set_io spi_sck  15   # <- ESP32 GPIO38
+set_io spi_ss   16   # <- ESP32 GPIO21 (its CS0)
+set_io spi_si   17   # <- ESP32 GPIO14 (its MOSI)
+set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
+
+# Not located yet: CS1..CS3 on ESP32 GPIO13, GPIO11 and GPIO5.  The stock
+# design uses them to address different functions in the fabric.  A DAP-only
+# image needs one chip select, which CS0 already provides, so these are left
+# out rather than guessed at - but they are the obvious place to put a second
+# channel if the command and trace streams ever want separating.
+
+# Two clocks now, and they are not the same speed.
+#
+# The SPI slave clocks its shift register straight from SCK rather than
+# oversampling it, so SCK is a real clock domain and nextpnr constrains it like
+# one.  Left to the global --freq it is held to 48 MHz, which it never runs at
+# and cannot quite meet; what it actually has to meet is whatever the host
+# drives, and 30 leaves room above the 24 the ESP32 can produce.
+set_frequency clk 48
+set_frequency spi_sck 30

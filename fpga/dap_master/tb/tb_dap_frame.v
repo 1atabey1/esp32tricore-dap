@@ -1,0 +1,425 @@
+/*
+ * Check the RTL against the vectors the host test binary already pins down.
+ *
+ * These are the same numbers components/dap_probe/test/test_dap_frame.c
+ * asserts, which is the point: the C and the Verilog are independent
+ * implementations of the same wire format, so agreeing on the documented
+ * vectors means something.  Disagreeing means one of them is wrong before a
+ * pin has moved.
+ *
+ *   sync  = CMD 0x10, LEN 63, no data  -> CRC 9,  wire word 0x09FE1, 19 bits
+ *   LEN 0 frame                        -> CRC 25
+ *
+ * The wire word is the frame with the *first transmitted bit in bit 0*.  The
+ * other convention gives 0x23FC8, so this vector tests bit order as much as
+ * it tests the checksum.
+ */
+
+`timescale 1ns / 1ps
+`default_nettype none
+
+module tb_dap_frame;
+
+    reg clk = 1'b0;
+    always #5 clk = ~clk;          /* 100 MHz */
+
+    reg         rst   = 1'b1;
+    reg         start = 1'b0;
+    reg  [4:0]  cmd   = 5'h10;
+    reg  [5:0]  len   = 6'd63;
+    reg  [5:0]  dbits = 6'd0;
+    reg  [62:0] data  = 63'd0;
+
+    reg         wide  = 1'b0;
+    reg         raw   = 1'b0;
+
+    wire busy, done, dap0, dap1, dat_oe, dap2, dat2_oe;
+
+    dap_frame_tx #(.DIV_WIDTH(8)) dut (
+        .clk (clk), .rst (rst),
+        .div (8'd1),               /* fast, so the test runs in little time */
+        .start (start), .cmd (cmd), .len (len), .data_bits (dbits), .data (data),
+        .lead (6'd2), .wide (wide), .raw (raw),
+        .busy (busy), .done (done),
+        .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe),
+        .dap2 (dap2), .dat2_oe (dat2_oe)
+    );
+
+    /*
+     * Sample dap1 on every rising edge of dap0, which is what the target does.
+     * The lead-in clocks are part of the frame as the device sees it, so they
+     * land in the capture too and the check skips them explicitly rather than
+     * quietly trimming - a lead-in that went missing is a bug worth failing on.
+     */
+    reg [95:0] captured;
+    reg [95:0] captured2;
+    integer    nbits;
+    reg        dap0_d;
+
+    /*
+     * Was DAP2 ever driven during the frame?
+     *
+     * Checking dat2_oe after `done` used to work and now cannot: the enable
+     * covers the frame proper and drops for the lead-in and the trailing zero,
+     * so by the time a frame finishes it is correctly low.  What the test
+     * actually means to assert is that wide mode drives DAP2 at some point and
+     * narrow mode never does, which is what this latch records.
+     */
+    reg saw_oe2;
+
+    always @(posedge clk) begin
+        if (start) begin
+            saw_oe2 <= 1'b0;
+        end else if (dat2_oe) begin
+            saw_oe2 <= 1'b1;
+        end
+        dap0_d <= dap0;
+        if (!rst && dap0 && !dap0_d) begin
+            captured[nbits]  <= dap1;
+            captured2[nbits] <= dap2;
+            nbits            <= nbits + 1;
+        end
+    end
+
+    /* Clear both captures and the counter, so a test that forgets one cannot
+     * pass on the previous test's bits. */
+    task restart;
+        begin
+            nbits     = 0;
+            captured  = 96'd0;
+            captured2 = 96'd0;
+        end
+    endtask
+
+    /*
+     * The same bits, one at a time and two at a time, must land on the same
+     * CRC.
+     *
+     * Wide mode puts the even bits of a frame on DAP1 and the odd ones on DAP2
+     * and sends a pair per clock, so the CRC has to absorb two bits in one
+     * cycle.  That is the same step function applied twice, not a different
+     * polynomial - and this is where that claim is checked, before any of the
+     * datapath is built on top of it.
+     */
+    reg        c_rst = 1'b1, c_en = 1'b0, c_wide = 1'b0;
+    reg        c_b0 = 1'b0, c_b1 = 1'b0;
+    wire [5:0] c_narrow, c_wide_out;
+
+    dap_crc6_gen u_narrow (
+        .clk (clk), .rst (c_rst), .en (c_en & ~c_wide),
+        .bit_in (c_b0), .bit_in2 (1'b0), .wide (1'b0), .crc (c_narrow)
+    );
+    dap_crc6_gen u_wide (
+        .clk (clk), .rst (c_rst), .en (c_en & c_wide),
+        .bit_in (c_b0), .bit_in2 (c_b1), .wide (1'b1), .crc (c_wide_out)
+    );
+
+    /* An awkward pattern rather than a tidy one: alternating bits would hide a
+     * swapped pair, which is the mistake this is looking for. */
+    localparam [15:0] CRC_PATTERN = 16'b1101_0010_1011_0001;
+
+    /* Captured before the wide pass, because both instances share one reset
+     * and the second pass would otherwise wipe the first one's answer. */
+    reg [5:0] crc_narrow_result;
+
+    /*
+     * Stimulus changes on the falling edge, never the rising one.
+     *
+     * Driving it either side of `@(posedge clk)` races the design: both the
+     * task and the DUT's always block wake on that edge, and whether the DUT
+     * reads the old value or the new one is a scheduling detail.  The first
+     * version of this did exactly that, and both CRCs came out wrong - neither
+     * matching a model of the same bits - which is the tell that the bench was
+     * at fault rather than the logic.  There is exactly one rising edge
+     * between two falling ones, so this feeds exactly one bit per step.
+     */
+    task crc_equivalence;
+        integer i;
+        begin
+            c_en = 1'b0;
+            @(negedge clk); c_rst = 1'b1; c_wide = 1'b0;
+            @(negedge clk); c_rst = 1'b0;
+            for (i = 0; i < 16; i = i + 1) begin
+                c_b0 = CRC_PATTERN[i];
+                c_en = 1'b1;
+                @(negedge clk);
+            end
+            c_en = 1'b0;
+            crc_narrow_result = c_narrow;
+
+            @(negedge clk); c_rst = 1'b1; c_wide = 1'b1;
+            @(negedge clk); c_rst = 1'b0;
+            for (i = 0; i < 16; i = i + 2) begin
+                c_b0 = CRC_PATTERN[i];
+                c_b1 = CRC_PATTERN[i + 1];
+                c_en = 1'b1;
+                @(negedge clk);
+            end
+            c_en = 1'b0;
+        end
+    endtask
+
+    integer errors = 0;
+
+    task check_eq;
+        input [127:0] name;
+        input [63:0]  got;
+        input [63:0]  want;
+        begin
+            if (got !== want) begin
+                $display("  FAIL %0s: got 0x%0h, want 0x%0h", name, got, want);
+                errors = errors + 1;
+            end else begin
+                $display("  ok   %0s = 0x%0h", name, got);
+            end
+        end
+    endtask
+
+    /* The frame proper, with the lead-in clocks removed. */
+    localparam integer LEAD = 2;
+
+    initial begin
+        $dumpfile("tb_dap_frame.vcd");
+        $dumpvars(0, tb_dap_frame);
+
+        restart;
+        dap0_d   = 1'b0;
+        saw_oe2  = 1'b0;
+
+        repeat (4) @(posedge clk);
+        rst = 1'b0;
+        repeat (2) @(posedge clk);
+
+        $display("sync: CMD 0x10, LEN 63, no data");
+        cmd   = 5'h10;
+        len   = 6'd63;
+        dbits = 6'd0;          /* sync carries LEN 63 and no data */
+        data  = 63'd0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+
+        check_eq("lead-in clocks", nbits - 19, LEAD);
+        /* The 19 frame bits, first transmitted bit in bit 0. */
+        check_eq("wire word", (captured >> LEAD) & 96'h7FFFF, 64'h09FE1);
+
+        /* Bit 18 is the trailing zero; bits 12..17 are the CRC. */
+        check_eq("crc", (captured >> (LEAD + 12)) & 96'h3F, 64'd9);
+
+        $display("LEN 0 frame: CMD 0x10, LEN 0");
+        restart;
+        len      = 6'd0;
+        dbits    = 6'd0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+
+        /* start + 5 + 6 + 0 + 6 + 1 = 19 bits here too. */
+        check_eq("len0 crc", (captured >> (LEAD + 12)) & 96'h3F, 64'd25);
+
+        /*
+         * Frames that carry a DATA field.
+         *
+         * The gap that mattered: everything above has no payload, and on
+         * hardware exactly those worked while every frame with data drew no
+         * reply at all.  The expected words come from the C builder, which is
+         * itself checked against the documented vectors - so this compares two
+         * implementations rather than the RTL against itself.
+         */
+        $display("client_set(1): CMD 0x1C, LEN 3, 3 data bits");
+        restart;
+        cmd      = 5'h1C;
+        len      = 6'd3;
+        dbits    = 6'd3;
+        data     = 63'd1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 22);
+        check_eq("client_set word", (captured >> LEAD) & 96'h3FFFFF, 64'h1B10F9);
+
+        $display("client_read CLIENT_ID: CMD 0x1A, LEN 7, 7 data bits");
+        restart;
+        cmd      = 5'h1A;
+        len      = 6'd7;
+        dbits    = 6'd7;
+        data     = 63'h4F;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 26);
+        check_eq("client_read word", (captured >> LEAD) & 96'h3FFFFFF, 64'h1ECF1F5);
+
+        $display("client_write IOCONF: CMD 0x08, LEN 16, 16 data bits");
+        restart;
+        cmd      = 5'h08;
+        len      = 6'd16;
+        dbits    = 6'd16;
+        data     = 63'h810;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("frame length", nbits - LEAD, 35);
+        check_eq("client_write word", (captured >> LEAD) & 96'h7FFFFFFFF, 64'h240810411);
+
+        $display("CRC: one bit per clock against two");
+        crc_equivalence;
+        check_eq("narrow and wide agree", {58'd0, crc_narrow_result}, {58'd0, c_wide_out});
+
+        /*
+         * Wide mode: the same frames, two bits per clock.
+         *
+         * DAP1 carries the even bits of the frame and DAP2 the odd ones, the
+         * start bit goes out on both lines together, and a field with an odd
+         * bit count picks up one pad bit which the CRC covers.  That last part
+         * is why these CRCs are not the narrow ones: CMD is five bits, so every
+         * frame gains a zero the checksum sees.  Getting the same answer as
+         * narrow would mean the pad was being skipped.
+         *
+         * The expected words come from an independent model of the polynomial
+         * and the interleave, not from running this design and writing down
+         * what it did.
+         */
+        wide = 1'b1;
+
+        $display("wide sync: CMD 0x10, LEN 63, no data");
+        restart;
+        cmd   = 5'h10;
+        len   = 6'd63;
+        dbits = 6'd0;
+        data  = 63'd0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* 1 start + 3 CMD + 3 LEN + 3 CRC + 1 trailing zero. */
+        check_eq("wide sync clocks",  nbits - LEAD, 11);
+        check_eq("wide sync dap1", (captured  >> LEAD) & 96'h7FF, 64'h179);
+        check_eq("wide sync dap2", (captured2 >> LEAD) & 96'h7FF, 64'h371);
+
+        $display("wide client_set(1): CMD 0x1C, LEN 3, 3 data bits");
+        restart;
+        cmd   = 5'h1C;
+        len   = 6'd3;
+        dbits = 6'd3;
+        data  = 63'd1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* An odd payload as well as an odd CMD, so two pad bits. */
+        check_eq("wide client_set clocks", nbits - LEAD, 13);
+        check_eq("wide client_set dap1", (captured  >> LEAD) & 96'h1FFF, 64'h9D);
+        check_eq("wide client_set dap2", (captured2 >> LEAD) & 96'h1FFF, 64'h15);
+
+        $display("wide client_read CLIENT_ID: CMD 0x1A, LEN 7, 7 data bits");
+        restart;
+        cmd   = 5'h1A;
+        len   = 6'd7;
+        dbits = 6'd7;
+        data  = 63'h4F;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("wide client_read clocks", nbits - LEAD, 15);
+        check_eq("wide client_read dap1", (captured  >> LEAD) & 96'h7FFF, 64'h35B9);
+        check_eq("wide client_read dap2", (captured2 >> LEAD) & 96'h7FFF, 64'h1197);
+
+        $display("wide client_write IOCONF: CMD 0x08, LEN 16, 16 data bits");
+        restart;
+        cmd   = 5'h08;
+        len   = 6'd16;
+        dbits = 6'd16;
+        data  = 63'h810;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        /* An even payload, so the only pad is CMD's. */
+        check_eq("wide client_write clocks", nbits - LEAD, 19);
+        check_eq("wide client_write dap1", (captured  >> LEAD) & 96'h7FFFF, 64'h241);
+        check_eq("wide client_write dap2", (captured2 >> LEAD) & 96'h7FFFF, 64'h9005);
+
+        /* DAP2 is an output only while wide mode is asked for.  Narrow mode
+         * leaves the pad alone, which is the whole reason the enable is
+         * separate from dat_oe. */
+        check_eq("dap2 driven in wide mode", {63'd0, saw_oe2}, 64'd1);
+        wide = 1'b0;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("dap2 released in narrow mode", {63'd0, saw_oe2}, 64'd0);
+
+        /*
+         * Raw frames: the host supplies the bits and the fabric shifts them.
+         *
+         * Checked against the assembled path rather than against a constant,
+         * which is the property that matters: feeding the sync frame's own
+         * wire word back in as raw data must put exactly the same bits on the
+         * wire.  If the two ever disagree, one of them is wrong and this says
+         * so without either being trusted.
+         */
+        $display("raw frame, narrow: sync's wire word fed back in");
+        wide = 1'b0;
+        raw  = 1'b1;
+        restart;
+        dbits = 6'd19;              /* start + 5 + 6 + 6 + trailing zero */
+        data  = 63'h09FE1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("raw narrow length", nbits - LEAD, 19);
+        check_eq("raw narrow word", (captured >> LEAD) & 96'h7FFFF, 64'h09FE1);
+
+        /*
+         * The same bits wide: one clock per pair, DAP1 taking the even
+         * positions and DAP2 the odd ones.  19 bits is odd, so the last pair
+         * is half a pair - the host is responsible for what rides in the unused
+         * half, and here it is the zero the shift register supplies.
+         */
+        $display("raw frame, wide: the same bits, two per clock");
+        wide = 1'b1;
+        restart;
+        dbits = 6'd19;
+        data  = 63'h09FE1;
+        @(posedge clk) start = 1'b1;
+        @(posedge clk) start = 1'b0;
+        wait (done);
+        @(posedge clk);
+        check_eq("raw wide clocks", nbits - LEAD, 10);
+        /* 0x09FE1, first bit on the wire in bit 0, split by position parity:
+         * the even bits make 0x079 and the odd ones 0x0BC.  Both come from a
+         * model of the split rather than from running this design - the first
+         * version of this line had 0x0F8 for the odd half, the design said
+         * 0x0BC, and the model agreed with the design. */
+        check_eq("raw wide dap1", (captured  >> LEAD) & 96'h3FF, 64'h079);
+        check_eq("raw wide dap2", (captured2 >> LEAD) & 96'h3FF, 64'h0BC);
+        raw  = 1'b0;
+        wide = 1'b0;
+
+        $display("");
+        if (errors == 0) begin
+            $display("PASSED (0 failures)");
+        end else begin
+            $display("FAILED (%0d failure%s)", errors, (errors == 1) ? "" : "s");
+        end
+        $finish;
+    end
+
+    /* A frame that never completes should not hang the run forever. */
+    initial begin
+        #500000;
+        $display("FAILED (timeout)");
+        $finish;
+    end
+endmodule
+
+`default_nettype wire
