@@ -419,6 +419,33 @@ static void resume_application(void);
  * reads idle high, the fabric latches a phantom start bit and issues trailing
  * clocks on top of it, and the *next* frame is the one that gets lost.
  */
+/*
+ * Which command code the dapisc telegram goes out as, from
+ * /api/dap_fpga?dcmd=N.
+ *
+ * 0x11 measured, not assumed.  The register spec gives 0x09 for both dapisc
+ * forms, but 0x09 is client_blockwrite - the blockwrite spec says so, and the
+ * device agrees: sent as 0x09 with LEN 48 the telegram desynchronises the link
+ * hard enough that the following attach reads CLIENT_ID 0x0000 at every trail
+ * value.  With 0x11 the link stays up.  So the register spec has the wrong
+ * opcode, and the reason dapisc never takes is something else.
+ *
+ * What is still unexplained is that no dapisc telegram is ever answered, while
+ * every other command is.  Attach does not depend on it landing - sync,
+ * client_set and client_read all work against the reset configuration - so
+ * nothing noticed until wide mode needed DAPISC.MODE changed.
+ *
+ * Kept overridable because finding the right opcode is one request per guess
+ * this way and one rebuild per guess otherwise.
+ */
+#define DAPISC_CMD_DEFAULT 0x11u
+static uint8_t s_dapisc_cmd = DAPISC_CMD_DEFAULT;
+
+void dap_probe_fpga_dapisc_cmd(int cmd)
+{
+    s_dapisc_cmd = (cmd < 0) ? DAPISC_CMD_DEFAULT : (uint8_t)(cmd & 0x1F);
+}
+
 static void send_dapisc_long(uint16_t value)
 {
     const uint64_t data = ((uint64_t)DAPISC_SIGNATURE << 16) | value;
@@ -426,7 +453,7 @@ static void send_dapisc_long(uint16_t value)
     uint16_t waited = 0;
 
     dap_phy_fpga_set_raw_window(true);
-    dap_phy_fpga_exchange(0x11u, 48, data, 48, 2, &reply, &waited);
+    dap_phy_fpga_exchange(s_dapisc_cmd, 48, data, 48, 2, &reply, &waited);
     dap_phy_fpga_set_raw_window(false);
 }
 
@@ -436,7 +463,7 @@ static void send_dapisc_short(uint16_t value)
     uint16_t waited = 0;
 
     dap_phy_fpga_set_raw_window(true);
-    dap_phy_fpga_exchange(0x11u, 16, value, 16, 2, &reply, &waited);
+    dap_phy_fpga_exchange(s_dapisc_cmd, 16, value, 16, 2, &reply, &waited);
     dap_phy_fpga_set_raw_window(false);
 }
 
@@ -455,7 +482,7 @@ static bool dapisc_write_read(uint8_t len_field, uint64_t data, size_t dbits,
     uint32_t reply = 0;
     uint16_t waited = 0;
 
-    const esp_err_t err = dap_phy_fpga_exchange(0x11u, len_field, data, dbits,
+    const esp_err_t err = dap_phy_fpga_exchange(s_dapisc_cmd, len_field, data, dbits,
                                                 16, &reply, &waited);
     *now = (uint16_t)reply;
     return err == ESP_OK;

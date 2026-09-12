@@ -188,6 +188,10 @@ esp_err_t dap_probe_fpga_route_check(void);
  * How far into the wide-mode sequence the route check should go, for bisecting
  * a step that wedges the target.  Zero, the default, runs all of it.
  */
+/* Which command code the dapisc telegram uses; negative restores the default.
+ * Bring-up scaffolding, see the note in dap_fpga_route.c. */
+void dap_probe_fpga_dapisc_cmd(int cmd);
+
 void dap_probe_fpga_wide_stage(int stage);
 
 /* Which capture taps stage 6 should use, one pair per request. */
