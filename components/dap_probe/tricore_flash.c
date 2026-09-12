@@ -810,6 +810,7 @@ static esp_err_t install_loader(void)
          * is never written and the others land at their own index.
          */
         uint32_t two[3] = {0};
+        uint32_t ioaddr_tail = 0;
         for (int i = 0; i < 3; i++) {
             dap_probe_write32(LOADER_BUFFER + 0xC0u + 4u * i, 0xDEADBEEFu);
         }
@@ -821,6 +822,24 @@ static esp_err_t install_loader(void)
         ESP_LOGW(TAG, "  two-word block write: %s -> %08" PRIX32 " %08" PRIX32
                       " %08" PRIX32, esp_err_to_name(bw3), two[0], two[1],
                  two[2]);
+
+        /*
+         * Where the device left IOADDR.
+         *
+         * IO_READ_WORD with no IO_SET_ADDRESS in front of it reads from
+         * whatever IOADDR holds, so this reads the device's own pointer back
+         * rather than trusting that the address field was understood.  After
+         * two words at A it should be A+8, whose content is still the
+         * 0xDEADBEEF marker - a different value, or an error, says the address
+         * never landed where this end thinks it did.
+         */
+        dap_exchange_t tail = {0};
+        const esp_err_t te = dap_probe_client_read(DAP_IO_READ_WORD, 5, 32,
+                                                   &tail);
+        ESP_LOGW(TAG, "  IOADDR after the block write reads %s -> 0x%08" PRIX32
+                      " (A+8 holds the marker)", esp_err_to_name(te),
+                 (uint32_t)tail.reply);
+        ioaddr_tail = (uint32_t)tail.reply;
 
         /*
          * The same eight words again, without the address field.
@@ -867,9 +886,9 @@ static esp_err_t install_loader(void)
             char why[256];
             snprintf(why, sizeof(why),
                      "bw probe: %s, 8w %08" PRIX32 " %08" PRIX32
-                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", divs:%s",
+                     ", 1w %08" PRIX32 ", asm %08" PRIX32 ", tail %08" PRIX32 ", divs:%s",
                      esp_err_to_name(bw), back[0], back[1],
-                     one_back, (uint32_t)assembled, line);
+                     one_back, (uint32_t)assembled, ioaddr_tail, line);
             set_phase(TRICORE_FLASH_FAILED, why);
             return ESP_FAIL;
         }
