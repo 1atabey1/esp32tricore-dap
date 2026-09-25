@@ -6,6 +6,7 @@
 #include "dap_probe.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,10 +28,23 @@ static const char *TAG = "DAP_TRACE";
 #define TRACE_PARAGRAPH     0x400u          /* 1 kB, the framing unit */
 #define TRACE_WORDS_PER_PAR (TRACE_PARAGRAPH / 4u)
 
-/* Output ring in PSRAM: eight TRAMs of slack against WiFi latency spikes. */
-#define TRACE_RING_BYTES    (64u * 1024u)
+/* Pointer registers hold a TRAM offset in bits [12:5]. */
+#define TRACE_PTR_MASK      0x1FE0u
+
+/* Output ring: 1 MB in PSRAM is ~0.5 s of slack at 2 MB/s against WiFi stalls;
+ * internal RAM fallback is small. */
+#define TRACE_RING_PSRAM    (1024u * 1024u)
+#define TRACE_RING_INTERNAL (64u * 1024u)
+#define TRACE_RING_BYTES    s_ring_bytes
+
+/* Paragraphs kept between the writer and the oldest one read (see drain_to). */
+#define TRACE_MARGIN        3u
+
+/* FIFOOVRCNT only feeds a statistic; read it every n-th poll. */
+#define TRACE_OVRCNT_EVERY  16u
 
 static uint8_t          *s_ring;
+static size_t            s_ring_bytes;
 static size_t            s_ring_head;      /* next write */
 static size_t            s_ring_tail;      /* next read */
 static SemaphoreHandle_t s_lock;
@@ -40,6 +54,7 @@ static uint32_t s_bot, s_top;              /* FIFO bounds, byte offsets */
 static uint32_t s_span;                    /* top - bot + 1 */
 static uint32_t s_next_par;                /* paragraph index we expect next */
 static uint32_t s_last_ovrcnt;
+static uint32_t s_pending_lost;            /* lost paragraphs not yet flagged */
 static uint32_t s_seq;
 static dap_trace_stats_t s_stats;
 static TaskHandle_t s_task;
@@ -61,10 +76,11 @@ static size_t ring_free(void)
 
 static void ring_put(const uint8_t *src, size_t len)
 {
-    for (size_t i = 0; i < len; i++) {
-        s_ring[s_ring_head] = src[i];
-        s_ring_head = (s_ring_head + 1u) % TRACE_RING_BYTES;
-    }
+    const size_t first = (len < TRACE_RING_BYTES - s_ring_head)
+                       ? len : TRACE_RING_BYTES - s_ring_head;
+    memcpy(s_ring + s_ring_head, src, first);
+    memcpy(s_ring, src + first, len - first);
+    s_ring_head = (s_ring_head + len) % TRACE_RING_BYTES;
 }
 
 /* Publish one paragraph, or drop it whole (and count it) if the ring is full. */
@@ -102,8 +118,12 @@ esp_err_t dap_trace_start(void)
     if (err != ESP_OK) {
         return err;
     }
+    /* Core 0: WiFi and lwIP are pinned to core 1.  The 8 kB TRAM fills in
+     * ~5 ms at 1.8 MB/s, far below one 10 ms tick, so the drain busy-polls
+     * above the other core-0 tasks; IDLE0 starves meanwhile. */
+    esp_task_wdt_delete(xTaskGetIdleTaskHandleForCore(0));
     if (s_task == NULL &&
-        xTaskCreate(trace_task, "dap_trace", 4096, NULL, 6, &s_task) != pdPASS) {
+        xTaskCreatePinnedToCore(trace_task, "dap_trace", 4096, NULL, 12, &s_task, 0) != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "could not start the drain task");
         return ESP_ERR_NO_MEM;
@@ -114,12 +134,14 @@ esp_err_t dap_trace_start(void)
 static esp_err_t trace_begin(void)
 {
     if (s_ring == NULL) {
-        s_ring = heap_caps_malloc(TRACE_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_ring_bytes = TRACE_RING_PSRAM;
+        s_ring = heap_caps_malloc(s_ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_ring == NULL) {
-            s_ring = heap_caps_malloc(TRACE_RING_BYTES, MALLOC_CAP_8BIT);
+            s_ring_bytes = TRACE_RING_INTERNAL;
+            s_ring = heap_caps_malloc(s_ring_bytes, MALLOC_CAP_8BIT);
         }
         if (s_ring == NULL) {
-            ESP_LOGE(TAG, "no room for a %u byte ring", (unsigned)TRACE_RING_BYTES);
+            ESP_LOGE(TAG, "no room for a %u byte ring", (unsigned)s_ring_bytes);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -156,6 +178,7 @@ static esp_err_t trace_begin(void)
     const uint32_t now_par = ((now - bot) % s_span) / TRACE_PARAGRAPH;
     s_next_par     = now_par;
     s_last_ovrcnt  = ovr;
+    s_pending_lost = 0;
     s_seq          = 0;
     s_ring_head    = 0;
     s_ring_tail    = 0;
@@ -176,6 +199,39 @@ void dap_trace_stop(void)
 {
     s_running = false;
     s_stats.running = false;
+    /* The task leaves after its current pass; do not hold the DAP lock here. */
+    for (int i = 0; i < 100 && s_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+static esp_err_t drain_to(uint32_t now, uint32_t ovr);
+
+esp_err_t dap_trace_finish(void)
+{
+    static uint32_t words[TRACE_WORDS_PER_PAR];
+    uint32_t now = 0;
+
+    if (s_ring == NULL || s_span == 0u) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dap_probe_read32(TRACE_FIFONOW, &now) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+    now &= TRACE_PTR_MASK;
+    s_running = true;
+    drain_to(now, s_last_ovrcnt);              /* complete paragraphs */
+    s_running = false;
+
+    /* The paragraph NOW points into ends with <endoftrace>. */
+    const uint32_t par = ((now - s_bot) % s_span) / TRACE_PARAGRAPH;
+    if (dap_probe_blockread(TRACE_TRAM_BASE + s_bot + par * TRACE_PARAGRAPH, words,
+                            TRACE_WORDS_PER_PAR) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+    publish(par, words, 0);
+    s_stats.running = false;
+    return ESP_OK;
 }
 
 /* A drain pass for a given write pointer; FIFONOW is not DAP-writable, so the
@@ -199,31 +255,63 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     uint32_t available = (now_par + total_par - s_next_par) % total_par;
 
     /* Lapped (no ERR for this): everything unread is lost; resume at the
-     * pointer's paragraph and flag a gap. */
-    uint32_t lost = 0;
+     * pointer's paragraph and flag a gap on the next record published. */
+    uint32_t lost = s_pending_lost;
     if (available >= total_par - 1u && available != 0u) {
-        lost = available - (total_par - 1u) + 1u;
+        const uint32_t n = available;           /* all skipped: the oldest is torn */
+        lost += n;
         s_stats.laps++;
-        s_stats.lost += lost;
+        s_stats.lost += n;
         s_next_par = now_par;
         available  = 0;
         ESP_LOGW(TAG, "TRAM lapped: %" PRIu32 " paragraphs lost, resuming at %" PRIu32,
                  lost, now_par);
     }
 
+    /* Behind the writer: drop the oldest paragraphs (the ones it overwrites
+     * next) so at least TRACE_MARGIN separate it from the first one read. */
+    if (available + TRACE_MARGIN > total_par) {
+        const uint32_t n = available + TRACE_MARGIN - total_par;
+        lost += n;
+        s_stats.lost += n;
+        s_stats.laps++;
+        s_next_par = (s_next_par + n) % total_par;
+        available -= n;
+    }
+
+    /* The writer must cross `margin` paragraphs before it reaches the oldest
+     * unread one; each read paragraph shifts that by one. */
     const uint32_t to_read = available;
-    while (available--) {
+    const uint32_t margin  = total_par - available;
+    for (uint32_t i = 0; i < to_read; i++) {
         const uint32_t addr = TRACE_TRAM_BASE + s_bot + s_next_par * TRACE_PARAGRAPH;
 
         if (dap_probe_blockread(addr, words, TRACE_WORDS_PER_PAR) != ESP_OK) {
             s_stats.read_errors++;
             dap_probe_clear_error_state();
+            s_pending_lost = lost;
             return ESP_ERR_TIMEOUT;
+        }
+
+        /* Torn if the writer reached this paragraph while it was read. */
+        uint32_t w = now;
+        if (dap_probe_read32(TRACE_FIFONOW, &w) == ESP_OK) {
+            const uint32_t w_par = (((w & TRACE_PTR_MASK) - s_bot) % s_span) / TRACE_PARAGRAPH;
+            const uint32_t moved = (w_par + total_par - now_par) % total_par;
+            if (moved >= margin + i) {
+                const uint32_t n = to_read - i;
+                lost += n;
+                s_stats.laps++;
+                s_stats.lost += n;
+                s_next_par = w_par;
+                break;
+            }
         }
         publish(s_next_par, words, lost);
         lost = 0;                       /* the marker belongs to one record only */
         s_next_par = (s_next_par + 1u) % total_par;
     }
+    s_pending_lost = lost;
 
     const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
     if (us > s_stats.poll_us_max) {
@@ -240,16 +328,18 @@ esp_err_t dap_trace_poll(void)
         return ESP_OK;
     }
 
-    uint32_t now = 0, ovr = 0;
+    static uint32_t polls;
+    uint32_t now = 0, ovr = s_last_ovrcnt;
     if (dap_probe_read32(TRACE_FIFONOW, &now) != ESP_OK) {
         s_stats.read_errors++;
         dap_probe_clear_error_state();
         return ESP_ERR_TIMEOUT;
     }
-    if (dap_probe_read32(TRACE_FIFOOVRCNT, &ovr) != ESP_OK) {
+    if ((polls++ % TRACE_OVRCNT_EVERY) == 0u &&
+        dap_probe_read32(TRACE_FIFOOVRCNT, &ovr) != ESP_OK) {
         ovr = s_last_ovrcnt;
     }
-    return drain_to(now, ovr);
+    return drain_to(now & TRACE_PTR_MASK, ovr);
 }
 
 /* Drain task: never sleeps while data waits (read time is close to the arrival
@@ -259,14 +349,13 @@ static void trace_task(void *arg)
     (void)arg;
     while (s_running) {
         const esp_err_t err = dap_trace_poll();
-        if (err == ESP_ERR_NOT_FOUND) {
-            vTaskDelay(pdMS_TO_TICKS(2));
-        } else if (err != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(10));   /* a read failed; back off a little */
+        if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+            vTaskDelay(1);                   /* a read failed; back off one tick */
         } else {
-            taskYIELD();
+            taskYIELD();                     /* one tick (10 ms) would lap the TRAM */
         }
     }
+    esp_task_wdt_add(xTaskGetIdleTaskHandleForCore(0));
     s_task = NULL;
     vTaskDelete(NULL);
 }
@@ -279,10 +368,13 @@ size_t dap_trace_read(uint8_t *out, size_t max)
         return 0;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    while (n < max && s_ring_tail != s_ring_head) {
-        out[n++] = s_ring[s_ring_tail];
-        s_ring_tail = (s_ring_tail + 1u) % TRACE_RING_BYTES;
-    }
+    const size_t used = ring_used();
+    n = (used < max) ? used : max;
+    const size_t first = (n < TRACE_RING_BYTES - s_ring_tail)
+                       ? n : TRACE_RING_BYTES - s_ring_tail;
+    memcpy(out, s_ring + s_ring_tail, first);
+    memcpy(out + first, s_ring, n - first);
+    s_ring_tail = (s_ring_tail + n) % TRACE_RING_BYTES;
     s_stats.queue_free = (uint32_t)ring_free();
     xSemaphoreGive(s_lock);
     return n;

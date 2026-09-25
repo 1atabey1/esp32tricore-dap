@@ -102,6 +102,7 @@ extern SemaphoreHandle_t capture_done_semaphore;
 
 void flash_web_register(httpd_handle_t server);
 void dap_web_register(httpd_handle_t server);
+void mcds_web_register(httpd_handle_t server);
 
 static const char *TAG = "web-server";
 
@@ -2248,7 +2249,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
      * so a cap set too low takes the *last* endpoints registered off the air
      * with no sign of it but a 404.  Kept well clear of the count.
      */
-    config.max_uri_handlers = 56;
+    config.max_uri_handlers = 64;
     config.stack_size = 10240;
     /*
      * The trace websocket holds one socket for the length of a capture, and
@@ -2277,6 +2278,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
 
     /* DAP/trace/FPGA endpoints and the flasher, from the modules that own them. */
     dap_web_register(*http_handle);
+    mcds_web_register(*http_handle);
     flash_web_register(*http_handle);
     httpd_register_uri_handler(*http_handle, &uri_help);
     //httpd_register_uri_handler(*http_handle, &uri_logic_analyzer_data);

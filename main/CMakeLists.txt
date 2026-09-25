@@ -8,6 +8,7 @@ set(sources
     network/web_server.c
     network/flash_web.c
     network/dap_web.c
+    network/mcds_web.c
     network/network_mngr_ota.c
     network/descriptors.c
     network/uart_websocket.c
@@ -51,6 +52,7 @@ idf_component_register(
         "web/website.html"
         "web/logic_analyzer.html"
         "web/trace.html"
+        "web/datatrace.html"
         "web/flash.html"
         "web/help.html"
         "web/ez32.svg"

@@ -1,0 +1,26 @@
+[project]
+name = "mcds-trace"
+version = "0.1.0"
+description = "Capture, decode and plot TC3xx miniMCDS data/watch-point traces from the esp32jtag probe"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "websocket-client>=1.7",
+]
+
+[project.scripts]
+mcds-trace = "mcds_trace.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcds_trace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

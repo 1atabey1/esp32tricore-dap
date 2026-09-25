@@ -49,12 +49,16 @@ typedef struct {
     uint32_t poll_us_max;    /* slowest drain pass, to size the poll interval */
 } dap_trace_stats_t;
 
-/* Start draining the trace FIFO.  Needs OCDS enabled; MCDS configuration is
- * left to the host. */
+/* Start draining the trace FIFO.  Needs OCDS enabled and the miniMCDS
+ * configured (dap_mcds_start, or a host tool). */
 esp_err_t dap_trace_start(void);
 
-/* Stop draining.  The FIFO is left as it is, so a capture can be resumed. */
+/* Stop draining (waits for the drain task).  The FIFO is left as it is. */
 void dap_trace_stop(void);
+
+/* After tracing was flushed and the drain stopped: publish what is left,
+ * including the last, partial paragraph (it ends with <endoftrace>). */
+esp_err_t dap_trace_finish(void);
 
 /* One drain pass (normally run by the drain task).  No-op when stopped;
  * ESP_ERR_NOT_FOUND when nothing was waiting. */

@@ -345,8 +345,10 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
  * the capture.
  */
 
-#define TRACE_WS_CHUNK   4096
-#define TRACE_WS_IDLE_MS 5
+/* 16 kB frames keep per-frame overhead low at MB/s rates.  Idle wait is one
+ * tick (10 ms at CONFIG_FREERTOS_HZ=100); the 1 MB drain ring covers it. */
+#define TRACE_WS_CHUNK   16384
+#define TRACE_WS_IDLE_MS 10
 
 static httpd_handle_t s_trace_ws_hd;
 static int            s_trace_ws_fd = -1;
@@ -365,9 +367,9 @@ static void trace_ws_close(void)
 static void trace_ws_task(void *arg)
 {
     uint8_t *buf = heap_caps_malloc(TRACE_WS_CHUNK,
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (buf == NULL) {
-        buf = heap_caps_malloc(TRACE_WS_CHUNK, MALLOC_CAP_8BIT);
+        buf = heap_caps_malloc(TRACE_WS_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (buf == NULL) {
         ESP_LOGE(TAG, "trace ws: no buffer");
@@ -427,8 +429,9 @@ static esp_err_t trace_ws_handler(httpd_req_t *req)
         s_trace_ws_fd  = httpd_req_to_sockfd(req);
         s_trace_ws_run = true;
 
-        if (xTaskCreate(trace_ws_task, "trace_ws", 4096, NULL, 5,
-                        &s_trace_ws_task) != pdPASS) {
+        /* Core 1 with WiFi/lwIP; the TRAM drain owns core 0. */
+        if (xTaskCreatePinnedToCore(trace_ws_task, "trace_ws", 4096, NULL, 5,
+                                    &s_trace_ws_task, 1) != pdPASS) {
             ESP_LOGE(TAG, "trace ws: could not start the sender");
             trace_ws_close();
             return ESP_FAIL;

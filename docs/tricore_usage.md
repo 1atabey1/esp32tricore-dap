@@ -75,7 +75,8 @@ Wide mode halts the application while P21.7 is borrowed as DAP2, then restores i
 ## 5. Trace (miniMCDS TRAM drain)
 
 Browser: `http://<board>/trace.html` (Start capture / Stop / Self-test / Save; stream over `ws://<board>/ws/trace`).
-MCDS trace configuration is the host's job; the probe only drains.
+This page drains a TRAM configured by someone else (e.g. a host tool); for probe-configured
+data/watch-point trace use 5b.
 
 ```sh
 curl -u admin:admin http://<board>/api/dap_trace/start
@@ -87,6 +88,42 @@ curl -u admin:admin http://<board>/api/dap_trace/selftest   # drain check withou
 
 Stream = `dap_trace_record_t` header (magic `DTRP`, seq, offset, length, gap flag, lost) + 1 kB paragraph.
 One WebSocket client at a time.
+
+## 5b. Data trace / watch-points (DTU + WTU)
+
+Browser: `http://<board>/datatrace.html` (tab "TriCore Data Trace").
+
+1. Source: CPU pipeline (what that CPU loads/stores), CPU memory slave (any master into its DSPR/PSPR), LMU0.
+2. Mode: *Full trace* (address and/or value of every matching access) or *Compact watchpoint timestamping*
+   (one 12-bit WPS per hit).
+3. Up to two slots: address, size (bytes; larger = watch a whole struct), access r / w / rw,
+   optional value filter (low..high after mask, signed).
+4. Timestamps: per hit (default), ticks (every cycle, +~850 kB/s), none.
+5. *Start* asks for a file (Chrome/Edge save picker; other browsers download at the end), streams,
+   *Stop* flushes and closes the file.
+
+CLI instead of the page (same file format):
+
+```sh
+curl -u admin:admin -X POST --data-binary @cfg.json http://<board>/api/mcds/config
+cd tools/mcds_trace
+uv run mcds-trace capture <board> run.mcds --seconds 5 --start
+uv run mcds-trace decode run.mcds --plot                    # or --plot out.png --window 0.1:0.11
+uv run mcds-trace decode run.mcds --csv events.csv --elf app.elf
+```
+
+`cfg.json`:
+
+```json
+{"source": "cpu", "cpu": 0, "mode": "full", "payload": "addr_data", "timestamps": "hit",
+ "slots": [{"enabled": true, "name": "tick", "addr": "0x7001A08C", "size": 4, "access": "w",
+            "value": {"enabled": false, "lo": "0", "hi": "0xFFFFFFFF", "mask": "0xFFFFFFFF"}},
+           {"enabled": false}]}
+```
+
+The decode summary always states losses: gaps (probe lapped / ring full), ERR (target FIFO overflow).
+Lossless up to ~850 kB/s of trace; heavier loads lose (flagged) paragraphs.
+Addresses are compared as the source sees them (cached 0x8…/0x9… ≠ uncached 0xA…/0xB…).
 
 ## 6. Bring-up diagnostics (CPU DAP path)
 

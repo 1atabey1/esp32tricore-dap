@@ -43,6 +43,7 @@ flash programming, trace drain and a Black Magic Probe (BMP) GDB target.
 | `tricore_flash.c`, `include/tricore_flash.h` | Flash layout, erase/program/verify, sessions |
 | `tricore_flash_loader.c`, `tricore_flash_priv.h` | Loader stub (from tas-debug), reset-and-halt, trap dump |
 | `dap_trace.c`, `include/dap_trace.h` | TRAM drain, stream records |
+| `dap_mcds.c`, `include/dap_mcds.h` | miniMCDS setup for data trace (DTU) / watch-points (WTU) |
 | `test/` | Host unit test for `dap_frame.c` (`make -C test`) |
 
 Web glue: `main/network/dap_web.c` (DAP, trace, FPGA image, GDB registration),
@@ -97,6 +98,25 @@ reports `busy`.
 - Halts use Cerberus trigger line 1, shared by all cores: `tricore_halt_request` disarms
   EXEVT on the other running cores first, so only the requested core stops.
 - `gdb_thread` stack is 16 KB (`main/main.c`); `/api/dap_gdb/status` reports `gdb_stack_free`.
+
+## Data / watch-point trace (miniMCDS)
+
+Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
+
+- Slot j = DTU comparator set j: `TCXEA*` address range, `TCXAC*` access pulse
+  (pattern bit 12 WR / 13 RD, one cycle per transaction), `TCXWD*` value (byte lane from address).
+- ANDed in MCXEVT8 (slot 0) / MCXEVT10 (slot 1): the Table 394 columns carrying all six DTU triggers.
+- Full: MCXACT27-30 (`dtu_wdat/wadr/rdat/radr`) level on the slot events.
+  Compact: MCXACT5/6 (`wtu_enable[j]`) edge → 12-bit WPS.
+- Time: TSR per paragraph (`tsu_rel_sync` on `sync_rq`), plus per hit (`hit`), or `<tick>` (`ticks`, ~850 kB/s idle).
+- Start: OCDS/EECTRC, MCDS reset, MUX_TC_RC then MUX, TROFF, actions, events, comparators,
+  FIFO ring (BOT 0, TOP 1FFF, PRE 1FE0, WARN 0), TRAM filled with FFFFFFFF, TRON, CLR.
+  Stop: SET (flush), drain incl. the last partial paragraph, MCDS reset.
+- Drain: core 0, prio 12, busy-poll (FreeRTOS tick is 10 ms; the 8 kB TRAM fills in ~5 ms);
+  keeps 3 paragraphs margin to the writer, re-checks FIFONOW after each read (torn → dropped, flagged).
+  1 MB PSRAM ring → `/ws/trace` (core 1, 16 kB frames). WiFi/lwIP pinned to core 1.
+- Measured: lossless 850 kB/s for 5 s over WiFi. TRAM reads slow down under heavy trace writes
+  (spec: SRI reads are delayed while MCDS writes), so ~1.6 MB/s offered loses most paragraphs (flagged).
 
 ## Known limits
 
