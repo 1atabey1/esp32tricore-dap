@@ -62,8 +62,8 @@ def build_series(events: list[Event], config: dict, symbols: dict | None = None,
                 slot = next((s for s in slots if s['lo'] <= ev.addr <= s['hi']), None)
                 if symbols and ev.addr in symbols:
                     name = symbols[ev.addr]
-                elif slot and slot['lo'] == slot['hi'] - 3 and ev.addr == slot['lo']:
-                    name = slot['name']
+                elif slot and slot['hi'] - slot['lo'] < 4:
+                    name = slot['name']                  # a single variable
                 elif slot:
                     name = '%s+0x%X' % (slot['name'], ev.addr - slot['lo'])
                 else:
