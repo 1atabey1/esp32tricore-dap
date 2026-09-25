@@ -6,6 +6,7 @@ import base64
 import json
 import signal
 import time
+import urllib.error
 import urllib.request
 
 import websocket
@@ -18,6 +19,19 @@ def _get(host: str, path: str, auth: str, timeout: float = 30) -> str:
     req.add_header('Authorization', 'Basic ' + base64.b64encode(auth.encode()).decode())
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode(errors='replace')
+
+
+def post_config(host: str, auth: str, config: dict) -> dict:
+    """POST /api/mcds/config; returns the configuration the probe accepted."""
+    req = urllib.request.Request('http://%s/api/mcds/config' % host,
+                                 data=json.dumps(config).encode(), method='POST')
+    req.add_header('Authorization', 'Basic ' + base64.b64encode(auth.encode()).decode())
+    req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError('probe rejected the config: %s' % e.read().decode(errors='replace').strip())
 
 
 def trace_config(host: str, auth: str) -> dict:

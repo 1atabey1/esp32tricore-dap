@@ -1,12 +1,15 @@
 """mcds-trace: capture, decode and plot miniMCDS data / watch-point traces.
 
-    mcds-trace capture HOST OUT.mcds [--seconds N] [--start]
+    mcds-trace capture HOST OUT.mcds --watch ADDR:SIZE[:ACCESS[:NAME]] [--cpu N] [--seconds N]
+    mcds-trace capture HOST OUT.mcds --config CFG.json [--seconds N]
+    mcds-trace capture HOST OUT.mcds --start          # config already on the probe
     mcds-trace decode FILE.mcds [--csv OUT] [--plot [PNG]] [--elf APP.elf] [--signed]
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from . import analyse, capfile, capture, decode
@@ -29,8 +32,52 @@ def _symbols(elf: str) -> dict:
     return syms
 
 
+def _watch(spec: str) -> dict:
+    """ADDR:SIZE[:ACCESS[:NAME]] -> one slot, e.g. 0x5000220C:2:w:mCyclesUntilSecond."""
+    parts = spec.split(':')
+    if len(parts) < 2:
+        raise SystemExit('--watch needs ADDR:SIZE[:ACCESS[:NAME]], got %r' % spec)
+    access = parts[2] if len(parts) > 2 and parts[2] else 'w'
+    if access not in ('r', 'w', 'rw'):
+        raise SystemExit('--watch access must be r, w or rw, got %r' % access)
+    return {'enabled': True, 'addr': parts[0], 'size': int(parts[1], 0), 'access': access,
+            'name': parts[3] if len(parts) > 3 else parts[0]}
+
+
+def _build_config(a) -> dict | None:
+    """The configuration to POST, from --config and/or --watch; None if neither."""
+    if not a.config and not a.watch:
+        return None
+    cfg = {}
+    if a.config:
+        with open(a.config) as f:
+            cfg = json.load(f)
+    for key in ('source', 'cpu', 'mode', 'payload', 'timestamps', 'dap_div'):
+        val = getattr(a, key)
+        if val is not None:
+            cfg[key] = val
+    if a.watch:
+        if len(a.watch) > 2:
+            raise SystemExit('at most two --watch slots (one DTU comparator set each)')
+        slots = [_watch(w) for w in a.watch]
+        cfg['slots'] = slots + [{'enabled': False}] * (2 - len(slots))
+    return cfg
+
+
 def cmd_capture(a) -> int:
-    res = capture.capture(a.host, a.out, a.auth, a.seconds, a.start)
+    cfg = _build_config(a)
+    if cfg is not None:
+        try:
+            applied = capture.post_config(a.host, a.auth, cfg)
+        except (RuntimeError, OSError) as e:
+            print('error:', e, file=sys.stderr)
+            return 1
+        for s in applied.get('slots', []):
+            if s.get('enabled'):
+                print('watch %-24s %s size %s %s' % (s['name'], s['addr'], s['size'], s['access']))
+        print('source %s cpu %s, %s, timestamps %s' % (applied.get('source'), applied.get('cpu'),
+                                                        applied.get('mode'), applied.get('timestamps')))
+    res = capture.capture(a.host, a.out, a.auth, a.seconds, a.start or cfg is not None)
     print('%(bytes)d bytes in %(frames)d frames, %(seconds).1f s' % res)
     return 0
 
@@ -85,6 +132,16 @@ def main(argv=None) -> int:
     c.add_argument('--seconds', type=float)
     c.add_argument('--start', action='store_true',
                    help='start with the configuration stored on the probe, stop at the end')
+    g = c.add_argument_group('configuration (posted to the probe; implies --start)')
+    g.add_argument('--config', help='JSON file, as the web page sends it')
+    g.add_argument('--watch', action='append', metavar='ADDR:SIZE[:ACCESS[:NAME]]',
+                   help='a watch slot, e.g. 0x5000220C:2:w:mCyclesUntilSecond (repeat for slot 1)')
+    g.add_argument('--source', choices=['cpu', 'memslave', 'lmu0'])
+    g.add_argument('--cpu', type=int, help='CPU for the cpu / memslave sources')
+    g.add_argument('--mode', choices=['full', 'compact'])
+    g.add_argument('--payload', choices=['addr_data', 'data', 'addr'])
+    g.add_argument('--timestamps', choices=['hit', 'ticks', 'none'])
+    g.add_argument('--dap-div', dest='dap_div', type=int, help='DAP clock divider (0 = 24 MHz)')
     c.set_defaults(fn=cmd_capture)
 
     d = sub.add_parser('decode', help='decode (and plot) a capture file')

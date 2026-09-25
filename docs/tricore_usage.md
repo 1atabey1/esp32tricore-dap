@@ -105,14 +105,16 @@ Browser: `http://<board>/datatrace.html` (tab "TriCore Data Trace").
 CLI instead of the page (same file format):
 
 ```sh
-curl -u admin:admin -X POST --data-binary @cfg.json http://<board>/api/mcds/config
 cd tools/mcds_trace
-uv run mcds-trace capture <board> run.mcds --seconds 5 --start
+# posts the config, starts, streams 2 s, stops (up to two --watch slots)
+uv run mcds-trace capture <board> run.mcds --cpu 2 --watch 0x5000220C:2:w:mCyclesUntilSecond --seconds 2
+uv run mcds-trace capture <board> run.mcds --config cfg.json --seconds 2   # flags override the file
 uv run mcds-trace decode run.mcds --plot                    # or --plot out.png --window 0.1:0.11
 uv run mcds-trace decode run.mcds --csv events.csv --elf app.elf
 ```
 
-`cfg.json`:
+`--watch ADDR:SIZE[:ACCESS[:NAME]]`, plus `--source`, `--cpu`, `--mode`, `--payload`,
+`--timestamps`, `--dap-div`. Value filters need `--config`. `cfg.json`:
 
 ```json
 {"source": "cpu", "cpu": 0, "mode": "full", "payload": "addr_data", "timestamps": "hit",

@@ -5,7 +5,9 @@ firmware `components/dap_probe/dap_mcds.c`). Own decoder, no Infineon libraries.
 
 ```sh
 cd tools/mcds_trace
-uv run mcds-trace capture 192.168.178.99 run.mcds --seconds 5 --start   # uses the config stored on the probe
+uv run mcds-trace capture 192.168.178.99 run.mcds --cpu 2 --watch 0x5000220C:2:w:mCyclesUntilSecond --seconds 2
+uv run mcds-trace capture 192.168.178.99 run.mcds --config cfg.json --mode compact --seconds 2
+uv run mcds-trace capture 192.168.178.99 run.mcds --seconds 5 --start   # config already on the probe
 uv run mcds-trace decode run.mcds                     # summary: message types, gaps, ERR, clock
 uv run mcds-trace decode run.mcds --plot              # value/time per variable + interval histogram
 uv run mcds-trace decode run.mcds --plot out.png --window 0.10:0.11
