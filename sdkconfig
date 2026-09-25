@@ -2359,7 +2359,6 @@ CONFIG_WIFI_PROV_STA_ALL_CHANNEL_SCAN=y
 #
 # Infineon DAP probe
 #
-# CONFIG_AEL_DAP_BRINGUP_AT_BOOT is not set
 CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ=400000
 # end of Infineon DAP probe
 # end of Component config

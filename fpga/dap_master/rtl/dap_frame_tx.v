@@ -1,24 +1,12 @@
 /*
- * Assemble and clock out one DAP frame.
+ * Assemble and clock out one DAP frame, all fields LSB first:
  *
- * A frame is, in transmission order and all LSB first:
+ *     lead (0s) | start bit (1) | CMD (5) | LEN (6) | DATA (LEN) | CRC6 | trailing zero
  *
- *     start bit (1) | CMD (5) | LEN (6) | DATA (LEN) | CRC6 | trailing zero
- *
- * The CRC covers CMD, LEN and DATA - not the start bit, not itself, not the
- * trailing zero.  Bit order is the part that bites: the documented sync wire
- * word 0x09FE1 only comes out if the *first bit on the wire is bit 0* of the
- * integer.  The other convention gives 0x23FC8, so that vector doubles as a
- * statement about byte order and is what tb_dap_frame checks.
- *
- * Two clocks with the line held low precede every frame, not just the first.
- * That was measured, not documented: a frame sent straight after the previous
- * exchange is silently discarded, and that holds for sync itself.  The device
- * needs the idle run to recognise a frame start.
- *
- * dap0 is generated here rather than left to the caller so the frame and its
- * clock cannot drift apart: one bit is presented, then one full clock period.
- * The target latches on the rising edge.
+ * The CRC covers CMD, LEN and DATA.  First bit on the wire is bit 0: sync is
+ * 0x09FE1 (tb_dap_frame checks it).  The device needs the low lead-in before
+ * every frame, sync included.  dap0 is generated here; the target latches on
+ * the rising edge.
  */
 
 `default_nettype none
@@ -34,53 +22,23 @@ module dap_frame_tx #(
     input  wire [DIV_WIDTH-1:0]  div,
     input  wire                  start,      /* pulse to begin a frame */
     input  wire [4:0]            cmd,
-    /*
-     * LEN is the field that goes on the wire; data_bits is how many DATA bits
-     * actually follow it.  They are not the same thing and conflating them is
-     * a real trap: sync carries LEN 63 with *no* data at all, so a serialiser
-     * that treats LEN as the payload width sends 63 bits of nothing and the
-     * device ignores the frame.
-     */
+    /* LEN is the wire field; data_bits is how many DATA bits follow.  Sync has
+     * LEN 63 and no data. */
     input  wire [5:0]            len,
     input  wire [5:0]            data_bits,
     input  wire [62:0]           data,
-    /*
-     * Clocks with the line low before the frame proper.
-     *
-     * A register rather than a constant, for the same reason TRAIL and MAXWAIT
-     * are: it is the one part of the framing that was found empirically, the
-     * notes on the CPU path record eleven as the measured value while the
-     * constant here said two, and the next target will have to be swept again.
-     */
+    /* Clocks with the line low before the frame proper. */
     input  wire [5:0]            lead,
     /*
-     * Wide mode: two bits per DAP0 clock, the even bits of the frame on DAP1
-     * and the odd ones on DAP2.
-     *
-     * Sampled once when the frame is loaded rather than used live, so a host
-     * that flips the flag between frames cannot produce half a frame in each
-     * mode.  It changes three things and nothing else: the fields shift two
-     * positions per clock instead of one, every field's last index halves, and
-     * a field with an odd bit count picks up one pad bit.  The pad is whatever
-     * the shift register zero-fills with, which is 0 - required for CMD, and
-     * ignored by the device everywhere else.
+     * Wide mode: two bits per DAP0 clock, even bits on DAP1 and odd on DAP2.
+     * Latched at start.  Each field's clock count halves, and a field with an
+     * odd bit count gets one zero pad bit.
      */
     input  wire                  wide,
     /*
-     * Raw frame: `data` already holds the whole thing.
-     *
-     * Start bit, CMD, LEN, DATA, CRC6 and the trailing zero, first bit on the
-     * wire in bit 0, `data_bits` of them.  Nothing is assembled here and no
-     * CRC is generated - the bits are shifted out exactly as given, one per
-     * clock narrow and two per clock wide.
-     *
-     * This exists because the wide framing is not documented anywhere this
-     * project has access to, and the one description it had - per-field
-     * padding, covered by the CRC - is a reconstruction that the device
-     * rejects.  Finding the right rule by rebuilding the bitstream for each
-     * guess is a twenty-minute loop; finding it by assembling candidate frames
-     * on the host is a one-second loop.  So the fabric stops having an opinion
-     * about framing and the host gets to hold it.
+     * Raw frame: `data` holds the whole frame (start bit through trailing
+     * zero, bit 0 first, `data_bits` long) and is shifted out as given, with
+     * no assembly or CRC.
      */
     input  wire                  raw,
 
@@ -91,25 +49,14 @@ module dap_frame_tx #(
     output reg                   dap0,
     output reg                   dap1,
     output reg                   dat_oe,
-    /* DAP2 carries the odd bits, and is driven only in wide mode - a line the
-     * design has no use for is better left an input than held at a level. */
+    /* DAP2 carries the odd bits, driven only in wide mode. */
     output reg                   dap2,
-    /*
-     * Held steady for the whole frame, not decoded from the state.
-     *
-     * Narrowing this to the frame proper - start bit through CRC, excluding the
-     * lead-in and the trailing zero - looked like an improvement and measurably
-     * was not: it turns the pad enable into a combinational function of the
-     * state, so it toggles at every field boundary, and on hardware that went
-     * from "one wide frame is survivable" to "every wide frame takes the board
-     * down".  A pad enable that switches repeatedly against a line someone else
-     * may be driving is worse than one that is asserted once and released once,
-     * even though it is asserted for fewer clocks in total.
-     */
+    /* Held for the whole frame, not decoded from the state: toggling it at
+     * field boundaries takes the board down. */
     output reg                   dat2_oe
 );
     localparam [3:0] S_IDLE  = 4'd0,
-                     S_LEAD  = 4'd1,   /* the two low clocks before the frame */
+                     S_LEAD  = 4'd1,   /* low clocks before the frame */
                      S_START = 4'd2,
                      S_CMD   = 4'd3,
                      S_LEN   = 4'd4,
@@ -127,28 +74,14 @@ module dap_frame_tx #(
     reg [5:0]  len_r;
     reg [5:0]  nbits_r;
     reg [5:0]  lead_r;
-    /*
-     * The last index of each variable-length field, worked out once when the
-     * frame is loaded.
-     *
-     * Written inline as `index == nbits_r - 1` it is a six-bit subtract feeding
-     * a six-bit compare feeding the index update, every bit - a carry chain in
-     * the middle of the hot path, and the design's critical path once the
-     * register file was pipelined.  The subtraction happens once per frame
-     * instead, where it has a whole bit period to settle.
-     */
+    /* Last index of each variable-length field, computed at load (timing). */
     reg [5:0]  nbits_last;
     reg [5:0]  lead_last;
     reg [62:0] data_r;
     reg        wide_r;
     reg        raw_r;
 
-
-    /*
-     * Field lengths are counted in clock periods, not bits, so wide mode
-     * halves them: a six-bit field is three periods, and CMD's five bits plus
-     * its pad are three as well.  index therefore still increments by one.
-     */
+    /* Field lengths in clock periods: wide mode halves them (CMD plus pad is 3). */
     wire [5:0] cmd_last = wide_r ? 6'd2 : 6'd4;
     wire [5:0] f6_last  = wide_r ? 6'd2 : 6'd5;   /* LEN and CRC, both six */
     /* The finished CRC, latched when the payload runs out and then shifted out
@@ -171,34 +104,20 @@ module dap_frame_tx #(
         .crc    (crc)
     );
 
-    /* Registered for the same reason as the receiver's: as a comparison it
-     * feeds clock enables, and that is what place and route answered by
-     * putting the enable on a global net. */
+    /* Half-period strobe, registered (timing). */
     reg tick_done;
 
-    /*
-     * What goes on the wire: always the bottom bit of the field being sent.
-     *
-     * The fields shift right as they go out rather than being indexed by a
-     * counter.  Indexing reads better, but data_r[index] over a 63-bit
-     * register is a 63-to-1 multiplexer feeding the CRC generator, and that
-     * mux was the design's critical path once the enable chains were fixed -
-     * five LUT levels of it.  Shifting costs the same flip-flops and leaves a
-     * four-way choice between five single bits.
-     */
+    /* The bottom bit of the current field; fields shift right as they go out
+     * (a 63:1 index mux does not meet timing). */
     always @(*) begin
         case (state)
-            /* The start bit goes out on both lines at once.  It is the only
-             * bit that does, and that is the point of it in wide mode: the
-             * device gets one edge on each line from a known common instant to
-             * align its two capture phases against. */
+            /* The start bit goes out on both lines; wide mode aligns on it. */
             S_START: begin cur_bit = 1'b1;      cur_bit2 = 1'b1;      end
             S_CMD:   begin cur_bit = cmd_r[0];  cur_bit2 = cmd_r[1];  end
             S_LEN:   begin cur_bit = len_r[0];  cur_bit2 = len_r[1];  end
             S_DATA:  begin cur_bit = data_r[0]; cur_bit2 = data_r[1]; end
             S_CRC:   begin cur_bit = crc_sr[0]; cur_bit2 = crc_sr[1]; end
-            /* No CRC is generated for a raw frame, so what these feed does not
-             * matter; they follow the data for tidiness. */
+            /* No CRC for a raw frame; these are unused. */
             S_RAW:   begin cur_bit = data_r[0]; cur_bit2 = data_r[1]; end
             /* lead-in and trailing zero */
             default: begin cur_bit = 1'b0;      cur_bit2 = 1'b0;      end
@@ -206,29 +125,14 @@ module dap_frame_tx #(
     end
 
     /*
-     * The bit that becomes current at the end of this one.
-     *
-     * Needed because DAP1 has to change *on* the falling edge of DAP0, not a
-     * clock after it.  Assigning dap1 from cur_bit every cycle leaves only
-     * (half period - 1) clocks of setup before the target latches on the
-     * rising edge, which is fine at a divider of 1 and is zero at a divider of
-     * 0 - so the fastest bit rate the clock generator can produce was
-     * unreachable for want of one clock.
-     *
-     * Within a field this is just the next bit of the shift register, since
-     * the fields shift right as they go out; only the field boundaries need
-     * saying, and they mirror the state advance below.
+     * The bit that becomes current at the next falling edge, so DAP1 changes
+     * with DAP0 falling and the whole low phase is setup (needed at div 0).
+     * Field boundaries mirror the state advance below.
      */
     reg next_bit;
     reg next_bit2;
 
-    /*
-     * Within a field, "the next slot" is one position along in narrow mode and
-     * two in wide - which is the only place the stride appears, since the
-     * shift registers themselves are shifted by the same amount below.  Naming
-     * the four heads separately keeps that choice a two-way mux on a single
-     * bit rather than a variable shift.
-     */
+    /* Next slot within a field: one position on narrow, two on wide. */
     wire cmd_n0  = wide_r ? cmd_r[2]  : cmd_r[1];
     wire cmd_n1  = cmd_r[3];
     wire len_n0  = wide_r ? len_r[2]  : len_r[1];
@@ -241,12 +145,7 @@ module dap_frame_tx #(
     always @(*) begin
         case (state)
             S_LEAD: begin
-                /*
-                 * The bit after the lead-in.  For an assembled frame that is
-                 * the start bit, on both lines; for a raw one it is whatever
-                 * the host put in bit 0, and the host decides what goes on
-                 * DAP2 with it.
-                 */
+                /* After the lead-in: the start bit, or bit 0/1 of a raw frame. */
                 next_bit  = (index == lead_last)
                           ? (raw_r ? data_r[0] : 1'b1) : 1'b0;
                 next_bit2 = (index == lead_last)
@@ -273,8 +172,7 @@ module dap_frame_tx #(
                 next_bit2 = (index == nbits_last) ? crc[1] : data_n1;
             end
             S_RAW: begin
-                /* The trailing zero is part of what the host supplied, so the
-                 * only thing after the last slot is the idle line. */
+                /* The host supplied the trailing zero; then the idle line. */
                 next_bit  = (index == nbits_last) ? 1'b0 : data_n0;
                 next_bit2 = (index == nbits_last) ? 1'b0 : data_n1;
             end
@@ -305,8 +203,7 @@ module dap_frame_tx #(
         crc_rst <= 1'b0;
         done    <= 1'b0;
 
-        /* index is loaded at the start of every frame, so it is left out -
-         * see the note in the receiver on why this reset list is short. */
+        /* index is loaded at the start of every frame, so it is not reset. */
         if (rst) begin
             state   <= S_IDLE;
             busy    <= 1'b0;
@@ -325,9 +222,8 @@ module dap_frame_tx #(
                 cmd_r   <= cmd;
                 len_r   <= len;
                 nbits_r    <= data_bits;
-                /* One clock per pair in wide mode, so an odd payload and the
-                 * even one above it take the same number of periods - the
-                 * extra slot is the pad bit, and data_r zero-fills it. */
+                /* One clock per pair in wide mode; an odd payload gets a
+                 * zero pad bit from data_r. */
                 nbits_last <= wide ? ((data_bits - 1'b1) >> 1)
                                    :  (data_bits - 1'b1);
                 lead_r     <= lead;
@@ -351,15 +247,8 @@ module dap_frame_tx #(
                 phase     <= 1'b0;
             end
         end else begin
-            /*
-             * One bit per two half-periods: present the bit with dap0 low,
-             * then raise dap0 for the second half.  The target latches on that
-             * rising edge, so the data is already stable when it arrives.
-             *
-             * DAP1 is driven only at the falling edge below, where the field
-             * registers shift, so the data and the clock change together and
-             * the whole low phase is setup time.
-             */
+            /* One bit per period: present it with dap0 low, then raise dap0;
+             * DAP1 changes only at the falling edge. */
             if (!tick_done) begin
                 tick      <= tick + 1'b1;
                 tick_done <= (tick + 1'b1 == div);
@@ -405,11 +294,9 @@ module dap_frame_tx #(
                             len_r <= wide_r ? {2'b0, len_r[5:2]}
                                             : {1'b0, len_r[5:1]};
                             if (index == f6_last) begin
-                                /* Straight to the CRC when nothing follows -
-                                 * which is sync's case, LEN 63 and no data.
-                                 * The generator has already absorbed this
-                                 * bit - it does that on the phase-0 edge -
-                                 * so `crc` is final and can be latched. */
+                                /* No data (sync): straight to the CRC.  The
+                                 * generator took this bit on phase 0, so
+                                 * `crc` is final. */
                                 state  <= (nbits_r == 6'd0) ? S_CRC : S_DATA;
                                 crc_sr <= crc;
                                 index  <= 6'd0;

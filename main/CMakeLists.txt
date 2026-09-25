@@ -7,6 +7,7 @@ set(sources
     network/network_mngr.c
     network/web_server.c
     network/flash_web.c
+    network/dap_web.c
     network/network_mngr_ota.c
     network/descriptors.c
     network/uart_websocket.c

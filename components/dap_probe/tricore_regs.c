@@ -1,7 +1,4 @@
-/*
- * TriCore registers, memory and the debug triggers, all of which need the core
- * halted.
- */
+/* TriCore registers, triggers, stepping and memory access. */
 
 #include <inttypes.h>
 #include <string.h>
@@ -25,11 +22,7 @@ static esp_err_t require_halted(int core)
         return ESP_ERR_INVALID_ARG;
     }
     if (!tricore_is_halted(core)) {
-        /*
-         * Not a courtesy check.  While the core runs, these reads bus-error,
-         * and a bus error mid-sequence leaves the IOClient in Error State with
-         * every later access silently dropped.
-         */
+        /* Reads would bus-error and leave the IOClient in Error State. */
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
@@ -92,11 +85,7 @@ esp_err_t tricore_read_all_regs(int core, uint32_t regs[TRICORE_NUM_REGS])
     }
     for (int i = 0; i < TRICORE_NUM_REGS; i++) {
         if (tricore_rd(core, reg_offset(i), &regs[i]) != ESP_OK) {
-            /*
-             * Report what was read rather than failing the whole packet: GDB
-             * showing fifteen registers and one "unavailable" is far more use
-             * than GDB showing an error.
-             */
+            /* Mark just this one unreadable rather than failing the packet. */
             regs[i] = 0xFFFFFFFFu;
             dap_probe_clear_error_state();
         }
@@ -131,8 +120,7 @@ esp_err_t tricore_set_code_trigger(int core, int slot, uint32_t addr)
     if (!tricore_core_ok(core) || slot < 0 || slot >= TRICORE_NUM_TRIGGERS) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* Address first, event word last: arming last avoids a window where the
-     * trigger is live on a stale address. */
+    /* Address first, so the trigger is never live on a stale address. */
     esp_err_t err = tricore_wr(core, OFF_TR_ADR(slot), addr);
     if (err != ESP_OK) {
         return err;
@@ -140,18 +128,8 @@ esp_err_t tricore_set_code_trigger(int core, int slot, uint32_t addr)
     return tricore_wr(core, OFF_TR_EVT(slot), TREVT_HALT_ON_ADDR);
 }
 
-/*
- * The TRnEVT word for a data watchpoint.  Differences from the instruction
- * trigger, all deliberate:
- *
- *   - TYP stays clear, selecting the data address bus rather than the PC.
- *     Setting it by accident turns a watchpoint into a breakpoint on an address
- *     that is never executed, so it simply never fires.
- *   - BBM stays clear, i.e. break after make: the store completes before the
- *     core halts, so the new value is the one you read - which is what "break
- *     on value change" is expected to show.
- *   - SUSP is set, matching the instruction trigger, so the timers freeze too.
- */
+/* TRnEVT for a data watchpoint: TYP clear (data bus, not PC), BBM clear (the
+ * access completes before the halt), SUSP set. */
 static uint32_t data_trigger_word(bool on_read, bool on_write, bool is_range)
 {
     uint32_t word = EVTA_HALT | EVT_SUSP;
@@ -180,13 +158,8 @@ esp_err_t tricore_set_data_trigger(int core, int slot, uint32_t addr,
         return tricore_wr(core, OFF_TR_EVT(slot), data_trigger_word(on_read, on_write, false));
     }
 
-    /*
-     * Anything wider than a byte needs a range, which the hardware builds from
-     * an even/odd pair: the even register holds the lower bound, the odd one
-     * the upper, and the odd register's own configuration is ignored.  Ranges
-     * matter because the comparator matches one address, so a four-byte
-     * variable written a byte at a time would only trip on the byte at its base.
-     */
+    /* Wider than a byte: an even/odd range pair, lower bound in the even slot,
+     * upper in the odd one, whose own configuration is ignored. */
     if ((slot % 2) != 0 || slot + 1 >= TRICORE_NUM_TRIGGERS) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -217,11 +190,7 @@ esp_err_t tricore_trigger_acc(int core, uint32_t *bits)
 
 void tricore_disarm_reset_trigger(void)
 {
-    /*
-     * A debugger that offered halt-after-reset implements it by arming TR0 at
-     * the reset vector, and leaves it armed.  Without clearing it every resume
-     * immediately re-halts there.
-     */
+    /* Other debuggers leave TR0 armed at the reset vector for halt-after-reset. */
     for (int core = 0; core < TRICORE_MAX_CORES; core++) {
         if (!tricore_present[core]) {
             continue;
@@ -320,8 +289,7 @@ int tricore_bp_add_watch(int core, uint32_t addr, uint32_t size,
         .on_read = on_read, .on_write = on_write,
     };
     if (needs_pair) {
-        /* Hold the odd trigger so nothing else takes it; the hardware ignores
-         * its configuration while the even one is in range mode. */
+        /* Reserve the odd trigger of the range pair. */
         s_slots[core][slot + 1] = (tricore_bp_t){
             .addr = addr + size, .kind = TRICORE_BP_WATCH_HI,
         };
@@ -362,18 +330,6 @@ void tricore_bp_clear_kind(int core, tricore_bp_kind_t kind)
     }
 }
 
-int tricore_bp_free_slots(int core)
-{
-    if (!tricore_core_ok(core)) {
-        return 0;
-    }
-    int n = 0;
-    for (int slot = 0; slot < TRICORE_NUM_TRIGGERS; slot++) {
-        n += (s_slots[core][slot].kind == TRICORE_BP_FREE);
-    }
-    return n;
-}
-
 const tricore_bp_t *tricore_bp_of_slot(int core, int slot)
 {
     if (!tricore_core_ok(core) || slot < 0 || slot >= TRICORE_NUM_TRIGGERS) {
@@ -394,13 +350,6 @@ const tricore_bp_t *tricore_bp_at(int core, uint32_t addr)
 /* ------------------------------------------------------------------------ */
 /* Control-flow decoding, for stepping                                       */
 /* ------------------------------------------------------------------------ */
-/*
- * TriCore has no single-step control bit reachable this way, so a step is
- * "breakpoint on the successor instruction(s), run, stop".  The successors are
- * the fall-through, always, and the branch target when the instruction is a
- * direct branch we can decode.  For indirect flow (JI, CALLI, RET) the target
- * comes from an address register, which is readable because the core is halted.
- */
 
 /* 32-bit B format, disp24: target = PC + sign_extend(disp24) * 2 */
 static bool is_b_format(uint8_t op)
@@ -448,11 +397,8 @@ static int32_t sign_extend(uint32_t value, int bits)
     return (int32_t)((value ^ sign) - sign);
 }
 
-/*
- * Where execution can go from the instruction at `pc`.  `target_valid` is false
- * for straight-line code.  Reads an address register for indirect flow, which
- * is safe here because the core is halted.
- */
+/* Successors of the instruction at `pc`: fall-through always, plus the branch
+ * target when decodable (indirect targets from A[n]; core is halted). */
 static void decode_successors(int core, uint32_t pc, const uint8_t raw[4],
                               uint32_t *fall_through, uint32_t *target,
                               bool *target_valid)
@@ -536,11 +482,7 @@ esp_err_t tricore_step(int core, uint32_t timeout_ms, tricore_step_t *out)
 
     tricore_bp_clear_kind(core, TRICORE_BP_STEP);
 
-    /*
-     * A trigger armed at the current PC fires again the instant we resume, so
-     * the core never leaves this instruction.  Step off it and put it back
-     * afterwards.
-     */
+    /* A trigger at the PC would re-fire at once; lift it for the step. */
     uint32_t          evicted_addr = 0;
     tricore_bp_kind_t evicted_kind = TRICORE_BP_FREE;
     const tricore_bp_t *here = tricore_bp_at(core, pc);
@@ -560,16 +502,12 @@ esp_err_t tricore_step(int core, uint32_t timeout_ms, tricore_step_t *out)
                  "out of triggers; the stop may be imprecise");
     }
 
-    /*
-     * request_resume rather than resume: a trigger is armed one instruction
-     * ahead, so the core re-halts faster than a wait could see it running.
-     */
+    /* No wait for running: the core re-halts one instruction later. */
     tricore_request_resume(core);
 
     const bool stopped = tricore_wait_halted(core, true, timeout_ms);
     if (!stopped) {
-        /* No successor was reached - an instruction we could not decode
-         * branched somewhere else.  Force a halt so the session survives. */
+        /* An undecoded branch went elsewhere; force a halt. */
         if (tricore_halt(core, 1, 200) != ESP_OK) {
             snprintf(out->note, sizeof(out->note), "the core could not be stopped");
             tricore_bp_clear_kind(core, TRICORE_BP_STEP);
@@ -589,8 +527,7 @@ esp_err_t tricore_step(int core, uint32_t timeout_ms, tricore_step_t *out)
     if (tricore_read_pc(core, &out->pc) != ESP_OK) {
         out->pc = pc;
     }
-    /* A step can end on somebody else's breakpoint, and calling that "step"
-     * hides why the core is where it is. */
+    /* Report a step that landed on a user breakpoint as such. */
     const tricore_bp_t *landed = tricore_bp_at(core, out->pc);
     out->hit_user_bp = (landed != NULL && landed->kind == TRICORE_BP_USER);
     return ESP_OK;
@@ -637,11 +574,7 @@ esp_err_t tricore_write_mem(uint32_t addr, const uint8_t *buf, size_t len)
 
         uint32_t word = 0;
         if (take != 4) {
-            /*
-             * Read-modify-write, because the probe exposes word writes only.
-             * Right for RAM, wrong for a register with side effects on read -
-             * a GDB user writing one byte into a peripheral should know that.
-             */
+            /* Word writes only: partial words are read-modify-write. */
             if (dap_probe_read32(word_addr, &word) != ESP_OK) {
                 dap_probe_clear_error_state();
                 return ESP_FAIL;
@@ -663,8 +596,7 @@ esp_err_t tricore_write_mem(uint32_t addr, const uint8_t *buf, size_t len)
     return ESP_OK;
 }
 
-/* Drop the record of what is armed; discovery calls this because a reset takes
- * the triggers with it. */
+/* Drop the slot records; called on discovery, as a reset clears the triggers. */
 void tricore_forget_triggers(void)
 {
     memset(s_slots, 0, sizeof(s_slots));

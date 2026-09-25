@@ -28,11 +28,7 @@ esp_err_t dap_probe_spi_bringup(void)
 
     ESP_LOGW(TAG, "=== Phase 1c: GP-SPI backend ===");
 
-    /*
-     * Establish that the target answers *before* any of this, so a silence
-     * afterwards can be attributed.  Without it every SPI failure has two
-     * candidate causes and no way to tell them apart.
-     */
+    /* Confirm the target answers on bit-bang first, so SPI failures are attributable. */
     {
         const esp_err_t pre = dap_probe_attach(&x, 3);
         ESP_LOGW(TAG, "  before SPI, bit-bang sync -> 0x%08" PRIX64 " %s", x.reply,
@@ -98,11 +94,7 @@ esp_err_t dap_probe_spi_bringup(void)
              x.reply == DAP_SYNC_EXPECT ? "(expected)" : "MISMATCH");
     if (err != ESP_OK || x.reply != DAP_SYNC_EXPECT) {
         failures++;
-        /*
-         * Dump the raw window on both backends before theorising.  A reply
-         * that is nearly right is either a sampling-phase problem or a length
-         * problem, and the two look identical in a decoded value.
-         */
+        /* Raw window on both backends: separates sampling phase from length errors. */
         ESP_LOGW(TAG, "  raw window, GP-SPI:");
         dap_probe_dump_sync_reply(64);
         dap_phy_use_spi(false);
@@ -114,12 +106,7 @@ esp_err_t dap_probe_spi_bringup(void)
 
     /* 2: a selected client and its hard-wired ID. */
     if (!failures) {
-        /*
-         * Twice, deliberately.  The first exchange after a backend switch may
-         * be the one that teaches the window its wait count, and an
-         * acknowledge has no CRC to fail on, so it is retried rather than
-         * trusted.
-         */
+        /* Sent twice: the first exchange after a backend switch is not trusted. */
         dap_probe_client_set(1, &x);
         dap_probe_client_set(1, &x);
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -178,24 +165,13 @@ esp_err_t dap_probe_spi_bringup(void)
     }
 
     if (failures) {
-        /*
-         * Print the raw windows before giving up.  A decoded value says a reply
-         * was wrong; only the raw bits say whether the device answered at all,
-         * and where in the window its start bit sat.
-         */
         dap_probe_dump_raw_attach("GP-SPI");
         dap_probe_set_trailer_bits(0);
         ESP_LOGE(TAG, "=== GP-SPI backend failed %d check%s: reverting to bit-bang ===",
                  failures, failures == 1 ? "" : "s");
         dap_phy_use_spi(false);
-        /*
-         * A failed SPI attempt may have left the device mid-telegram, so flush
-         * with a long low burst before deciding the bit-bang path is broken -
-         * otherwise the revert reports a pad-routing fault for what is only a
-         * desynchronised device.
-         */
+        /* Flush a device possibly left mid-telegram before re-checking bit-bang. */
         dap_phy_idle_clocks(dap_probe_max_wait * 2u, 0);
-        /* Which of the two possible causes is it? */
         if (!dap_phy_pad_toggle_check()) {
             ESP_LOGE(TAG, "the pads are no longer under GPIO control");
         }
@@ -215,12 +191,7 @@ esp_err_t dap_probe_spi_bringup(void)
     dap_probe_rate_test();
     dap_probe_block_throughput();
 
-    /*
-     * And the rates only hardware clocking can reach.  The bit-bang path tops
-     * out near 1 MHz effective whatever it is asked for, so everything above
-     * that is new ground - and the rate where the target stops agreeing is a
-     * number this project has never had.
-     */
+    /* Rates beyond the bit-bang ceiling (~1 MHz effective). */
     {
         static const uint32_t fast[] = { 8000000u, 12000000u, 16000000u, 20000000u };
         static uint32_t buf[256];
@@ -272,11 +243,7 @@ esp_err_t dap_probe_bringup_report(void)
     ESP_LOGI(TAG, "=== DAP bring-up: DAP0=GPIO%d DAP1=GPIO%d dir=GPIO%d trst=GPIO%d ===",
              AEL_DAP0_PIN, AEL_DAP1_PIN, AEL_DAP1_DIR_PIN, AEL_DAP_TRST_PIN);
 
-    /*
-     * Wire check first.  A silent target has several causes, and these two
-     * measurements separate "our side is broken" from "nothing is listening"
-     * before any protocol theory gets involved.
-     */
+    /* Wire check: is our own drive path working before any protocol step. */
     const bool self_ok = dap_phy_self_drive_check();
     const int  idle_high = dap_phy_sample_target_idle(32);
     ESP_LOGI(TAG, "0 wire check          self-drive %s, DAP1 idle %d/32 high",
@@ -285,13 +252,7 @@ esp_err_t dap_probe_bringup_report(void)
         ESP_LOGE(TAG, "   the S3 cannot read back its own drive: check Port C mode "
                       "(cfgpc) and that swd_gpio selects the GPIO path");
     }
-    /*
-     * Measured on this board with the analyser: the DAP1 net has no pull-up and
-     * no pull-down.  Released from low it stays low for milliseconds, released
-     * from high it stays high.  So this reading reports the charge left by
-     * whatever we last drove, and says nothing at all about the target.  It is
-     * kept because a *change* in it across a run is still worth seeing.
-     */
+    /* DAP1 is unpulled, so the idle level is residual charge, not the target. */
     ESP_LOGI(TAG, "   (idle level is residual charge on an unpulled net, not "
                   "evidence of a target)");
     (void)idle_high;
@@ -307,8 +268,7 @@ esp_err_t dap_probe_bringup_report(void)
         ESP_LOGE(TAG, "   expected 0x%08" PRIX32 " - target silent or framing off",
                  (uint32_t)DAP_SYNC_EXPECT);
         failures++;
-        /* Everything downstream assumes sync worked, so rather than emit a
-         * cascade of failures with one cause, try the cheap attach variants. */
+        /* Everything downstream needs sync; try the attach variants instead. */
         if (dap_probe_clock_pin_search() == ESP_OK ||
             dap_probe_attach_sweep() == ESP_OK) {
             ESP_LOGW(TAG, "=== a sweep combination answered: adopt it and re-run ===");
@@ -318,9 +278,7 @@ esp_err_t dap_probe_bringup_report(void)
         return ESP_FAIL;
     }
 
-
-
-    /* And the whole handshake with no host work between frames. */
+    /* The whole handshake with no host work between frames. */
     {
         static const char *names[6] = { "sync", "dapisc", "client_set(1)",
                                         "client_read ID", "spare", "spare" };
@@ -339,7 +297,7 @@ esp_err_t dap_probe_bringup_report(void)
         }
     }
 
-    /* Checkpoint 2: DAPISC.  Dump its window first, for the same reason. */
+    /* Checkpoint 2: DAPISC.  Dump the long-form reply window first. */
     {
         dap_frame_t df;
         const uint64_t d = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE;
@@ -372,8 +330,7 @@ esp_err_t dap_probe_bringup_report(void)
     }
 
     if (err != ESP_OK) {
-        /* Expected: this form takes no reply, so a timeout here is not a
-         * failure.  It is logged so a change in behaviour is still visible. */
+        /* Not counted as a failure. */
         ESP_LOGI(TAG, "   no reply, as expected for the LEN-48 write form");
     } else {
         ESP_LOGI(TAG, "   MAXWAIT8=%u MW8E=%u -> %u wait clocks allowed",
@@ -389,21 +346,19 @@ esp_err_t dap_probe_bringup_report(void)
         failures++;
     }
 
-    /* Checkpoint 4: CLIENT_ID.  This is the one that says the probe is real. */
+    /* Checkpoint 4: CLIENT_ID must read 0x0260. */
     for (int attempt = 0; attempt < 3; attempt++) {
         err = dap_probe_client_read(DAP_IO_CLIENT_ID, 4, 16, &x);
         if (err == ESP_OK && x.reply == DAP_CLIENT_ID_EXPECT) {
             break;
         }
-        /* Flush and retry: the first sequence after a board reset regularly
-         * fails here where the next one succeeds. */
+        /* Flush and retry; the first try after a board reset often fails. */
         dap_phy_idle_clocks(dap_probe_max_wait, 0);
         dap_probe_clear_error_state();
     }
     dap_probe_log_exchange("4 client_read ID", &x);
     {
-        /* 32-bit form: the hardware replicates the halfword, so a correct
-         * transport returns 0x02600260 and confirms the width handling too. */
+        /* 32-bit form replicates the halfword: expect 0x02600260. */
         dap_exchange_t w;
         if (dap_probe_client_read(DAP_IO_CLIENT_ID, 5, 32, &w) == ESP_OK) {
             ESP_LOGI(TAG, "   32-bit CLIENT_ID reads 0x%08" PRIX64 "%s",
@@ -422,28 +377,11 @@ esp_err_t dap_probe_bringup_report(void)
     }
 
     /*
-     * Checkpoint 5: a word of target memory.  OSTATE is the right first read -
-     * it is read-only, it is the register the OCDS enable sequence checks, and
-     * its OEN bit tells us whether the miniMCDS space is reachable yet.
-     * IOINFO afterwards reports whether the access took a bus error.
+     * Checkpoint 5: target memory reads at several addresses, each followed
+     * by IOINFO to show bus errors.  STM0_TIM0 counts, so two reads must differ.
      */
     {
-        /*
-         * Several addresses, because a single failure cannot distinguish "the
-         * read mechanism does not work" from "that address is not readable".
-         * Program flash and the CPU0 scratchpad are ordinary memory; OSTATE
-         * sits in the OCDS control block, which may itself be gated until
-         * OCDS is enabled.
-         */
         static const struct { uint32_t addr; const char *what; } probes[] = {
-            /*
-             * STM0_TIM0 counts continuously, so reading it twice is the only
-             * check here that cannot be faked: identical values mean we are
-             * not really reading, and 0xFFFFFFFF everywhere means a bus error
-             * or an unset IOADDR rather than data.  Erased flash reads all
-             * ones legitimately, which is why the flash aliases alone prove
-             * nothing.
-             */
             { 0xF0001010u, "STM0_TIM0 (counts up)" },
             { 0xF0001010u, "STM0_TIM0 again" },
             { 0x70000000u, "CPU0 DSPR" },
@@ -452,22 +390,10 @@ esp_err_t dap_probe_bringup_report(void)
         };
         uint32_t word = 0, again = 0;
 
-        /*
-         * Order matters and is not optional: clear any Error State, put the
-         * IOClient in RW mode, and only then set an address and read.  RW mode
-         * is a 12-bit IOCONF write - sending 16 bits leaves MODE clear,
-         * because the device keeps only the last N bits of an over-long write.
-         */
+        /* Required order: clear Error State, set RW mode, then address and read. */
         dap_probe_clear_error_state();
 
-        /*
-         * Before blaming the address, establish whether *any* bus read works
-         * and what the IOClient says about itself.  Register reads through
-         * instruction 0xF and 0xB already work, so a failure here separates
-         * "this address" from "bus access at all" - and the plan notes that
-         * OJCONF through the IOClient keeps working when the bus is locked or
-         * unclocked, which is exactly the shape of what we are seeing.
-         */
+        /* IOClient registers first; OJCONF stays readable even with the bus locked. */
         static const struct { uint8_t instr; const char *what; } regs[] = {
             { 0xEu, "OJCONF (0xE)" },
             { 0xBu, "IOINFO (0xB)" },
@@ -484,16 +410,6 @@ esp_err_t dap_probe_bringup_report(void)
         ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
                  mode == ESP_OK ? "acknowledged" : "no acknowledge");
         int reads_ok = 0;
-        /*
-         * Map the IOClient's readable instruction space.
-         *
-         * IOCONF is write-only, so a MODE=1 write cannot be confirmed by
-         * reading it back, and an acknowledge only says a frame was accepted.
-         * Sweeping every instruction shows which registers answer and what
-         * they hold - including whichever one reports the interface lock,
-         * which is the leading explanation for bus reads being dropped while
-         * register reads work.  Reads only; nothing here changes state.
-         */
         for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
             if (dap_probe_read32(probes[i].addr, &word) == ESP_OK) {
                 reads_ok++;
@@ -509,10 +425,7 @@ esp_err_t dap_probe_bringup_report(void)
                          (inf.reply & ~0x0020u) ? "  <- bits beyond PWR_DWN" : "");
             }
         }
-        /*
-         * The timer read twice is the check that cannot be faked: a counter
-         * that reports the same value twice is not being read.
-         */
+        /* A counter reading the same value twice is not being read. */
         if (dap_probe_read32(0xF0001010u, &word) == ESP_OK &&
             dap_probe_read32(0xF0001010u, &again) == ESP_OK) {
             if (word != again) {
@@ -532,36 +445,7 @@ esp_err_t dap_probe_bringup_report(void)
         }
     }
 
-    if (0) {
-        uint32_t word = 0;
-        esp_err_t mode = dap_probe_set_rw_mode(true);
-        ESP_LOGI(TAG, "   IOCONF <- RW + supervisor: %s",
-                 mode == ESP_OK ? "acknowledged" : "no acknowledge");
-        if (dap_probe_read32(0xF0000480u, &word) == ESP_OK) {
-            ESP_LOGI(TAG, "5 read 0xF0000480    OSTATE = 0x%08" PRIX32
-                          " (OEN=%" PRIu32 ")", word, word & 1u);
-        } else {
-            /* Try without supervisor privilege before calling it a failure. */
-            dap_probe_set_rw_mode(false);
-            if (dap_probe_read32(0xF0000480u, &word) == ESP_OK) {
-                ESP_LOGI(TAG, "5 read 0xF0000480    OSTATE = 0x%08" PRIX32
-                              " (user privilege)", word);
-            } else {
-                ESP_LOGE(TAG, "5 read 0xF0000480    no reply either way");
-                failures++;
-            }
-        }
-        dap_exchange_t info;
-        if (dap_probe_client_read(DAP_IO_INFO, 4, 16, &info) == ESP_OK) {
-            ESP_LOGI(TAG, "   IOINFO after the read: 0x%04" PRIX64, info.reply);
-        }
-    }
-
-    /*
-     * Checkpoint 6, Phase 3's exit criterion: enable OCDS and read a miniMCDS
-     * register.  ID reads a known constant when OCDS is on and bus-errors when
-     * it is off, so it distinguishes "enabled" from "wishful thinking".
-     */
+    /* Checkpoint 6: enable OCDS; miniMCDS ID reads a constant only when it is on. */
     {
         uint32_t id = 0;
         if (dap_probe_read32(DAP_ADDR_MCDS_ID, &id) == ESP_OK) {
@@ -623,14 +507,8 @@ esp_err_t dap_probe_bringup_report(void)
     }
 
     /*
-     * Checkpoint 8, the groundwork for the autonomous drain: is the trace FIFO
-     * reachable, and is the TRAM readable through the same block reads?
-     *
-     * Nothing here configures tracing - that is the host's 54-write list - so
-     * FIFONOW is expected to sit still and the TRAM to hold whatever the last
-     * session left.  What it establishes is that the drain has something to
-     * read and a pointer to follow, which is the one assumption Phase 4 rests
-     * on and the one this project had never tested.
+     * Checkpoint 8: trace FIFO registers and TRAM reachable by block read.
+     * Tracing is not configured here, so FIFONOW is expected to be static.
      */
     {
         static const struct { uint32_t addr; const char *name; } fifo[] = {
@@ -656,11 +534,7 @@ esp_err_t dap_probe_bringup_report(void)
         /* And the buffer behind it, one paragraph at a time. */
         static uint32_t para[DAP_TRAM_PARAGRAPH / 4];
         if (dap_probe_blockread(DAP_ADDR_TRAM_BASE, para, 256) == ESP_OK) {
-            /*
-             * A configuration seeds 0xFFFFFFFF into the first five words, which
-             * decodes as <endoftrace>, so an untouched buffer says so plainly
-             * rather than looking like data.
-             */
+            /* Configuration seeds five 0xFFFFFFFF words (<endoftrace>): empty buffer. */
             int ones = 0;
             for (int i = 0; i < 5; i++) {
                 ones += (para[i] == 0xFFFFFFFFu);

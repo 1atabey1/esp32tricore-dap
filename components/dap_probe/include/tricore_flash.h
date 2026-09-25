@@ -1,21 +1,13 @@
 /*
- * Program the TriCore's flash, from an image the probe holds.
+ * TC3xx program flash, following tas-debug's flasher.
  *
- * Ported from tas-debug's flasher, which is the reference this project follows
- * for anything TriCore-specific.  Two things carry over unchanged because they
- * are the whole design:
+ * The DMU only accepts command sequences from the core, so a stub in CPU0's
+ * scratchpad programs each buffer and computes CRC32s for verification.  Two
+ * ways in: tricore_flash_write() for a whole image (the web flasher), or the
+ * stages below for a caller that streams one (GDB `load`).
  *
- *   - Program flash command cycles are only accepted from the core, so the
- *     debug link cannot issue them.  A small stub runs from CPU0's scratchpad
- *     and walks the pages itself; the host fills a buffer and hands it over.
- *     One round trip per chunk instead of one per 32-byte page.
- *   - Verification is a CRC32 the stub computes by reading the flash through
- *     the core.  Reading it back over the link instead is a kilobyte per round
- *     trip, and there is 700 kB of it.
- *
- * What is new here is how the buffer gets there: client_blockwrite streams it
- * from the fabric's FIFO, so the transfer is close to wire speed rather than
- * two register-file round trips per word.
+ * Addresses may be cached (0x8...) or uncached (0xA...).  Long-running; call
+ * from a task of its own.
  */
 
 #pragma once
@@ -30,19 +22,21 @@
 extern "C" {
 #endif
 
-/* Program flash page: the smallest unit that can be written, and it is written
- * whole. */
-#define TRICORE_FLASH_PAGE   32u
-/* Erase sector on TC38x. */
-#define TRICORE_FLASH_SECTOR 0x4000u
-/* What erased flash reads as. */
+#define TRICORE_FLASH_PAGE   32u        /* written whole */
+#define TRICORE_FLASH_SECTOR 0x4000u    /* erased whole */
 #define TRICORE_FLASH_ERASED 0xFFu
 
 typedef struct {
-    uint32_t address;      /* physical (uncached) start */
+    uint32_t address;
     uint32_t length;
     const uint8_t *data;
 } tricore_flash_region_t;
+
+/* A populated program-flash range, uncached, end exclusive. */
+typedef struct {
+    uint32_t start;
+    uint32_t end;
+} tricore_flash_range_t;
 
 typedef enum {
     TRICORE_FLASH_IDLE = 0,
@@ -61,36 +55,42 @@ typedef struct {
     uint32_t sectors;
     uint32_t sectors_done;
     uint32_t elapsed_ms;
-    /* DMU_HF_ERRSR as it read when something went wrong, which names which of
-     * OPER/SQER/PROER/PVER/EVER the flash refused on. */
-    uint32_t errsr;
+    uint32_t errsr;             /* DMU_HF_ERRSR at the last failure */
     bool     verified;
-    char     message[288];
+    char     message[160];
 } tricore_flash_status_t;
 
-/*
- * Program `regions` into flash and verify them.
- *
- * Erases every sector the regions touch, programs whole pages - bytes no region
- * covers are left erased - and checks each region with the stub's CRC32.  The
- * target is halted throughout and left halted; the caller resets and starts it.
- *
- * Long-running: call it from a task of its own, not from the web server's.
- */
+/* Erase the sectors the regions touch, program, verify by CRC32, then reset
+ * and start the target.  A failed image is left halted. */
 esp_err_t tricore_flash_write(const tricore_flash_region_t *regions,
                               size_t count);
 
-/*
- * Whether bulk transfers use client_blockwrite.  Off forces the word-at-a-time
- * path, which is correct and far slower - useful for telling a fabric problem
- * from everything else in one request.
- */
+/* Stages.  begin() resets and halts the target and installs the loader; end()
+ * restores the flash configuration and leaves the target at its reset vector,
+ * running it if asked. */
+esp_err_t tricore_flash_begin(void);
+esp_err_t tricore_flash_erase(uint32_t address, uint32_t length);
+esp_err_t tricore_flash_program(uint32_t address, const uint8_t *data,
+                                uint32_t length);
+esp_err_t tricore_flash_verify(uint32_t address, const uint8_t *data,
+                               uint32_t length);
+esp_err_t tricore_flash_end(bool start_target);
+
+/* Populated program flash, from SCU_CHIPID.FSIZE; 0 if the size is unknown. */
+size_t tricore_flash_layout(const tricore_flash_range_t **ranges);
+
+/* Cached alias to uncached; anything else unchanged. */
+uint32_t tricore_flash_to_physical(uint32_t address);
+
+/* The UCBs and configuration store, which this code never erases or writes. */
+bool tricore_flash_is_never(uint32_t address);
+
+/* Off forces word-at-a-time transfers instead of client_blockwrite. */
 void tricore_flash_set_blockwrite(bool enable);
 
-/* A snapshot of what the flash task is doing, for progress reporting. */
 void tricore_flash_get_status(tricore_flash_status_t *out);
 
-/* The same CRC32 the stub computes, over an image held here. */
+/* The CRC32 the stub computes, for comparing against an image held here. */
 uint32_t tricore_flash_crc32(const uint8_t *data, uint32_t length);
 
 /* CRC32 of a target range, computed by the stub. */

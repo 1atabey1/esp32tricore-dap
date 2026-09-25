@@ -1,27 +1,10 @@
 /*
- * DAP CRC6, both directions.
+ * DAP CRC6, both directions.  Ported bit for bit from
+ * components/dap_probe/dap_frame.c and checked against the same vectors.
  *
- * Ported bit for bit from components/dap_probe/dap_frame.c, which is checked
- * against the documented vectors by a host test binary - so these two agree by
- * construction rather than by hope, and the same vectors verify this module.
- *
- * The two topologies are deliberately different.  The generator is a
- * right-shifting Galois LFSR; the checker is a Fibonacci LFSR whose residue
- * lands on zero for a good frame.  A checker built from the generator's own
- * structure would only ever prove self-consistency, which is exactly the
- * mistake this protocol punishes: a wrong-but-consistent CRC produces a device
- * that answers sync and ignores everything after it.
- *
- * Both are fed one bit per clock with `en` high, LSB of the frame first, which
- * is transmission order.
- *
- * Wide mode feeds two bits per clock instead, because it puts the even bits of
- * the frame on DAP1 and the odd ones on DAP2 and sends a pair per clock.  The
- * CRC still covers the frame in transmission order, so a pair is absorbed as
- * bit_in then bit_in2 - the same step function applied twice in one cycle
- * rather than a different polynomial.  That equivalence is worth stating
- * because it is testable: the same bits through either path must land on the
- * same CRC, and tb_dap_frame checks exactly that.
+ * Generator: right-shifting Galois LFSR.  Checker: independent Fibonacci LFSR
+ * whose residue is zero for a good frame.  One bit per `en`, LSB first; in wide
+ * mode a pair per clock, bit_in (even) then bit_in2 (odd).
  */
 
 `default_nettype none
@@ -78,8 +61,7 @@ module dap_crc6_check (
 
     reg [5:0] state;
 
-    /* The taps named by FIBO_POLY, XORed with the incoming bit and shifted in
-     * at the top.  FIBO_POLY is 6'h03, so the taps are bits 0 and 1. */
+    /* Taps at bits 0 and 1 (FIBO_POLY) XOR the input, shifted in at the top. */
     function [5:0] step;
         input [5:0] s;
         input       b;

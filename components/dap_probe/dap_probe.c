@@ -1,4 +1,5 @@
 #include "dap_probe.h"
+#include "dap_lock.h"
 #include "dap_probe_priv.h"
 
 #include <inttypes.h>
@@ -13,63 +14,27 @@
 
 static const char *TAG = "DAP";
 
-/*
- * Bits clocked after a reply's CRC, with the target still driving.
- *
- * Replies alternate - every second exchange answers - which is what leaving a
- * fixed amount of state behind per exchange looks like.  Making this adjustable
- * turns that into a measurement instead of a guess.
- */
-size_t dap_probe_trailer_bits;   /* zero: measured to be what the device wants */
+size_t dap_probe_trailer_bits;   /* clocks after a reply's CRC; zero by default */
 static size_t s_raw_window;     /* non-zero: dump this many raw reply bits */
 
-/*
- * How long to wait for a reply's start bit, in probe clocks.
- *
- * Starts at the DAPISC reset allowance and is re-derived whenever dapisc
- * reports a new value, because the window is a property of the device's
- * current configuration rather than a constant.  Getting this wrong is not
- * harmless: the reference sets MAXWAIT8 to 15, which is 120 clocks, and a
- * probe still waiting 248 then flushing 248 more on the timeout path turns the
- * first read after a dapisc into a failure that the *next* read silently
- * recovers from.
- */
+/* Reply start-bit wait in probe clocks; re-derived from each DAPISC value. */
 uint32_t dap_probe_max_wait = DAP_MAXWAIT_RESET_CYCLES;
-
-
 
 /* Widest reply this layer reads in one go: start bit is consumed separately. */
 #define DAP_REPLY_MAX_BITS     64
 
-/*
- * How many clocks to issue after a reply, with the target still driving.
- *
- * Zero is right for the bit-banged backend, which issues one implicitly: it
- * samples before raising the clock, so it is always one clock ahead of the
- * cells it has looked at.  The SPI backend samples on the edge and has no such
- * offset, so what the device needs after a reply becomes an explicit number
- * here rather than an accident of how the sampling loop is written.
- */
-/*
- * Dump `bits` raw reply bits instead of decoding, for every exchange until it
- * is set back to zero.  The frames sent are the real ones - that is the point.
- */
 void dap_probe_set_raw_window(size_t bits)
 {
     s_raw_window = bits;
 }
 
+/* Bit-bang needs zero (it samples one clock ahead); SPI needs an explicit count. */
 void dap_probe_set_trailer_bits(size_t n)
 {
     dap_probe_trailer_bits = n;
 }
 
-size_t dap_probe_get_trailer_bits(void)
-{
-    return dap_probe_trailer_bits;
-}
-
-esp_err_t dap_probe_init(uint32_t clock_hz)
+static esp_err_t dap_probe_init_locked(uint32_t clock_hz)
 {
 #if !AEL_BOARD_HAS_DAP_PROBE
     ESP_LOGW(TAG, "board has no DAP probe wiring");
@@ -95,9 +60,7 @@ esp_err_t dap_probe_park_idle(void)
     if (err != ESP_OK) {
         return err;
     }
-    /* dap_phy_init() already parks clock low, data high and TRST released;
-     * say so in the log, because a target that was held in reset coming back
-     * to life at this exact point is the symptom this explains. */
+    /* dap_phy_init() parks clock low, data high and TRST released. */
     ESP_LOGI(TAG, "DAP pins parked: TRST released (GPIO%d high), clock low",
              AEL_DAP_TRST_PIN);
     return ESP_OK;
@@ -106,25 +69,15 @@ esp_err_t dap_probe_park_idle(void)
 
 /*
  * Clock a frame out, turn the line around, wait out the busy stuffing and read
- * `reply_bits` of payload plus six CRC bits.
- *
- * The upstream CRC convention is the one part of this not pinned by
- * documentation, so the residue check is recorded rather than enforced: a
- * mismatch here is interesting, not fatal, and the raw payload is reported
- * either way.
+ * `reply_bits` of payload plus six CRC bits (none for a bare acknowledge).
+ * A bad CRC residue returns ESP_ERR_INVALID_CRC after a resync flush.
  */
-esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits,
+static esp_err_t dap_probe_exchange_locked(const dap_frame_t *frame, size_t reply_bits,
                           dap_exchange_t *out)
 {
     uint8_t bits[DAP_REPLY_MAX_BITS + 6];
 
-    /*
-     * The fabric does a whole exchange by itself, so when it is driving there
-     * is nothing here to assemble: hand it the frame's fields and take the
-     * answer.  Everything above this - read32, OCDS enable, the GDB target, the
-     * trace drain - is unchanged either way, which is the point of putting the
-     * switch at this level rather than in the PHY.
-     */
+    /* The FPGA fabric performs the whole exchange from the frame's fields. */
     if (dap_phy_fpga_in_use()) {
         uint32_t reply = 0;
         uint16_t waited = 0;
@@ -157,16 +110,7 @@ esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits,
     out->sent_word = dap_frame_word(frame);
     out->sent_bits = frame->len;
 
-    /*
-     * Idle clocks before every frame, not just the first.
-     *
-     * Measured: a sync preceded by eleven low clocks is answered every time,
-     * while the identical frame sent straight after a previous exchange is
-     * ignored - and that holds for sync itself, so it was never about which
-     * command.  The device needs the idle run to recognise a frame start.
-     * This is the same eleven clocks the reference probe sends before its own
-     * sync, which it turns out are not a one-off attach ritual.
-     */
+    /* Low clocks before every frame, so the device sees a clean start bit. */
     dap_phy_write_frame_with_lead(frame, DAP_FRAME_LEAD_CLOCKS);
     dap_phy_turnaround_to_read();
 
@@ -191,45 +135,25 @@ esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits,
     if (out->wait_cycles < 0) {
         out->timed_out = true;
         dap_phy_turnaround_to_write();
-        /* Flush the device back to Active::RECEIVE before anything else is
-         * attempted; see DAP_RESYNC_CLOCKS. */
+        /* Flush the device back to Active::RECEIVE; see DAP_RESYNC_CLOCKS. */
         dap_phy_idle_clocks(dap_probe_max_wait, 0);
         return ESP_ERR_TIMEOUT;
     }
 
     /*
-     * The timeout counter is deactivated by the start bit, so from here the
-     * clock may stop anywhere with no consequence.
-     *
-     * A reply that carries data is [start][RDATA][CRC6]; a bare acknowledge -
-     * client_set's, for one - is the start bit and nothing else.  Clocking six
-     * phantom CRC bits after an acknowledge runs the clock into the next
-     * telegram's space and gets the *following* command discarded, which then
-     * looks like an intermittent failure of that command rather than of this
-     * one.
+     * A data reply is [start][RDATA][CRC6]; an acknowledge is the start bit
+     * alone.  Clocking phantom CRC bits after an ack discards the next command.
      */
     const size_t to_read = reply_bits ? reply_bits + 6 : 0;
     if (to_read) {
-        /*
-         * All ones, CRC included, is not a reply - it is an undriven wire read
-         * as a reply.  This is where that is visible: the start-bit search
-         * cannot tell a floating high line from a legitimate start bit, and
-         * should not try, because requiring a leading zero broke the SPI
-         * backend's alignment.
-         */
+        /* All ones, CRC included, is an undriven wire, not a reply. */
         size_t ones = 0;
         for (size_t i = 0; i < to_read; i++) {
             ones += bits[i] ? 1u : 0u;
         }
         out->idle_high = (ones == to_read);
     }
-    /*
-     * Then a short trailer, still with the target driving.  The measured sync
-     * window ends around bit 42 while payload plus CRC accounts for 38, so
-     * something follows the CRC; leaving it unclocked risks parking the device
-     * mid-frame, which would explain why sync answers and every later frame
-     * finds the device back in receive and ignoring us.
-     */
+    /* Optional trailer clocks, still with the target driving. */
     uint8_t trailer[24];
     if (dap_probe_trailer_bits > sizeof(trailer)) {
         dap_probe_trailer_bits = sizeof(trailer);
@@ -253,31 +177,13 @@ esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits,
         out->crc_ok = true;
     }
 
-    /*
-     * A reply whose residue fails is not a reply.
-     *
-     * The start-bit search can still be fooled: late in a long wait window a
-     * glitch reads as low-then-high, the caller then clocks in idle-high bits,
-     * and the result is a confident 0xFFFF or 0xFFFFFFFF with a wait count
-     * near the window limit.  That is how four addresses - including a
-     * free-running timer read twice - all came back as 0xFFFFFFFF and were
-     * reported as successful reads.  The CRC is the discriminator and it was
-     * being recorded rather than enforced.
-     */
+    /* A failed residue means no reply (e.g. a glitch taken for a start bit). */
     if (!out->crc_ok) {
         dap_phy_idle_clocks(dap_probe_max_wait, 0);      /* flush to Active::RECEIVE */
         return ESP_ERR_INVALID_CRC;
     }
 
-    /*
-     * An acknowledge carries no CRC, so it is the one reply that cannot be
-     * checked - and a phantom start bit late in the wait window is
-     * indistinguishable from a real one by content.  It is distinguishable by
-     * *when* it arrives: the device answers within a few cycles of the
-     * command, while a glitch turns up near the limit.  Anything past
-     * DAP_ACK_MAX_WAIT is treated as no acknowledge, which stops a write from
-     * being reported as landed when nothing received it.
-     */
+    /* An ack has no CRC; one arriving later than DAP_ACK_MAX_WAIT is a glitch. */
     if (reply_bits == 0 && out->wait_cycles > DAP_ACK_MAX_WAIT) {
         out->timed_out = true;
         dap_phy_idle_clocks(dap_probe_max_wait, 0);
@@ -289,12 +195,7 @@ esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits,
 
 esp_err_t dap_probe_attach(dap_exchange_t *out, int attempts)
 {
-    /*
-     * Sync, retrying after a flush.  The first attach following a board reset
-     * regularly fails where the second succeeds, and MAXWAIT8 low clocks is
-     * the documented way to put the device back in Active::RECEIVE, so a
-     * retry is cheaper and more honest than reporting a dead target.
-     */
+    /* Retry sync after a MAXWAIT8 flush back to Active::RECEIVE. */
     esp_err_t err = ESP_FAIL;
 
     for (int i = 0; i < attempts; i++) {
@@ -319,16 +220,7 @@ esp_err_t dap_probe_sync(dap_exchange_t *out)
     if (!dap_frame_build(&f, DAP_CMD_SYNC, 63, 0, 0)) {
         return ESP_FAIL;
     }
-    /*
-     * `sync` is the one command sent with LEN all ones, as a JTAG-TAP safety
-     * measure while the pins may still be shared: the run of ones parks the TAP
-     * instead of risking a drift into instruction execution during a hot plug.
-     *
-     * It is preceded by eleven clocks with the line *low*, which is what the
-     * reference probe does - a 3-bit write of zeros then an 8-bit one, at
-     * 400 kHz.  An earlier draft used eight clocks held high, which was a
-     * guess and is now known to be wrong.
-     */
+    /* LEN all ones parks a JTAG TAP that may share the pins during hot plug. */
     return dap_probe_exchange(&f, 32, out);
 }
 
@@ -337,20 +229,9 @@ esp_err_t dap_probe_dapisc(uint16_t value, bool cold, dap_exchange_t *out)
     dap_frame_t f;
 
     /*
-     * Two telegram variants, and picking the wrong one gets silence.
-     *
-     * The long form - LEN 48, 66 bits, carrying the 16-bit value plus the
-     * 32-bit signature 0x4ABBAF53 - is the *initialisation* telegram, for use
-     * straight after PORST release or on the Enabled-to-Active transition.
-     * Once the device is Active, which a sync reply proves, the short form
-     * (LEN 16, no signature) is what reconfigures DAP options.
-     *
-     * Either way the device replies with the newly updated 16-bit DAPISC
-     * value, and it drives the start bit exactly 3 DAP0 cycles after the
-     * command's last CRC bit - a fixed delay, not wait stuffing.  A discarded
-     * command produces no reply at all: a CRC failure, a signature shifted the
-     * wrong way round, or an unsynchronised attach all look identical from
-     * here, which is why this code sends sync first and checks it answered.
+     * Cold: LEN 48 with the signature, for after PORST or Enabled-to-Active.
+     * Otherwise LEN 16 for an Active device.  The reply is the updated DAPISC,
+     * 3 DAP0 cycles after the last CRC bit; a rejected command gets no reply.
      */
     if (cold) {
         const uint64_t data = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | value;
@@ -368,12 +249,8 @@ esp_err_t dap_probe_dapisc(uint16_t value, bool cold, dap_exchange_t *out)
 }
 
 /*
- * Adopt the wait window the device is now configured for.
- *
- *   T_timeout = MAXWAIT8 * 8 * (1 + MW8E * 15)   DAP0 clocks
- *
- * MAXWAIT8 = 0 disables the device's timeout entirely, which means an internal
- * bus lockup would hang the probe; cap it rather than wait forever.
+ * T_timeout = MAXWAIT8 * 8 * (1 + MW8E * 15) DAP0 clocks.  MAXWAIT8 = 0
+ * disables the device timeout, so a fixed cap is used instead.
  */
 void dap_probe_note_dapisc(uint16_t dapisc)
 {
@@ -384,36 +261,6 @@ void dap_probe_note_dapisc(uint16_t dapisc)
                           : DAP_MAXWAIT_GENEROUS_CYCLES;
     ESP_LOGI(TAG, "wait window now %" PRIu32 " clocks (MAXWAIT8=%" PRIu32
                   " MW8E=%" PRIu32 ")", dap_probe_max_wait, maxwait8, mw8e);
-}
-
-esp_err_t dap_probe_dapisc_read(dap_exchange_t *out)
-{
-    dap_frame_t f;
-
-    /*
-     * The cold-attach form: LEN 48, carrying the 16-bit register value in the
-     * bits sent first and the 32-bit signature 0x4ABBAF53 above it.
-     *
-     * A USB capture of a miniWiggler attaching to this target shows exactly
-     * this frame - LEN 48, data 0x4ABBAF530F00 - and the register half 0x0F00
-     * sets MAXWAIT8 to 15 with MW8E clear.  The 16-bit form this code sent
-     * first drew no reply at all, which is consistent with the handshake not
-     * completing without the signature.
-     */
-    const uint64_t data = ((uint64_t)DAP_DAPISC_SIGNATURE << 16) | DAP_DAPISC_VALUE;
-
-    if (!dap_frame_build(&f, DAP_CMD_DAPISC, 48, data, 48)) {
-        return ESP_FAIL;
-    }
-    /*
-     * No reply is read back.  Measured on this target, the window after a
-     * LEN-48 dapisc is 200 bits of solid idle high - nothing drives the line -
-     * and the reference capture agrees once read correctly: the alternating
-     * pattern that turns up after its dapisc is sync's late reply, not
-     * dapisc's own.  The plan's "the register echoed back" does not hold for
-     * the cold-attach form.
-     */
-    return dap_probe_exchange(&f, 0, out);
 }
 
 esp_err_t dap_probe_client_set(uint8_t client, dap_exchange_t *out)
@@ -446,14 +293,8 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
     dap_frame_t f;
 
     /*
-     * A write telegram carries no size exponent - unlike a read, where the
-     * 7-bit selector holds one.  The width comes from LEN alone:
-     *
-     *   LEN     = 4 + n          (4-bit IO instruction plus n data bits)
-     *   payload = [instruction][data], both LSB first
-     *
-     * The reply is a bare start bit with no data and no CRC6, unless
-     * DAPISC.RC6 is enabled.
+     * Writes carry no size exponent: LEN = 4 + n, payload = [instruction][data]
+     * LSB first.  Reply is a bare start bit (no CRC6 unless DAPISC.RC6).
      */
     (void)size_exponent;
     if (data_bits > 32) {
@@ -464,11 +305,10 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
                          4u + data_bits)) {
         return ESP_FAIL;
     }
-    /* Writes acknowledge with a bare start bit, like client_set. */
     return dap_probe_exchange(&f, 0, out);
 }
 
-esp_err_t dap_probe_set_rw_mode(bool supervisor)
+static esp_err_t dap_probe_set_rw_mode_locked(bool supervisor)
 {
     dap_exchange_t x;
     const uint16_t conf = DAP_IOCONF_MODE_RW |
@@ -494,17 +334,11 @@ void dap_probe_log_ioinfo(uint16_t v)
              (v & DAP_IOINFO_IF_LCK)      ? " IF_LCK"      : "");
 }
 
-esp_err_t dap_probe_clear_error_state(void)
+static esp_err_t dap_probe_clear_error_state_locked(void)
 {
     dap_exchange_t x;
 
-    /*
-     * A bus error or protection fault puts Cerberus in Error State, where all
-     * IO_READ_* and IO_WRITE_* instructions are silently dropped.  Executing
-     * IO_SUPERVISOR - instruction 0xB, the same one that reads IOINFO - clears
-     * it.  Worth doing before a sequence, because the state survives whatever
-     * caused it, including an earlier session's mistake.
-     */
+    /* IO_SUPERVISOR (0xB, which also reads IOINFO) clears Error State. */
     const esp_err_t err = dap_probe_client_read(DAP_IO_INFO, 4, 16, &x);
     if (err == ESP_OK && (x.reply & (DAP_IOINFO_BUS_RST | DAP_IOINFO_IF_LCK |
                                      DAP_IOINFO_BUS_RD_ERR | DAP_IOINFO_BUS_WR_ERR))) {
@@ -513,16 +347,11 @@ esp_err_t dap_probe_clear_error_state(void)
     return err;
 }
 
-esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
+static esp_err_t dap_probe_read32_locked(uint32_t addr, uint32_t *value)
 {
     dap_exchange_t x;
 
-    /*
-     * IO_SET_ADDRESS (instruction 0x1) loads IOADDR - 32 bits for a full
-     * address, or 16 bits to change only the low half, which saves shift
-     * cycles for random access inside a 64 kB window.  Then IO_READ_WORD
-     * (0x5) at size exponent 5 returns the 32-bit word.
-     */
+    /* IO_SET_ADDRESS loads IOADDR (32 bits), then IO_READ_WORD fetches the word. */
     esp_err_t err = dap_probe_client_write(DAP_IO_SET_ADDRESS, 5, addr, 32, &x);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "IOADDR write for 0x%08" PRIX32 " not acknowledged (%s)",
@@ -542,7 +371,7 @@ esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
     return ESP_OK;
 }
 
-esp_err_t dap_probe_write32(uint32_t addr, uint32_t value)
+static esp_err_t dap_probe_write32_locked(uint32_t addr, uint32_t value)
 {
     dap_exchange_t x;
     esp_err_t err = dap_probe_client_write(DAP_IO_SET_ADDRESS, 5, addr, 32, &x);
@@ -553,17 +382,11 @@ esp_err_t dap_probe_write32(uint32_t addr, uint32_t value)
     return dap_probe_client_write(DAP_IO_WRITE_WORD, 5, value, 32, &x);
 }
 
-esp_err_t dap_probe_enable_ocds(void)
+static esp_err_t dap_probe_enable_ocds_locked(void)
 {
     /*
-     * Turn OCDS on, which the miniMCDS register space and the TRAM behind it
-     * need: with OSTATE.OEN clear, anything in 0xFB718000..0xFB71FFFF raises a
-     * bus error on the SRI slave interface.
-     *
-     * The four pattern writes to OEC.PAT must be contiguous.  Any other write
-     * to OEC in between, or any deviation in the values, resets the hardware
-     * matcher to its first step - which is why this is one function and not a
-     * sequence a caller can interleave with anything.
+     * With OSTATE.OEN clear, 0xFB718000..0xFB71FFFF bus-errors.  The four
+     * OEC.PAT writes must be contiguous or the matcher resets.
      */
     static const uint32_t pattern[4] = { 0xA1u, 0x5Eu, 0xA1u, 0x5Eu };
     uint32_t ostate = 0;
@@ -593,13 +416,7 @@ esp_err_t dap_probe_enable_ocds(void)
         return ESP_FAIL;
     }
 
-    /*
-     * Then the module's own clock.  OEN alone leaves the miniMCDS unreadable:
-     * enabling OCDS makes the register space *reachable*, but the block is
-     * still clock-gated, so CLC has to be written to zero to run it.  A CLC
-     * register stays accessible while its module is disabled - that is how a
-     * module gets enabled at all.
-     */
+    /* The miniMCDS is still clock-gated; CLC = 0 enables it. */
     if (dap_probe_write32(DAP_ADDR_MCDS_CLC, 0x00000000u) != ESP_OK) {
         ESP_LOGW(TAG, "miniMCDS CLC write failed");
     }
@@ -608,22 +425,16 @@ esp_err_t dap_probe_enable_ocds(void)
     return dap_probe_write32(DAP_ADDR_MCDS_CT, 0x8000u);
 }
 
-esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
+static esp_err_t dap_probe_blockread_locked(uint32_t addr, uint32_t *words, size_t count)
 {
     /*
-     * client_blockread: one telegram, many words, and the reason this project
-     * exists.  A single-word read costs a whole frame plus a reply per 4 bytes;
-     * a block read amortises the frame over up to 256 words.
-     *
-     * Telegram 0x0A, with the payload
+     * client_blockread (0x0A) payload:
      *   bit 0      request the 32-bit block CRC (CRCup) as a final parcel
      *   bit 1      CRC6 after every parcel, rather than only the last
      *   bits 9:2   word count, 1..255, with 0 meaning 256 words (1 kB)
      *   bits 39:10 word-aligned address, shifted right by two
-     * and LEN selecting the address form: 10 for none, 24 for a 14-bit
-     * address, 40 for a 30-bit one.  With an address present the device loads
-     * IOADDR itself, so no separate IO_SET_ADDRESS is needed, and IOADDR
-     * post-increments by four per word.
+     * LEN 10/24/40 = no/14-bit/30-bit address.  With an address the device
+     * loads IOADDR itself and post-increments by four per word.
      */
     dap_frame_t f;
     uint8_t     bits[32];
@@ -632,12 +443,7 @@ esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /*
-     * With the fabric driving, this is the call that stops being a loop.  Here
-     * every parcel costs a start-bit hunt and 32 software-clocked bits; there
-     * the whole block is one command and one burst, and the host never enters
-     * the per-parcel path at all.
-     */
+    /* The fabric does the whole block as one command and burst. */
     if (dap_phy_fpga_in_use()) {
         const uint64_t payload = ((uint64_t)(count & 0xFFu) << 2) |
                                  ((uint64_t)(addr >> 2) << 10);
@@ -684,3 +490,68 @@ esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
     return err;
 }
 
+/* -- locked entry points (dap_lock.h) -------------------------------------- */
+
+esp_err_t dap_probe_exchange(const dap_frame_t *frame, size_t reply_bits, dap_exchange_t *out)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_exchange_locked(frame, reply_bits, out);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_set_rw_mode(bool supervisor)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_set_rw_mode_locked(supervisor);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_clear_error_state(void)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_clear_error_state_locked();
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_read32_locked(addr, value);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_write32(uint32_t addr, uint32_t value)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_write32_locked(addr, value);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_enable_ocds(void)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_enable_ocds_locked();
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_blockread_locked(addr, words, count);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_probe_init(uint32_t clock_hz)
+{
+    dap_lock();
+    const esp_err_t err = dap_probe_init_locked(clock_hz);
+    dap_unlock();
+    return err;
+}

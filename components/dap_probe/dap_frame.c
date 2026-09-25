@@ -1,7 +1,6 @@
 /*
- * DAP frame assembly and CRC6.  Pure computation, no hardware: this file is
- * compiled both into the firmware and into a host test binary, so the wire
- * format can be verified against the documented vectors before a pin moves.
+ * DAP frame assembly and CRC6.  Pure computation, no hardware; also built
+ * into a host test binary.
  */
 
 #include "dap_frame.h"
@@ -30,11 +29,8 @@ bool dap_crc6_residue_ok(const uint8_t *bits, size_t nbits)
     uint8_t state = CRC6_FIBO_SEED;
 
     /*
-     * A true Fibonacci LFSR: the taps in CRC6_FIBO_POLY are XORed together
-     * with the incoming bit and the result is shifted in at the top.  This is
-     * deliberately a different topology from dap_crc6() above - an oracle that
-     * shared the generator's structure would only prove self-consistency,
-     * which is the exact mistake this protocol punishes.
+     * Fibonacci LFSR: taps XORed with the incoming bit, shifted in at the top.
+     * Deliberately a different topology from dap_crc6(), to be a real oracle.
      */
     for (size_t i = 0; i < nbits; i++) {
         uint8_t feedback = bits[i] & 1u;
@@ -70,8 +66,7 @@ bool dap_frame_build(dap_frame_t *f, uint8_t cmd, uint8_t len_field,
         return false;
     }
 
-    /* Kept for a PHY that assembles the frame in hardware and needs the fields
-     * rather than the bits; see the note on dap_frame_t. */
+    /* Kept for PHYs that assemble the frame in hardware. */
     f->cmd       = cmd;
     f->len_field = len_field;
     f->data      = data;

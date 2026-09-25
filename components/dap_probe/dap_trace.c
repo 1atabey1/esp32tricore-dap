@@ -13,11 +13,7 @@
 
 static const char *TAG = "DAP_TRACE";
 
-/*
- * The miniMCDS trace FIFO, repeated here rather than shared with dap_probe.c,
- * because these are the only addresses this file needs and a header of
- * addresses shared between two files is a header that grows.
- */
+/* miniMCDS trace FIFO registers. */
 #define TRACE_MCDS_BASE     0xFB718000u
 #define TRACE_FIFONOW       (TRACE_MCDS_BASE + 0x0200u)
 #define TRACE_FIFOBOT       (TRACE_MCDS_BASE + 0x0204u)
@@ -31,11 +27,7 @@ static const char *TAG = "DAP_TRACE";
 #define TRACE_PARAGRAPH     0x400u          /* 1 kB, the framing unit */
 #define TRACE_WORDS_PER_PAR (TRACE_PARAGRAPH / 4u)
 
-/*
- * Ring size.  The drain publishes at most one TRAM's worth per pass, and the
- * host reads over WiFi, whose latency spikes are what this absorbs; 64 kB is
- * eight whole buffers of slack and comes out of PSRAM, where there is room.
- */
+/* Output ring in PSRAM: eight TRAMs of slack against WiFi latency spikes. */
 #define TRACE_RING_BYTES    (64u * 1024u)
 
 static uint8_t          *s_ring;
@@ -75,11 +67,7 @@ static void ring_put(const uint8_t *src, size_t len)
     }
 }
 
-/*
- * Publish one paragraph.  Dropped whole rather than in part when the ring is
- * full: half a paragraph in the stream is worse than a missing one, because the
- * missing one is reported and the half is not.
- */
+/* Publish one paragraph, or drop it whole (and count it) if the ring is full. */
 static void publish(uint32_t par_index, const uint32_t *words, uint32_t lost)
 {
     const dap_trace_record_t hdr = {
@@ -104,15 +92,8 @@ static void publish(uint32_t par_index, const uint32_t *words, uint32_t lost)
     xSemaphoreGive(s_lock);
 }
 
-/*
- * Everything dap_trace_start() does except spawn the drain task.
- *
- * Split out for the self-test, which has to write the FIFO pointer itself and
- * cannot do that while a background task is driving the same DAP: there is one
- * probe and no lock around it, so two tasks issuing frames interleave and the
- * result is neither one's.  The self-test calls this and then polls in its own
- * thread of control.
- */
+/* dap_trace_start() without the drain task, so the self-test can poll from its
+ * own thread (DAP access is not locked). */
 static esp_err_t trace_begin(void);
 
 esp_err_t dap_trace_start(void)
@@ -163,12 +144,7 @@ static esp_err_t trace_begin(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /*
-     * Zero the warning comparators.  Their purpose is to halt the buffer at a
-     * threshold so a host can catch up, which is exactly the behaviour this
-     * replaces - the drain follows the pointer instead, and a halted buffer
-     * would stall the application under test rather than lose a paragraph.
-     */
+    /* Zero the warning comparators so the FIFO never halts at a threshold. */
     dap_probe_write32(TRACE_FIFOWARN0, 0);
     dap_probe_write32(TRACE_FIFOWARN1, 0);
 
@@ -202,14 +178,8 @@ void dap_trace_stop(void)
     s_stats.running = false;
 }
 
-/*
- * Everything a poll does once it knows where the write pointer is.
- *
- * Split from the read of FIFONOW so the self-test can say where the pointer is
- * rather than having to move it: that register is written by the trace
- * hardware and is not writable over the DAP, so a self-test that needed it to
- * be would not have been a test of anything.
- */
+/* A drain pass for a given write pointer; FIFONOW is not DAP-writable, so the
+ * self-test passes its own. */
 static esp_err_t drain_to(uint32_t now, uint32_t ovr)
 {
     static uint32_t words[TRACE_WORDS_PER_PAR];
@@ -217,11 +187,7 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     const int64_t t0 = esp_timer_get_time();
 
     if (ovr != s_last_ovrcnt) {
-        /*
-         * Observation-unit overflow, which is a different loss from a TRAM lap:
-         * messages never reached the buffer.  The stream carries an ERR message
-         * for it, so it is counted here and not turned into a gap record.
-         */
+        /* Observation-unit overflow: the stream has an ERR message, so no gap record. */
         s_stats.overruns += (ovr - s_last_ovrcnt);
         s_last_ovrcnt = ovr;
     }
@@ -229,21 +195,11 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     const uint32_t total_par = s_span / TRACE_PARAGRAPH;
     const uint32_t now_par   = ((now - s_bot) % s_span) / TRACE_PARAGRAPH;
 
-    /*
-     * How many complete paragraphs are waiting.  The pointer's own paragraph is
-     * excluded because it is still being written, so a drain that is fully
-     * caught up has nothing to do.
-     */
+    /* Complete paragraphs waiting, excluding the one still being written. */
     uint32_t available = (now_par + total_par - s_next_par) % total_par;
 
-    /*
-     * A lap: the pointer has come all the way round and is writing into
-     * paragraphs we had not read yet.  There is no ERR for this, so it is
-     * detected by arithmetic and reported explicitly - which is the whole
-     * difference between a stream a decoder can trust and one it cannot.
-     *
-     * Everything still unread is gone; resume at the pointer's paragraph.
-     */
+    /* Lapped (no ERR for this): everything unread is lost; resume at the
+     * pointer's paragraph and flag a gap. */
     uint32_t lost = 0;
     if (available >= total_par - 1u && available != 0u) {
         lost = available - (total_par - 1u) + 1u;
@@ -296,18 +252,8 @@ esp_err_t dap_trace_poll(void)
     return drain_to(now, ovr);
 }
 
-/*
- * The drain task.
- *
- * It does not sleep while there is anything to read, and that is not laziness
- * about pacing: three signals from a 20 kHz task come to roughly 400 kB/s of
- * messages, against 453 kB/s of block-read throughput, so a paragraph arrives
- * about every 2.5 ms and takes about 2.2 ms to read.  There is no idle time to
- * spend in a delay when a capture is actually running, and the 8 kB buffer is
- * only eight paragraphs of slack.  When the buffer is empty - no tracing
- * configured, or a slow application - it drops to a 2 ms tick so the rest of
- * the system gets the core back.
- */
+/* Drain task: never sleeps while data waits (read time is close to the arrival
+ * rate); 2 ms tick when idle. */
 static void trace_task(void *arg)
 {
     (void)arg;
@@ -355,20 +301,8 @@ void dap_trace_get_stats(dap_trace_stats_t *out)
 /* Self-test                                                                  */
 /* ------------------------------------------------------------------------- */
 
-/*
- * Drive the drain with data we control, since the target is not tracing.
- *
- * The trace buffer and the FIFO write pointer are both ordinary memory as far
- * as the DAP is concerned, so a pattern can be written into two paragraphs and
- * the pointer moved over them - which is what the miniMCDS does when it is
- * tracing, at a rate this can control.  Everything after that point is the
- * real code path: the same poll, the same publish, the same ring, the same
- * read the HTTP stream uses.
- *
- * Two paragraphs rather than one, because a single one cannot show that the
- * paragraph index advances; the sequence numbers and TRAM offsets are checked
- * as well as the payload, for the same reason.
- */
+/* Write a pattern into two paragraphs (so the index is seen to advance) and run
+ * the real drain, ring and read path over them. */
 #define SELFTEST_PARAGRAPHS  2u
 
 esp_err_t dap_trace_selftest(void)
@@ -389,8 +323,7 @@ esp_err_t dap_trace_selftest(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* A pattern that is wrong in an obvious way if anything shifts: the
-     * paragraph index in the top byte, the word index below it. */
+    /* Paragraph index in the top byte, word index below it. */
     for (uint32_t par = 0; par < SELFTEST_PARAGRAPHS; par++) {
         const uint32_t addr = TRACE_TRAM_BASE + bot + par * TRACE_PARAGRAPH;
 
@@ -403,12 +336,7 @@ esp_err_t dap_trace_selftest(void)
             }
         }
 
-        /*
-         * Read one word back before trusting any of it.  A write that returns
-         * success has been acknowledged, not necessarily applied - the first
-         * version of this checked FIFONOW's writability by writing the value
-         * it already held, which read back correctly and proved nothing.
-         */
+        /* An acknowledged write is not necessarily applied; read one back. */
         uint32_t check = 0;
         const uint32_t want = (par << 24) | 1u;
         if (dap_probe_read32(addr + 4u, &check) != ESP_OK || check != want) {
@@ -418,18 +346,13 @@ esp_err_t dap_trace_selftest(void)
         }
     }
 
-    /* No background task: this thread drives the poll, so nothing else is
-     * issuing DAP frames while the pointer is being moved. */
+    /* No background task: this thread drives the poll. */
     if (trace_begin() != ESP_OK) {
         return ESP_FAIL;
     }
 
-    /*
-     * Tell the drain the pointer has moved past what was written, rather than
-     * moving it - FIFONOW belongs to the trace hardware and ignores writes.
-     * The drain excludes the pointer's own paragraph as still being written,
-     * so naming the one after them is what makes both complete.
-     */
+    /* Report the pointer one paragraph past the pattern, so both count as
+     * complete. */
     s_next_par = 0;
 
     size_t n = 0;

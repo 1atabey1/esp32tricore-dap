@@ -1,4 +1,5 @@
 #include "dap_phy_fpga.h"
+#include "dap_lock.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -20,36 +21,13 @@ static const char *TAG = "DAP_FPGA";
 /* Provided by the application, which owns the SPI buses. */
 extern esp_err_t spi_release_xvc_bus(void);
 
-/*
- * The FPGA sits on the bus the application already set up for the fabric -
- * AEL_PIN_NUM_CLK/MOSI/MISO with CS0 - and that same bus is what loads the
- * bitstream.  So this adds a device rather than taking the bus over: nothing
- * else needs to be torn down, and configuration still works afterwards.
- */
+/* FPGA link: AEL_PIN_NUM_CLK/MOSI/MISO, CS0 driven by hand. */
 #define FPGA_SPI_HOST   SPI2_HOST
 
-/*
- * 11.4 MHz, which is 80/7 and the last step below the ceiling.
- *
- * The fabric runs at 48 MHz and its SPI slave oversamples an asynchronous SCK,
- * so it needs sysclk >= 4x SCK - 12 MHz.  Past that it does not degrade
- * gracefully, it drops bits silently.
- *
- * This is the system's bottleneck, and by some margin.  With the wire at
- * 24 MHz a 1 kB block spends 0.35 ms on the DAP and 0.72 ms shifting the
- * answer over this link, so every further doubling of the wire - wide mode
- * included - buys almost nothing until the slave stops oversampling SCK and
- * clocks it directly.  It started at 1 MHz, where the drain took 8 ms of a
- * 13 ms block and the whole thing managed 75 kB/s.
- */
+/* Must be an integer division of the 80 MHz APB clock. */
 #define FPGA_SPI_HZ     (40000 * 1000)
 
-/*
- * Bytes to collect per drain while a block is still arriving.  Each drain is a
- * transaction of its own, so too small and the per-transaction overhead
- * outweighs the overlap; too large and the last chunk waits on the whole block
- * anyway.  Half a block is the compromise.
- */
+/* Minimum bytes per FIFO drain while a block is still arriving (half a block). */
 #define DRAIN_CHUNK     512
 
 /* Register map, mirrored from fpga/dap_master/rtl/dap_top.v. */
@@ -75,7 +53,6 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_FIFO        0x40
 #define REG_WLEVEL      0x43    /* 16-bit, bytes waiting in the write FIFO */
 #define REG_WFIFO       0x48    /* byte port into the write FIFO */
-#define REG_SCAN        0x41    /* 16-bit: every other BANK0 pad's level */
 
 #define CTRL_START_FRAME (1u << 0)
 #define CTRL_START_BLOCK (1u << 1)
@@ -99,30 +76,13 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define FLAG_RAW_FRAME   (1u << 3)
 #define FLAG_RX_WIDE     (1u << 5)
 
-/*
- * The wide-mode start-bit alignment, in the reply group's spare slot.
- *
- * Where it is read from is not cosmetic: it comes from the receiver, at the far
- * end of the chip from the register read mux, so the decode it joins decides
- * how much clock it costs.  In the control group the bitstream closes 46.7 MHz;
- * in LEVEL's high byte, which this file's own drain loop polls thousands of
- * times per block, 48.5 - at which it starts losing bytes at the slow
- * dividers.  Here, in a slot the reply group already spent on a constant, it
- * closes 50.4.
- */
-#define REG_LINES        0x27
+/* Wide-mode start-bit alignment. */
+#define REG_LINES       0x27
 #define LINES_ALIGNED    (1u << 0)
-#define LINES_TX2_LO     (1u << 1)
-#define LINES_TX2_HI     (1u << 2)
-#define LINES_RX2_LO     (1u << 3)
-#define LINES_RX2_HI     (1u << 4)
-#define LINES_RX1_LO     (1u << 5)
-#define LINES_RX1_HI     (1u << 6)
 
 #define WRITE_BIT        0x80
 
-/* Longest a command should ever take: a 256-parcel block at the slowest
- * sensible bit rate is a few milliseconds, so this is generous. */
+/* Upper bound for any command; a 256-parcel block takes a few ms. */
 #define OP_TIMEOUT_MS    250
 
 static spi_device_handle_t s_dev;
@@ -136,40 +96,17 @@ static WORD_ALIGNED_ATTR uint8_t s_buf[1024];
 /* Register access                                                           */
 /* ------------------------------------------------------------------------ */
 
-/*
- * The header byte goes in the command phase rather than the data phase.  In
- * half-duplex with DMA that keeps the address out of the way of the payload,
- * which is what lets a 1 kB read be one transaction the host does not touch.
- */
-/* The select, held for the whole transaction - header byte included, since the
- * fabric latches the address on the first eight clocks after it falls. */
+/* CS is held for the whole transaction; the first byte after it falls is the header. */
 static inline void cs_low(void)  { gpio_set_level(AEL_PIN_NUM_CS0, 0); }
 static inline void cs_high(void) { gpio_set_level(AEL_PIN_NUM_CS0, 1); }
 
-/*
- * Header and payload in one full-duplex transfer, not a command phase.
- *
- * The fabric slave counts every clock from the select falling and treats the
- * first eight as the header - which is exactly what the simulation verified,
- * with the header driven as an ordinary first byte.  Sending it as an ESP-IDF
- * command phase instead is a different shape on the wire, and the symptom was
- * a slave that saw the select and the clocks and still shifted out nothing.
- *
- * Full duplex also means one buffer carries both directions, so a read is
- * "send the header then clock zeros, take what comes back from byte one".
- */
+/* Header and payload in one full-duplex transfer. */
 static WORD_ALIGNED_ATTR uint8_t s_tx[1088];
 static WORD_ALIGNED_ATTR uint8_t s_rx[1088];
 
 static esp_err_t xfer(uint8_t header, const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    /*
-     * A read costs one byte more than a write: the header, then a dummy the
-     * fabric sends while it fetches, then the data.  That byte is what gives
-     * the register file a whole byte time to answer instead of half an SCK
-     * period, which is what lets the fabric clock reach 48 MHz - and at 0.1%
-     * of a 1 kB block it is the cheapest part of this.
-     */
+    /* Write: header, data.  Read: header, dummy byte, data. */
     const size_t lead = (rx != NULL) ? 2u : 1u;
 
     if (len + lead > sizeof(s_tx)) {
@@ -220,12 +157,6 @@ static uint8_t reg_read8(uint8_t addr)
     const esp_err_t err = reg_read(addr, &v, 1);
 
     if (err != ESP_OK) {
-        /*
-         * Returning zero on a failed transaction is indistinguishable from the
-         * fabric answering zero, and that ambiguity cost real time here: every
-         * symptom pointed at the slave while the transfer may never have been
-         * issued at all.
-         */
         ESP_LOGE(TAG, "register read of 0x%02X failed: %s", addr, esp_err_to_name(err));
         return 0;
     }
@@ -242,16 +173,7 @@ esp_err_t dap_phy_fpga_init(void)
         return ESP_OK;
     }
 
-    /*
-     * Chip select driven by hand, not by the driver.
-     *
-     * The same pin is the bitstream loader's chip select, and that loader
-     * bit-bangs it with gpio_set_level - which only works while the pad is
-     * under GPIO control.  Configuration demonstrably works, so the pad is GPIO
-     * controlled, which means the driver's CS signal is *not* reaching it and a
-     * driver-managed select would never assert.  The existing logic-analyser
-     * device on this bus drives its own select for the same reason.
-     */
+    /* CS is driven by hand: the driver's CS does not reach the FPGA. */
     const spi_device_interface_config_t dev = {
         .clock_speed_hz = FPGA_SPI_HZ,
         .mode           = 0,                      /* what the fabric expects */
@@ -260,20 +182,6 @@ esp_err_t dap_phy_fpga_init(void)
         .flags          = 0,
     };
 
-    /*
-     * Take the bus over rather than assuming what it was set up with.
-     *
-     * Adding a device to an existing bus inherits that bus's pin assignment,
-     * and this one is shared: the application configures it for the fabric, the
-     * GP-SPI DAP backend re-initialises it on the DAP pins, and the bitstream
-     * loader takes the pads back as plain GPIO in between.  Pointing the pads
-     * at the peripheral by hand is not enough if the peripheral is set up for a
-     * different set of pins - which showed up as a transaction that returned
-     * success and produced almost no clock edges at all.
-     *
-     * Freeing first costs the XVC devices, which is the same trade the DAP
-     * bitstream already makes: the fabric it needs is not loaded anyway.
-     */
     spi_release_xvc_bus();
 
     const spi_bus_config_t bus = {
@@ -296,21 +204,7 @@ esp_err_t dap_phy_fpga_init(void)
         return err;
     }
 
-    /*
-     * Put the pads back under the SPI peripheral.
-     *
-     * Configuring the FPGA bit-bangs these same pins, and doing that requires
-     * taking them back as plain GPIO - so after any bitstream load the
-     * peripheral is no longer connected to them and every transaction here
-     * would go nowhere.  Adding a device does not re-route them; bus
-     * initialisation did that once, long ago.
-     *
-     * Direction first, signal second: gpio_set_direction ends by pointing the
-     * pad at the GPIO output register, so doing it afterwards would quietly
-     * undo the wiring.
-     */
-    /* The select is ours to drive, so make sure the pad is plain GPIO and
-     * parked deselected before the first transaction. */
+    /* Reclaim the pads for SPI; FPGA configuration bit-bangs them. */
     gpio_set_direction(AEL_PIN_NUM_CS0, GPIO_MODE_OUTPUT);
     gpio_set_level(AEL_PIN_NUM_CS0, 1);
 
@@ -328,21 +222,6 @@ esp_err_t dap_phy_fpga_init(void)
                                    spi_periph_signal[FPGA_SPI_HOST].spiq_in,
                                    false);
 
-    /*
-     * Say what the pads are actually pointing at.
-     *
-     * This is the check that found the equivalent fault in the GP-SPI backend:
-     * a pad whose output selector still says "plain GPIO" ignores the
-     * peripheral completely, and the only symptom is a slave that sees a select
-     * and no clock - which is exactly what the fabric reported here.
-     */
-    /*
-     * What the driver actually settled on, not what was asked for.  The fabric
-     * synchronises SCK against a 24 MHz clock and needs at least four of its
-     * clocks per SCK period; a link running far above the request would alias
-     * almost every edge away, which looks exactly like a slave that never
-     * counts a byte.
-     */
     int actual_hz = 0;
     if (spi_device_get_actual_freq(s_dev, &actual_hz) == ESP_OK) {
         ESP_LOGI(TAG, "link clock: asked %d kHz, got %d kHz%s",
@@ -361,13 +240,7 @@ esp_err_t dap_phy_fpga_init(void)
              (unsigned)spi_periph_signal[FPGA_SPI_HOST].spid_out,
              (unsigned)SIG_GPIO_OUT_IDX);
 
-    /*
-     * Prove the DAP bitstream is loaded before anything trusts a register.
-     * Under the stock image these addresses do not exist, and a read returns
-     * whatever the logic-analyser fabric happens to drive - which can look
-     * entirely plausible.  Writing a register and reading it back is the
-     * cheapest thing only the right image can do.
-     */
+    /* Prove the DAP bitstream is loaded: TRAIL must read back what was written. */
     const uint8_t probe_values[] = { 0x5A, 0xA5, 0x2C };
     bool answered = true;
 
@@ -379,12 +252,6 @@ esp_err_t dap_phy_fpga_init(void)
             break;
         }
         const uint8_t got = reg_read8(REG_TRAIL);
-        /*
-         * Log what came back, not just whether it matched.  The difference
-         * between 0x00, 0xFF and a shifted copy of what was written is the
-         * difference between nothing driving the line, a floating input and a
-         * timing fault - three different bugs that a bare pass/fail hides.
-         */
         ESP_LOGI(TAG, "  probe: wrote 0x%02X, read 0x%02X%s",
                  probe_values[i], got, (got == probe_values[i]) ? "" : "  <- differs");
         if (got != probe_values[i]) {
@@ -409,14 +276,7 @@ esp_err_t dap_phy_fpga_init(void)
 
 void dap_phy_fpga_invalidate(void)
 {
-    /*
-     * Configuring the FPGA resets everything behind these registers, but the
-     * host's own idea of the link survives it - so init() returns early, the
-     * probe that proves the DAP image is loaded never runs, and the divider,
-     * trail and maxwait the host believes it set are back at their defaults.
-     * That presented as sync returning zero on a route that had just worked,
-     * with nothing in the log pointing at the reload.
-     */
+    /* FPGA reconfiguration resets every register. */
     s_in_use = false;
     s_ready  = false;
     if (s_dev != NULL) {
@@ -438,19 +298,6 @@ esp_err_t dap_phy_fpga_set_div(uint8_t div)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    /*
-     * Zero is a real setting: a one-clock half period, so DAP0 runs at half
-     * the fabric clock and a bit costs two clocks.  24 MHz on a 48 MHz fabric.
-     *
-     * It took both ends of the bit to get there.  The transmitter used to
-     * change DAP1 a clock *after* the falling edge, which leaves (half period
-     * - 1) clocks of setup - fine at a divider of 1 and nothing at all at 0 -
-     * so the data moved as the target latched it.  And the receiver sees DAP1
-     * two clocks late through its synchroniser, so at a two-clock bit there is
-     * no instant inside the bit that old; it samples the middle of the
-     * previous bit instead and the whole reply simply arrives one bit later,
-     * which costs nothing because the start-bit hunt shifts with it.
-     */
     return reg_write8(REG_DIV, div);
 }
 
@@ -465,19 +312,13 @@ esp_err_t dap_phy_fpga_set_maxwait(uint16_t clocks)
     return s_ready ? reg_write(REG_MAXWAIT, v, sizeof(v)) : ESP_ERR_INVALID_STATE;
 }
 
-/* FLAGS holds both bits, so it is tracked here rather than read back before
- * every change - a read-modify-write on a register only this file touches. */
+/* Shadow of REG_FLAGS (write-only from here). */
 static uint8_t s_flags;
 
 esp_err_t dap_phy_fpga_set_trst(bool asserted)
 {
     s_flags = (uint8_t)((s_flags & ~FLAG_TRST) | (asserted ? FLAG_TRST : 0u));
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
-}
-
-esp_err_t dap_phy_fpga_set_lead(uint8_t clocks)
-{
-    return s_ready ? reg_write8(REG_LEAD, clocks) : ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t dap_phy_fpga_set_raw_window(bool enable)
@@ -487,32 +328,12 @@ esp_err_t dap_phy_fpga_set_raw_window(bool enable)
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
 }
 
-/*
- * Wide mode, on the probe side only.
- *
- * This changes how the fabric frames and samples; it says nothing to the
- * device.  The device is told by a DAPISC telegram with MODE = 01B, and the
- * order matters - the telegram itself has to go out narrow, because until the
- * device has read it that is the only framing it understands.  So a caller
- * turns this on *after* the telegram is acknowledged, and back off before
- * anything that needs to talk to a device that has been reset.
- */
 esp_err_t dap_phy_fpga_set_wide(bool enable)
 {
     s_flags = (uint8_t)((s_flags & ~FLAG_WIDE) | (enable ? FLAG_WIDE : 0u));
     return s_ready ? reg_write8(REG_FLAGS, s_flags) : ESP_ERR_INVALID_STATE;
 }
 
-/*
- * Sample both lines without driving DAP2.
- *
- * Looking at what DAP2 is doing must not mean driving it.  In two-pin mode
- * that pin belongs to the target's application, which configures it as a
- * push-pull output - so a wide transmission from this end puts two drivers on
- * one net through a 22 ohm series resistor, about 150 mA, and enough frames of
- * that brown the board out.  This receives wide and transmits narrow, which is
- * safe against a target that has not handed the pin over yet.
- */
 esp_err_t dap_phy_fpga_set_rx_wide(bool enable)
 {
     s_flags = (uint8_t)((s_flags & ~FLAG_RX_WIDE) |
@@ -525,14 +346,6 @@ bool dap_phy_fpga_is_wide(void)
     return (s_flags & FLAG_WIDE) != 0u;
 }
 
-/*
- * Where in the two-clock-deep window each line is sampled.
- *
- * Tap 0 is what narrow mode has always used.  The silicon does not promise
- * DAP1 and DAP2 leave the pads together, and at the fastest divider a bit is
- * two fabric clocks, so one clock of skew between them is half a bit - which
- * is why this exists at all and why it is per line.
- */
 esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap)
 {
     if (dap1_tap > 3 || dap2_tap > 3) {
@@ -542,100 +355,14 @@ esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap)
     return s_ready ? reg_write8(REG_SKEW, v) : ESP_ERR_INVALID_STATE;
 }
 
-/*
- * Did the last reply's start bit arrive on DAP2 at the same sample as on DAP1?
- *
- * The start bit is the one bit the device drives on both lines together, so
- * this is the only direct evidence the two taps are set consistently.  It is
- * read from LEVEL's high byte rather than STATUS because STATUS had no bit
- * left and that byte had four.
- */
-bool dap_phy_fpga_last_aligned(void)
-{
-    if (!s_ready) {
-        return false;
-    }
-    return (reg_read8(REG_LINES) & LINES_ALIGNED) != 0u;
-}
-
-/*
- * Send a frame the caller assembled, bit for bit.
- *
- * `bits` is the whole thing - start bit, CMD, LEN, DATA, CRC6, trailing zero -
- * with the first bit on the wire in bit 0, and `nbits` of them.  In wide mode
- * consecutive pairs share a clock, bit 0 on DAP1 and bit 1 on DAP2, so a
- * caller that wants the start bit on both lines puts a one in each of the
- * first two positions.
- *
- * The fabric assembles nothing and checks nothing here: no CRC is generated
- * and none is expected back unless the caller asks for one.  That is the
- * point - the wide framing rule is not documented anywhere this project can
- * reach, so it has to be found by trying candidates, and a candidate that the
- * fabric would have "corrected" on the way out tests nothing.
- */
-esp_err_t dap_phy_fpga_raw_frame(uint64_t bits, size_t nbits,
-                                 size_t reply_bits,
-                                 uint32_t *reply, uint16_t *wait_cycles)
-{
-    if (!s_ready || nbits == 0 || nbits > 63) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    s_flags |= FLAG_RAW_FRAME;
-    const esp_err_t ferr = reg_write8(REG_FLAGS, s_flags);
-
-    /* CMD and LEN are ignored in this mode; DBITS is the frame length. */
-    /* CMD and LEN go out as zero and are ignored; DBITS carries the length. */
-    const esp_err_t err = ferr == ESP_OK
-        ? dap_phy_fpga_exchange(0, 0, bits, nbits, reply_bits,
-                                reply, wait_cycles)
-        : ferr;
-
-    s_flags &= (uint8_t)~FLAG_RAW_FRAME;
-    reg_write8(REG_FLAGS, s_flags);
-    return err;
-}
-
-/*
- * The level on every BANK0 pad this design does not otherwise use.
- *
- * Bit n is the pad named scan[n] in the PCF.  Only useful for chasing where a
- * target signal actually lands: with the target toggling one of its pins, the
- * bit that follows names the pad it reaches, and no bit following says no free
- * pad reaches it.
- */
-uint16_t dap_phy_fpga_pad_scan(void)
-{
-    uint8_t raw[2] = {0};
-
-    if (!s_ready) {
-        return 0;
-    }
-    reg_read(REG_SCAN, raw, sizeof(raw));
-    return (uint16_t)raw[0] | (uint16_t)((uint16_t)raw[1] << 8);
-}
-
-uint8_t dap_phy_fpga_line_witness(void)
-{
-    return s_ready ? reg_read8(REG_LINES) : 0u;
-}
-
-
-
 /* ------------------------------------------------------------------------ */
 /* Exchanges                                                                 */
 /* ------------------------------------------------------------------------ */
 
-/* Poll STATUS until the sequencer reports done, or give up. */
-/*
- * How long to spin before yielding, in microseconds.
- *
- * Every frame that is going to work finishes far inside this - a 1 kB block is
- * about 2 ms at the slowest divider and a single frame is microseconds - so the
- * fast path never gets here and never pays for a context switch.
- */
+/* Busy-poll this long before yielding; normal frames finish well inside it. */
 #define SPIN_BEFORE_YIELD_US  3000
 
+/* Poll STATUS until the sequencer reports done, or give up. */
 static esp_err_t wait_done(uint8_t *status_out)
 {
     const int64_t start    = esp_timer_get_time();
@@ -654,17 +381,7 @@ static esp_err_t wait_done(uint8_t *status_out)
             return ESP_ERR_TIMEOUT;
         }
 
-        /*
-         * Yield once the frame is clearly not coming back.
-         *
-         * This loop used to spin flat out for the whole timeout, which is
-         * invisible while frames are answered and catastrophic when they are
-         * not: a sweep that sends eighty frames to a target that has stopped
-         * listening holds the CPU for twenty seconds without yielding, and the
-         * web server, WiFi and console all starve behind it.  That is how a
-         * wide-mode experiment turned into a board that had to be power-cycled
-         * - the firmware was fine, it simply never got scheduled.
-         */
+        /* Yield once the frame is clearly slow. */
         if (now - start > SPIN_BEFORE_YIELD_US) {
             vTaskDelay(1);
         }
@@ -682,11 +399,7 @@ static esp_err_t load_frame(uint8_t cmd, uint8_t len_field,
     if (reg_write(REG_DATA, payload, sizeof(payload)) != ESP_OK) {
         return ESP_FAIL;
     }
-    /*
-     * CMD, LEN, DBITS and RBITS are consecutive, so one auto-incrementing
-     * burst sets all four - which is the same property that makes the block
-     * read cheap, used here to keep an ordinary exchange to three transactions.
-     */
+    /* CMD, LEN, DBITS, RBITS are consecutive: one auto-incrementing burst. */
     const uint8_t regs[4] = {
         (uint8_t)(cmd & 0x1F),
         (uint8_t)(len_field & 0x3F),
@@ -696,10 +409,10 @@ static esp_err_t load_frame(uint8_t cmd, uint8_t len_field,
     return reg_write(REG_CMD, regs, sizeof(regs));
 }
 
-esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
-                                uint64_t data, size_t data_bits,
-                                size_t reply_bits,
-                                uint32_t *reply, uint16_t *wait_cycles)
+static esp_err_t dap_phy_fpga_exchange_locked(uint8_t cmd, uint8_t len_field,
+                                              uint64_t data, size_t data_bits,
+                                              size_t reply_bits,
+                                              uint32_t *reply, uint16_t *wait_cycles)
 {
     uint8_t status = 0;
 
@@ -719,24 +432,12 @@ esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
     }
 
     if (status & (ST_TIMED_OUT | ST_IDLE_HIGH)) {
-        /*
-         * Read the command registers back before blaming the target.  The
-         * frame the fabric sent is built from these, not from anything the
-         * host keeps, so a byte that failed to land produces a perfectly
-         * formed frame that says the wrong thing - and the only symptom is
-         * silence, which looks identical to a target that is not listening.
-         */
+        /* Log what the fabric holds versus what was asked for. */
         uint8_t regs[4] = {0};
         uint8_t payload[8] = {0};
         reg_read(REG_CMD, regs, sizeof(regs));
         reg_read(REG_DATA, payload, sizeof(payload));
-        /*
-         * Debug level, not warning.  A frame drawing no reply is an ordinary
-         * outcome once this path is the default - an address that bus-errors
-         * answers exactly this way - and at warning level it buried the boot
-         * log.  It is the instrument that found the attach fault, so it stays,
-         * behind a log level rather than deleted.
-         */
+
         ESP_LOGD(TAG, "  no reply; fabric holds cmd=0x%02X len=%u dbits=%u "
                       "rbits=%u data=%02X%02X%02X%02X%02X%02X%02X%02X",
                  regs[0], regs[1], regs[2], regs[3],
@@ -763,9 +464,7 @@ esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
         return ESP_ERR_TIMEOUT;
     }
     if (status & ST_IDLE_HIGH) {
-        /* Nobody was driving the wire.  Distinct from a timeout, and worth
-         * keeping distinct: it means the target is absent or unpowered rather
-         * than slow. */
+        /* Nothing drove the wire: target absent or unpowered. */
         return ESP_ERR_NOT_FOUND;
     }
     if (!(status & ST_CRC_OK)) {
@@ -774,8 +473,8 @@ esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
     return ESP_OK;
 }
 
-esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
-                                 uint32_t *words, size_t count)
+static esp_err_t dap_phy_fpga_blockread_locked(uint64_t cmd_payload, size_t payload_bits,
+                                               uint32_t *words, size_t count)
 {
     uint8_t status = 0;
 
@@ -786,8 +485,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
     reg_write8(REG_CTRL, CTRL_CLEAR_FIFO);
     reg_write8(REG_PARCELS, (uint8_t)(count - 1));
 
-    /* DAP_CMD_CLIENT_BLOCKREAD is 0x0A with a 40-bit payload; the caller
-     * supplies the payload it has already assembled. */
+    /* DAP_CMD_CLIENT_BLOCKREAD (0x0A); payload assembled by the caller. */
     if (load_frame(0x0Au, (uint8_t)payload_bits, cmd_payload, payload_bits, 0) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -800,20 +498,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /*
-     * Drain while the block is still arriving, rather than after it.
-     *
-     * The two halves cost about the same - a 1 kB block is ~2.1 ms on the wire
-     * at 4 MHz and ~1.6 ms to shift out over a 5 MHz link - so running them one
-     * after the other spends nearly twice as long as the wire needs.  The FIFO
-     * holds a whole block, so this is not required for correctness; it is
-     * required for the fabric to be faster than the CPU path it replaces.
-     *
-     * STATUS and LEVEL are next to each other in the map, so one burst read of
-     * the low registers answers both "how much is waiting" and "has it
-     * finished" - which matters, because the loop has to be able to tell a
-     * block that is merely slow from one that stopped early.
-     */
+    /* Drain while the block is still arriving; one read fetches STATUS..LEVEL. */
     size_t  got = 0;
     uint8_t low[REG_LEVEL + 2];
     const int64_t deadline = esp_timer_get_time() + OP_TIMEOUT_MS * 1000;
@@ -829,12 +514,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
             avail = bytes - got;
         }
 
-        /*
-         * Wait for a worthwhile chunk while the block is still running: each
-         * drain costs a transaction of its own, and shifting out four bytes at
-         * a time would spend more on overhead than the overlap saves.  Once
-         * the sequencer is done there is nothing left to wait for.
-         */
+        /* Take a full chunk while running, or the remainder once done. */
         if (avail && (avail >= DRAIN_CHUNK || (status & ST_DONE))) {
             if (reg_read(REG_FIFO, s_buf + got, avail) != ESP_OK) {
                 return ESP_FAIL;
@@ -852,9 +532,7 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
             return ESP_ERR_TIMEOUT;
         }
         if (status & ST_OVERRUN) {
-            /* The FIFO filled because nothing drained it.  Reported rather
-             * than hidden: a short block the caller knows about beats a full
-             * one with a hole in the middle that looks like data. */
+            /* The FIFO filled because nothing drained it. */
             ESP_LOGE(TAG, "the reply FIFO overran");
             return ESP_ERR_NO_MEM;
         }
@@ -878,23 +556,9 @@ esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
     return ESP_OK;
 }
 
-/*
- * One client_blockwrite: the command frame, then `count` words streamed from
- * the fabric's write FIFO.
- *
- * Capped at DAP_FPGA_BLOCK_WORDS because the FIFO holds that much: the whole
- * block goes in before the transfer starts, so the host is not in the loop at
- * all once it does.  The fabric stalls rather than fails if the FIFO runs dry,
- * so a larger block would work too - it would just put the host back in the
- * loop, which is the thing worth avoiding.
- *
- * The address is word-aligned and travels shifted right by two, which is what
- * the 30-bit address form in the telegram carries.
- */
-
-
-esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
-                                   size_t count)
+/* client_blockwrite of up to DAP_FPGA_BLOCK_WORDS words from the write FIFO. */
+static esp_err_t dap_phy_fpga_block_write_locked(uint32_t address, const uint32_t *words,
+                                                 size_t count)
 {
     uint8_t status = 0;
 
@@ -912,11 +576,7 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
         return ESP_FAIL;
     }
 
-    /*
-     * The words first, as one burst.  0x48 does not auto-increment - it is a
-     * port, like the reply FIFO's 0x40 - so a burst of any length lands in the
-     * FIFO in order.
-     */
+    /* Fill the write FIFO first. */
     for (size_t i = 0; i < count; i += DAP_FPGA_BURST_WORDS) {
         const size_t n = (count - i > DAP_FPGA_BURST_WORDS)
                              ? DAP_FPGA_BURST_WORDS : (count - i);
@@ -935,10 +595,8 @@ esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
     }
 
     /*
-     * bit 0  CRCdown, bit 1 per-parcel CRC6, bits 9:2 the word count with 0
-     * meaning 256, bits 39:10 the word address.  Both checks are off: the
-     * loader verifies the whole image with an on-target CRC32 afterwards,
-     * which costs one round trip for the lot rather than six bits per word.
+     * Payload: bit 0 CRCdown, bit 1 per-parcel CRC6 (both off), bits 9:2 word
+     * count (0 = 256), bits 39:10 word address.
      */
     const uint64_t payload = ((uint64_t)(address >> 2) << 10) |
                              ((uint64_t)(count & 0xFFu) << 2);
@@ -983,4 +641,30 @@ void dap_phy_fpga_log_status(void)
              (st & ST_FIFO_EMPTY) ? " fifo_empty" : "",
              (st & ST_FIFO_FULL)  ? " fifo_full"  : "",
              (st & ST_OVERRUN)    ? " OVERRUN"    : "");
+}
+
+/* -- locked entry points (dap_lock.h) -------------------------------------- */
+
+esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field, uint64_t data, size_t data_bits, size_t reply_bits, uint32_t *reply, uint16_t *wait_cycles)
+{
+    dap_lock();
+    const esp_err_t err = dap_phy_fpga_exchange_locked(cmd, len_field, data, data_bits, reply_bits, reply, wait_cycles);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits, uint32_t *words, size_t count)
+{
+    dap_lock();
+    const esp_err_t err = dap_phy_fpga_blockread_locked(cmd_payload, payload_bits, words, count);
+    dap_unlock();
+    return err;
+}
+
+esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words, size_t count)
+{
+    dap_lock();
+    const esp_err_t err = dap_phy_fpga_block_write_locked(address, words, count);
+    dap_unlock();
+    return err;
 }

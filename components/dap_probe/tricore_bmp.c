@@ -1,24 +1,17 @@
 /*
- * TriCore as a Black Magic Probe target.
+ * TC3xx cores as Black Magic Probe targets.
  *
- * BMP already has everything a GDB session needs above the target: the RSP
- * parser, qXfer, extended-remote, vCont, monitor commands, watchpoint
- * bookkeeping, and a server already listening on 4242.  What it does not have
- * is a TriCore, because its targets all sit behind ADIv5 over SWD or JTAG and
- * this one speaks Infineon DAP on two wires.
- *
- * The interesting part is that none of that requires touching BMP.  target_new()
- * appends to BMP's global target list and target_attach_n() walks it, and both
- * are public - so a target can be registered from outside the component and
- * BMP's own server serves it.  No fork, no second port, no second server
- * fighting for the same pins.
- *
- * Everything below is an adapter.  The actual run control is in tricore.c.
+ * BMP supplies the GDB server on port 4242 (RSP, extended-remote, qXfer, flash
+ * packets); this file adapts it to the TriCore run control in tricore.c and the
+ * flasher in tricore_flash.c.  One BMP target per core, registered from outside
+ * the BMP component through target_new().
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "dap_lock.h"
 #include "dap_phy.h"
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
@@ -30,35 +23,25 @@
 #include "target_internal.h"
 #include "tricore.h"
 #include "tricore_bmp.h"
+#include "tricore_flash.h"
 
 static const char *TAG = "TRICORE_BMP";
 
-/*
- * The Cerberus trigger line used to drive break-in.  Any of 1..7 works; this
- * one is simply not otherwise spoken for on this bench.
- */
+/* The Cerberus trigger line that drives break-in; line 0 does not halt. */
 #define HALT_LINE 1
 
-/* Which core a target_s stands for.  BMP's model is one target per core, the
- * same as it does for a multi-core Cortex, so GDB attaches to one at a time. */
 #define CORE_OF(target) ((int)(intptr_t)(target)->target_storage)
 
 /*
- * The register layout GDB is told about.
- *
- * Serving our own description is what makes the `g` packet unambiguous: GDB
- * numbers registers in the order they appear here, so it cannot disagree with
- * us about where PC is - which it otherwise would, since different tricore-gdb
- * builds number them differently.  The order matches tricore.h.
- *
- * A10 and A11 are the stack pointer and return address in the TriCore ABI, so
- * typing A11 as a code pointer is what lets GDB unwind at all.
+ * Register layout, in the order and with the names tricore-elf-gdb expects
+ * (`maint print registers`): it rejects any other set.  PCXI is `pcx`, and
+ * lcx/fcx precede it.  A11 is typed as a code pointer so GDB can unwind.
  */
 static const char k_target_xml[] =
     "<?xml version=\"1.0\"?>"
     "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
     "<target version=\"1.0\">"
-    "<architecture>tricore</architecture>"
+    "<architecture>TriCore:V1_6_2</architecture>"
     "<feature name=\"org.gnu.gdb.tricore.core\">"
     "<reg name=\"d0\" bitsize=\"32\" type=\"uint32\"/>"
     "<reg name=\"d1\" bitsize=\"32\" type=\"uint32\"/>"
@@ -92,15 +75,6 @@ static const char k_target_xml[] =
     "<reg name=\"a13\" bitsize=\"32\" type=\"data_ptr\"/>"
     "<reg name=\"a14\" bitsize=\"32\" type=\"data_ptr\"/>"
     "<reg name=\"a15\" bitsize=\"32\" type=\"data_ptr\"/>"
-    /*
-     * From here the names and the order are GDB's, not the architecture's -
-     * `maint print registers` on tricore-elf-gdb lists exactly these 44 in
-     * exactly this sequence, and its architecture rejects a description that
-     * supplies anything else.  Two traps in one: PCXI has to be spelled `pcx`,
-     * and lcx and fcx come *before* it rather than after pc.  Getting either
-     * wrong produces "Architecture rejected target-supplied description" and
-     * then a register read that fails, with nothing saying which.
-     */
     "<reg name=\"lcx\" bitsize=\"32\" type=\"uint32\"/>"
     "<reg name=\"fcx\" bitsize=\"32\" type=\"uint32\"/>"
     "<reg name=\"pcx\" bitsize=\"32\" type=\"uint32\"/>"
@@ -116,575 +90,556 @@ static const char k_target_xml[] =
     "</feature>"
     "</target>";
 
-/* Sticky: set by any failed transaction, reported and cleared by check_error. */
+/* Sticky: set by a failed transaction, reported and cleared by check_error. */
 static bool s_error;
 
-/* Whether the last resume of this core was a single step, per core.  The step
- * itself leaves no trace by the time BMP asks why the core halted. */
+/* The last resume of this core was a single step; the step leaves no trigger
+ * behind by the time BMP asks why the core stopped. */
 static bool s_stepped[TRICORE_MAX_CORES];
 
-/* ------------------------------------------------------------------------ */
-/* Memory                                                                    */
-/* ------------------------------------------------------------------------ */
+/* GDB resumed this core since attaching.  BMP keeps a target attached when
+ * the GDB connection drops, and the next session's '?' makes it wait for a
+ * halt; a core restarted meanwhile (web flash, reset, power cycle) would
+ * never report one and every packet would be swallowed. */
+static bool s_resumed[TRICORE_MAX_CORES];
 
-static void tricore_mem_read(target_s *target, void *dest, target_addr64_t src, size_t len)
-{
-    (void)target;
-    if (tricore_read_mem((uint32_t)src, (uint8_t *)dest, len) != ESP_OK) {
-        /*
-         * BMP's memory calls return void; a failure is reported through
-         * check_error, which GDB turns into an E packet.  Zeroing rather than
-         * leaving the buffer untouched keeps a partly-filled read from looking
-         * like real data if the error is ever missed.
-         */
-        memset(dest, 0, len);
-        s_error = true;
-    }
+/* -- memory ---------------------------------------------------------------- */
+
+static void tricore_mem_read(target_s *target, void *dest, target_addr64_t src,
+                             size_t len) {
+  (void)target;
+  if (tricore_read_mem((uint32_t)src, (uint8_t *)dest, len) != ESP_OK) {
+    memset(dest, 0, len);
+    s_error = true;
+  }
 }
 
-static void tricore_mem_write(target_s *target, target_addr64_t dest, const void *src, size_t len)
-{
-    (void)target;
-    if (tricore_write_mem((uint32_t)dest, (const uint8_t *)src, len) != ESP_OK) {
-        s_error = true;
-    }
+static void tricore_mem_write(target_s *target, target_addr64_t dest,
+                              const void *src, size_t len) {
+  (void)target;
+  if (tricore_write_mem((uint32_t)dest, (const uint8_t *)src, len) != ESP_OK) {
+    s_error = true;
+  }
 }
 
-static bool tricore_check_error(target_s *target)
-{
-    (void)target;
-    const bool had = s_error;
-    s_error = false;
-    return had;
+static bool tricore_check_error(target_s *target) {
+  (void)target;
+  const bool had = s_error;
+  s_error = false;
+  return had;
 }
 
-/* ------------------------------------------------------------------------ */
-/* Registers                                                                 */
-/* ------------------------------------------------------------------------ */
+/* -- registers ------------------------------------------------------------- */
 
-static const char *tricore_regs_description(target_s *target)
-{
-    (void)target;
-    /* gdb_main.c free()s what this returns, so it has to be heap allocated -
-     * handing back the static string above would free rodata. */
-    return strdup(k_target_xml);
+static const char *tricore_regs_description(target_s *target) {
+  (void)target;
+  return strdup(k_target_xml); /* gdb_main.c frees it */
 }
 
-static void tricore_regs_read(target_s *target, void *data)
-{
-    uint32_t regs[TRICORE_NUM_REGS];
+static void tricore_regs_read(target_s *target, void *data) {
+  uint32_t regs[TRICORE_NUM_REGS];
 
-    if (tricore_read_all_regs(CORE_OF(target), regs) != ESP_OK) {
-        memset(data, 0, sizeof(regs));
-        s_error = true;
-        return;
-    }
-    memcpy(data, regs, sizeof(regs));
+  if (tricore_read_all_regs(CORE_OF(target), regs) != ESP_OK) {
+    memset(data, 0, sizeof(regs));
+    s_error = true;
+    return;
+  }
+  memcpy(data, regs, sizeof(regs));
 }
 
-static void tricore_regs_write(target_s *target, const void *data)
-{
-    const uint32_t *regs = (const uint32_t *)data;
+static void tricore_regs_write(target_s *target, const void *data) {
+  const uint32_t *regs = (const uint32_t *)data;
 
-    for (int i = 0; i < TRICORE_NUM_REGS; i++) {
-        if (tricore_write_reg(CORE_OF(target), i, regs[i]) != ESP_OK) {
-            s_error = true;
-        }
+  for (int i = 0; i < TRICORE_NUM_REGS; i++) {
+    if (tricore_write_reg(CORE_OF(target), i, regs[i]) != ESP_OK) {
+      s_error = true;
     }
+  }
 }
 
-static size_t tricore_reg_read(target_s *target, uint32_t reg, void *data, size_t max)
-{
-    uint32_t value = 0;
+static size_t tricore_reg_read(target_s *target, uint32_t reg, void *data,
+                               size_t max) {
+  uint32_t value = 0;
 
-    if (max < sizeof(value) || reg >= TRICORE_NUM_REGS) {
-        return 0;
-    }
-    if (tricore_read_reg(CORE_OF(target), (int)reg, &value) != ESP_OK) {
-        s_error = true;
-        return 0;
-    }
-    memcpy(data, &value, sizeof(value));
-    return sizeof(value);
-}
-
-static size_t tricore_reg_write(target_s *target, uint32_t reg, const void *data, size_t size)
-{
-    uint32_t value;
-
-    if (size < sizeof(value) || reg >= TRICORE_NUM_REGS) {
-        return 0;
-    }
-    memcpy(&value, data, sizeof(value));
-    if (tricore_write_reg(CORE_OF(target), (int)reg, value) != ESP_OK) {
-        s_error = true;
-        return 0;
-    }
-    return sizeof(value);
-}
-
-/* ------------------------------------------------------------------------ */
-/* Run control                                                               */
-/* ------------------------------------------------------------------------ */
-
-static void tricore_halt_request_cb(target_s *target)
-{
-    if (tricore_halt_request(CORE_OF(target), HALT_LINE) != ESP_OK) {
-        s_error = true;
-    }
-}
-
-/*
- * Why the core stopped, in BMP's vocabulary.
- *
- * The trigger accumulator says which comparator tripped, and what occupies that
- * slot says whether it was a breakpoint or a watchpoint - which is the whole
- * difference between GDB saying "hit breakpoint 2" and saying nothing useful.
- * It clears on read, so it is read exactly once per stop.
- */
-static target_halt_reason_e tricore_halt_poll_cb(target_s *target, target_addr64_t *watch)
-{
-    const int core = CORE_OF(target);
-
-    if (!tricore_halt_poll(core)) {
-        return TARGET_HALT_RUNNING;
-    }
-
-    uint32_t acc = 0;
-    if (tricore_trigger_acc(core, &acc) == ESP_OK && acc != 0) {
-        for (int slot = 0; slot < TRICORE_NUM_TRIGGERS; slot++) {
-            if (!(acc & (1u << slot))) {
-                continue;
-            }
-            const tricore_bp_t *bp = tricore_bp_of_slot(core, slot);
-            if (bp == NULL) {
-                continue;
-            }
-            if (bp->kind == TRICORE_BP_WATCH) {
-                if (watch != NULL) {
-                    *watch = bp->addr;
-                }
-                return TARGET_HALT_WATCHPOINT;
-            }
-            if (bp->kind == TRICORE_BP_USER) {
-                return TARGET_HALT_BREAKPOINT;
-            }
-        }
-    }
-
-    /*
-     * A step that landed, reported as one.
-     *
-     * This cannot be read back off the trigger that caused it: tricore_step()
-     * is synchronous - it arms the successors, resumes, waits for the halt and
-     * disarms them again - so by the time BMP polls there is no step trigger
-     * left to recognise.  Falling through to TARGET_HALT_REQUEST made every
-     * `stepi` come back as "Program received signal SIGINT, Interrupt", GDB
-     * reporting a Ctrl-C the user never pressed for a step that had in fact
-     * completed normally.  TARGET_HALT_STEPPING is what produces SIGTRAP.
-     */
-    if (s_stepped[core]) {
-        s_stepped[core] = false;
-        return TARGET_HALT_STEPPING;
-    }
-    return TARGET_HALT_REQUEST;
-}
-
-static void tricore_halt_resume(target_s *target, bool step)
-{
-    const int core = CORE_OF(target);
-
-    if (step) {
-        tricore_step_t result;
-        if (tricore_step(core, 500, &result) != ESP_OK) {
-            s_error = true;
-        } else if (result.note[0]) {
-            ESP_LOGI(TAG, "CPU%d step: %s", core, result.note);
-        }
-        /* Remembered for the poll that follows - see tricore_halt_poll_cb. */
-        s_stepped[core] = true;
-        return;
-    }
-
-    /*
-     * Step off a breakpoint under the PC before resuming.  A trigger armed at
-     * the current address fires again the instant the core runs, so a plain
-     * resume would leave it exactly where it is - and GDB, seeing an immediate
-     * stop at the same PC, would resume again, forever.
-     */
-    uint32_t pc = 0;
-    if (tricore_is_halted(core) && tricore_read_pc(core, &pc) == ESP_OK) {
-        const tricore_bp_t *bp = tricore_bp_at(core, pc);
-        if (bp != NULL && bp->kind == TRICORE_BP_USER) {
-            tricore_step_t stepped;
-            tricore_step(core, 500, &stepped);
-        }
-    }
-    tricore_request_resume(core);
-}
-
-/* ------------------------------------------------------------------------ */
-/* Breakpoints and watchpoints                                               */
-/* ------------------------------------------------------------------------ */
-
-/*
- * Both breakpoint types are served from address triggers.  TriCore software
- * breakpoints mean patching a DEBUG instruction over the code, and for
- * flash-resident code that is the wrong trade: a programmed page cannot be
- * rewritten, so each toggle means erasing and reprogramming the enclosing
- * 16 kB sector - about a second, a program/erase cycle of a code sector every
- * time, and a debugger that dies between the erase and the rewrite leaves that
- * sector blank.
- */
-static int tricore_breakwatch_set(target_s *target, breakwatch_s *bw)
-{
-    const int core = CORE_OF(target);
-    int slot;
-
-    switch (bw->type) {
-    case TARGET_BREAK_SOFT:
-    case TARGET_BREAK_HARD:
-        slot = tricore_bp_add(core, (uint32_t)bw->addr, TRICORE_BP_USER);
-        break;
-    case TARGET_WATCH_WRITE:
-        slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, false, true);
-        break;
-    case TARGET_WATCH_READ:
-        slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, true, false);
-        break;
-    case TARGET_WATCH_ACCESS:
-        slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, true, true);
-        break;
-    default:
-        return 1;                   /* not something this target does */
-    }
-
-    if (slot < 0) {
-        /*
-         * Out of triggers.  Reported rather than swallowed: a breakpoint GDB
-         * believes it set and the hardware never took is worse than one that
-         * visibly failed.
-         */
-        ESP_LOGW(TAG, "CPU%d: no free trigger for 0x%08lX; all %d are in use",
-                 core, (unsigned long)bw->addr, TRICORE_NUM_TRIGGERS);
-        return -1;
-    }
+  if (max < sizeof(value) || reg >= TRICORE_NUM_REGS) {
     return 0;
+  }
+  if (tricore_read_reg(CORE_OF(target), (int)reg, &value) != ESP_OK) {
+    s_error = true;
+    return 0;
+  }
+  memcpy(data, &value, sizeof(value));
+  return sizeof(value);
 }
 
-static int tricore_breakwatch_clear(target_s *target, breakwatch_s *bw)
-{
-    return tricore_bp_remove(CORE_OF(target), (uint32_t)bw->addr) ? 0 : 0;
+static size_t tricore_reg_write(target_s *target, uint32_t reg,
+                                const void *data, size_t size) {
+  uint32_t value;
+
+  if (size < sizeof(value) || reg >= TRICORE_NUM_REGS) {
+    return 0;
+  }
+  memcpy(&value, data, sizeof(value));
+  if (tricore_write_reg(CORE_OF(target), (int)reg, value) != ESP_OK) {
+    s_error = true;
+    return 0;
+  }
+  return sizeof(value);
 }
 
-/* ------------------------------------------------------------------------ */
-/* Attach and detach                                                         */
-/* ------------------------------------------------------------------------ */
+/* -- run control ----------------------------------------------------------- */
 
-static bool tricore_attach(target_s *target)
-{
-    const int core = CORE_OF(target);
+static void tricore_halt_request_cb(target_s *target) {
+  if (tricore_halt_request(CORE_OF(target), HALT_LINE) != ESP_OK) {
+    s_error = true;
+  }
+}
 
-    /*
-     * A previous debugger may have left the halt-after-reset trigger armed on
-     * TR0, and with it every resume immediately re-halts at the reset vector.
-     */
-    tricore_disarm_reset_trigger();
+/* Why the core stopped.  The trigger accumulator (clear-on-read) names the
+ * comparator, and what occupies that slot says breakpoint or watchpoint. */
+static target_halt_reason_e tricore_halt_poll_cb(target_s *target,
+                                                 target_addr64_t *watch) {
+  const int core = CORE_OF(target);
 
-    /* Stop this core's timer while it is halted, so a breakpoint does not
-     * silently kill a periodic task - see tricore.h. */
-    tricore_freeze_timer(core, true);
+  if (!tricore_halt_poll(core)) {
+    if (!s_resumed[core]) {
+      /* Running without GDB having resumed it: stop it and say so. */
+      tricore_halt(core, HALT_LINE, 200);
+      if (tricore_is_halted(core)) {
+        return TARGET_HALT_REQUEST;
+      }
+    }
+    return TARGET_HALT_RUNNING;
+  }
+  s_resumed[core] = false;
 
-    s_error = false;
-
-    /*
-     * Halt, the way every other BMP target's attach does.
-     *
-     * GDB's attach means "stop it and take control", and here it is not a
-     * nicety: with OCDS enabled but the core running, reads of PC, PSW, PCXI
-     * and the GPRs all bus-error - only DBGSR is safe to poll, which the
-     * tas-debug reference says in as many words.  Attaching without halting
-     * therefore gave a session where the first `info registers` came back
-     * `Could not fetch register "pc"; remote failure reply 'EFF'` and nothing
-     * pointed at the cause.
-     */
-    target_halt_request(target);
-
-    /*
-     * Polled rather than asked once.  A halt here is not a register write that
-     * takes effect on the next instruction: it goes out as a debug event and
-     * comes back over a trigger line, so the core is still running for a short
-     * while afterwards and a single poll loses the race about as often as it
-     * wins it.
-     */
-    target_halt_reason_e reason = TARGET_HALT_RUNNING;
-    for (int i = 0; i < 200 && reason == TARGET_HALT_RUNNING; i++) {
-        reason = target_halt_poll(target, NULL);
-        if (reason == TARGET_HALT_RUNNING) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+  uint32_t acc = 0;
+  if (tricore_trigger_acc(core, &acc) == ESP_OK && acc != 0) {
+    for (int slot = 0; slot < TRICORE_NUM_TRIGGERS; slot++) {
+      if (!(acc & (1u << slot))) {
+        continue;
+      }
+      const tricore_bp_t *bp = tricore_bp_of_slot(core, slot);
+      if (bp == NULL) {
+        continue;
+      }
+      if (bp->kind == TRICORE_BP_WATCH) {
+        if (watch != NULL) {
+          *watch = bp->addr;
         }
+        return TARGET_HALT_WATCHPOINT;
+      }
+      if (bp->kind == TRICORE_BP_USER) {
+        return TARGET_HALT_BREAKPOINT;
+      }
     }
+  }
 
-    if (reason == TARGET_HALT_ERROR || reason == TARGET_HALT_RUNNING) {
-        /*
-         * Say what the silicon looked like, not just that it did not stop.
-         * This failure is intermittent, and "CPU0 did not halt on attach" on
-         * its own cannot separate a halt that was never delivered from one
-         * that was and is not visible - the registers that distinguish them
-         * are the same four every time, so print them here rather than make
-         * the next person reconstruct the session by hand.
-         */
-        tricore_halt_diag(core, "attach");
-        /* Put the trigger line back before giving up, or this failure makes
-         * every later halt fail too - see tricore_halt_release(). */
-        tricore_halt_release(core);
-        return false;
-    }
-    return true;
+  /* A completed step is SIGTRAP, not the SIGINT a plain request would give. */
+  if (s_stepped[core]) {
+    s_stepped[core] = false;
+    return TARGET_HALT_STEPPING;
+  }
+  return TARGET_HALT_REQUEST;
 }
 
-static void tricore_detach(target_s *target)
-{
-    const int core = CORE_OF(target);
+static void tricore_halt_resume(target_s *target, bool step) {
+  const int core = CORE_OF(target);
 
-    /* Leave the target as we found it: running, with none of our triggers
-     * armed to halt it again later. */
-    ESP_LOGI(TAG, "Detaching...");
+  if (step) {
+    tricore_step_t result;
+    if (tricore_step(core, 500, &result) != ESP_OK) {
+      s_error = true;
+    }
+    s_stepped[core] = true;
+    return;
+  }
+
+  /* Step off a breakpoint under the PC first, or it fires again at once. */
+  uint32_t pc = 0;
+  if (tricore_is_halted(core) && tricore_read_pc(core, &pc) == ESP_OK) {
+    const tricore_bp_t *bp = tricore_bp_at(core, pc);
+    if (bp != NULL && bp->kind == TRICORE_BP_USER) {
+      tricore_step_t stepped;
+      tricore_step(core, 500, &stepped);
+    }
+  }
+  s_resumed[core] = true;
+  tricore_request_resume(core);
+}
+
+/* -- breakpoints and watchpoints ------------------------------------------ */
+
+/* Software breakpoints are served from address triggers too: patching a DEBUG
+ * instruction into flash would cost a sector erase per toggle. */
+static int tricore_breakwatch_set(target_s *target, breakwatch_s *bw) {
+  const int core = CORE_OF(target);
+  int slot;
+
+  switch (bw->type) {
+  case TARGET_BREAK_SOFT:
+  case TARGET_BREAK_HARD:
+    slot = tricore_bp_add(core, (uint32_t)bw->addr, TRICORE_BP_USER);
+    break;
+  case TARGET_WATCH_WRITE:
+    slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, false, true);
+    break;
+  case TARGET_WATCH_READ:
+    slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, true, false);
+    break;
+  case TARGET_WATCH_ACCESS:
+    slot = tricore_bp_add_watch(core, (uint32_t)bw->addr, bw->size, true, true);
+    break;
+  default:
+    return 1;
+  }
+  if (slot < 0) {
+    ESP_LOGW(TAG, "CPU%d: all %d triggers in use", core, TRICORE_NUM_TRIGGERS);
+    return -1;
+  }
+  return 0;
+}
+
+static int tricore_breakwatch_clear(target_s *target, breakwatch_s *bw) {
+  tricore_bp_remove(CORE_OF(target), (uint32_t)bw->addr);
+  return 0;
+}
+
+/* A reset takes every trigger with it; drop the bookkeeping to match. */
+static void forget_triggers(void) {
+  for (int i = 0; i < tricore_core_count(); i++) {
+    const int core = tricore_core_index(i);
     tricore_bp_clear_kind(core, TRICORE_BP_USER);
     tricore_bp_clear_kind(core, TRICORE_BP_STEP);
     tricore_bp_clear_kind(core, TRICORE_BP_WATCH);
     tricore_bp_clear_kind(core, TRICORE_BP_WATCH_HI);
-    tricore_clear_debug_events(core);
-    tricore_freeze_timer(core, false);
-    tricore_request_resume(core);
+    tricore_freeze_timer(core, true);
+  }
 }
 
-/* ------------------------------------------------------------------------ */
-/* Probe                                                                     */
-/* ------------------------------------------------------------------------ */
+/* -- flash: GDB `load` ----------------------------------------------------- */
 
-/*
- * The DAP opening sequence, used both to probe and to recover after a reset.
- *
- * OCDS is enabled through the OEC unlock pattern rather than by resetting the
- * device, which is measured to work on this part: a hot attach reaches OEN=1,
- * the miniMCDS ID reads back 0x00D6C007, and a free-running STM reads
- * differently twice.  A reset is therefore not needed to get *access* - it is
- * needed for the other reasons in tricore_reset().
- */
-static esp_err_t attach_dap(void)
-{
-    dap_exchange_t x;
+/* One load is one flasher session: begin on the first flash packet, end on
+ * vFlashDone.  Per-region prepare/done stay empty because BMP calls them again
+ * between erase and write, which would reset the target twice. */
+static bool tricore_enter_flash_mode(target_s *target) {
+  (void)target;
+  return tricore_flash_begin() == ESP_OK;
+}
 
-    esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "DAP PHY unavailable on this board");
-        return err;
-    }
+static bool tricore_exit_flash_mode(target_s *target) {
+  (void)target;
+  const bool ok = tricore_flash_end(false) == ESP_OK;
+  forget_triggers();
+  return ok;
+}
 
-    /*
-     * Through the fabric when it is there, which by default it is.
-     *
-     * The DAP bitstream replaces the Port C passthrough that the CPU-driven
-     * path runs over, so with it loaded that path reads nothing but 0xFFFFFFFF
-     * - this is not a preference between two working routes, it is the only
-     * one available.  The fabric attach also needs a DAPISC the CPU one does
-     * not, which is why it is a separate call rather than a flag.
-     *
-     * The CPU path stays as the fallback for a board running the stock image.
-     */
-    if (dap_phy_fpga_attach() == ESP_OK) {
-        ESP_LOGI(TAG, "using the fabric DAP master");
-    } else {
-        dap_phy_fpga_use(false);
-        ESP_LOGI(TAG, "no fabric DAP master; using the CPU-driven path");
+/* Undo a failed session, so the next `load` starts a fresh one. */
+static bool flash_failed(target_flash_s *flash) {
+  tricore_flash_end(false);
+  flash->t->flash_mode = false;
+  return false;
+}
 
-        err = dap_probe_attach(&x, 3);
-        if (err != ESP_OK || x.reply != 0xAAAAAAAAu) {
-            ESP_LOGE(TAG, "the target did not answer sync");
-            return ESP_ERR_INVALID_STATE;
-        }
-        dap_probe_client_set(1, &x);
-    }
+static bool pflash_erase(target_flash_s *flash, target_addr_t addr, size_t len) {
+  return tricore_flash_erase((uint32_t)addr, (uint32_t)len) == ESP_OK
+             ? true : flash_failed(flash);
+}
 
-    dap_probe_clear_error_state();
-    dap_probe_set_rw_mode(true);
+static bool pflash_write(target_flash_s *flash, target_addr_t dest,
+                         const void *src, size_t len) {
+  return tricore_flash_program((uint32_t)dest, (const uint8_t *)src,
+                               (uint32_t)len) == ESP_OK
+             ? true : flash_failed(flash);
+}
 
-    if (dap_probe_enable_ocds() != ESP_OK) {
-        ESP_LOGE(TAG, "OCDS did not come up; run control needs it");
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ESP_OK;
+/* UCBs and data flash are never programmed from here, as in the reference:
+ * an ELF's boot-mode headers are skipped, not written. */
+static bool ucb_erase(target_flash_s *flash, target_addr_t addr, size_t len) {
+  (void)flash;
+  (void)addr;
+  (void)len;
+  return true;
+}
+
+static bool ucb_write(target_flash_s *flash, target_addr_t dest,
+                      const void *src, size_t len) {
+  (void)flash;
+  (void)src;
+  ESP_LOGW(TAG, "load: skipped %u bytes at 0x%08lX (UCB/data flash)",
+           (unsigned)len, (unsigned long)dest);
+  return true;
+}
+
+static void add_flash(target_s *target, uint32_t start, uint32_t length,
+                      size_t block, flash_erase_func erase,
+                      flash_write_func write) {
+  target_flash_s *flash = calloc(1, sizeof(*flash));
+  if (flash == NULL) {
+    return;
+  }
+  flash->start = start;
+  flash->length = length;
+  flash->blocksize = block;
+  flash->writesize = block;
+  flash->erased = TRICORE_FLASH_ERASED;
+  flash->erase = erase;
+  flash->write = write;
+  target_add_flash(target, flash);
 }
 
 /*
- * Reset the target and take control of it again.
+ * The memory map, from tas-debug's tc38x profile and the project's linker
+ * script.  GDB treats anything unlisted as inaccessible, so it has to cover
+ * everything; unpopulated gaps inside a region just bus-error as before.
  *
- * On this bench the probe's TRST line is wired to the target's reset, so this
- * restarts the application under test - which is the point.  GDB's `run` asks
- * for it, and it is the only way to debug anything before main(): a hot attach
- * lands wherever the application happens to be.
- *
- * Everything in the core is gone afterwards, including our triggers, so the
- * breakpoints BMP believes are set have to be re-armed.  GDB re-inserts them on
- * the next resume, which is why this does not try to restore them itself - but
- * the bookkeeping is cleared so nothing claims a trigger that no longer exists.
- *
- * The cores come back *halted at the entry point*, because OSTATE.HARR asks the
- * startup software to stop them before any application code runs.  That is the
- * part a reset pin cannot give on its own: pulsing reset starts the application
- * immediately, and re-attaching over DAP takes long enough that it is well into
- * startup before there is anything to halt.
+ * Kept coarse on purpose: BMP renders the map into a 1024-byte stack buffer
+ * (gdb_main.c, exec_q_memory_map) and overruns it once it is full, so each
+ * core's DSPR and PSPR are one region and the local aliases another.
  */
-/* Wait for the device to answer over DAP again, re-establishing the link if it
- * went down with the reset.  Returns false if it never comes back. */
-static bool wait_for_target(int attempts)
-{
-    for (int i = 0; i < attempts; i++) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (tricore_discover() == ESP_OK) {
-            return true;
-        }
-        dap_probe_clear_error_state();
-        /* An application reset should leave the link up, but a heavier reset
-         * takes it down; rebuilding from sync costs little and covers both. */
-        attach_dap();
-    }
+static void add_memory_map(target_s *target) {
+  static const struct { uint32_t start, len; } k_ram[] = {
+      {0x70000000u, 0x110000u},   /* CPU0 DSPR .. PSPR */
+      {0x60000000u, 0x110000u},   /* CPU1 */
+      {0x50000000u, 0x110000u},   /* CPU2 */
+      {0x40000000u, 0x110000u},   /* CPU3 */
+      {0x90000000u, 0x60000u},    /* DLMU0-3, LMU0, cached */
+      {0xB0000000u, 0x60000u},    /* the same, uncached */
+      {0xC0000000u, 0x10010000u}, /* own DSPR (0xC...) and PSPR (0xD...) */
+      {0xF0000000u, 0x10000000u}, /* peripherals, CSFRs */
+  };
+  for (size_t i = 0; i < sizeof(k_ram) / sizeof(k_ram[0]); i++) {
+    target_add_ram32(target, k_ram[i].start, k_ram[i].len);
+  }
+
+  const tricore_flash_range_t *ranges;
+  const size_t n = tricore_flash_layout(&ranges);
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t len = ranges[i].end - ranges[i].start;
+    add_flash(target, ranges[i].start - 0x20000000u, len, TRICORE_FLASH_SECTOR,
+              pflash_erase, pflash_write);                      /* cached */
+    add_flash(target, ranges[i].start, len, TRICORE_FLASH_SECTOR,
+              pflash_erase, pflash_write);                      /* uncached */
+  }
+  add_flash(target, 0xAF000000u, 0x01000000u, 0x200u, ucb_erase, ucb_write);
+}
+
+/* -- attach and detach ----------------------------------------------------- */
+
+static bool tricore_attach(target_s *target) {
+  const int core = CORE_OF(target);
+
+  if (!tricore_core_started(core)) {
+    ESP_LOGW(TAG, "CPU%d was never started by the application (boot halt); "
+                  "nothing to attach to", core);
     return false;
+  }
+
+  tricore_disarm_reset_trigger();
+  tricore_freeze_timer(core, true);
+  s_error = false;
+  s_resumed[core] = false;
+
+  /* With OCDS on but the core running, register reads bus-error, so attach
+   * halts.  The halt arrives over a trigger line, hence the poll. */
+  target_halt_request(target);
+  target_halt_reason_e reason = TARGET_HALT_RUNNING;
+  for (int i = 0; i < 200 && reason == TARGET_HALT_RUNNING; i++) {
+    reason = target_halt_poll(target, NULL);
+    if (reason == TARGET_HALT_RUNNING) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  if (reason == TARGET_HALT_ERROR || reason == TARGET_HALT_RUNNING) {
+    tricore_halt_diag(core, "attach");
+    tricore_halt_release(core); /* or every later halt fails too */
+    return false;
+  }
+  return true;
 }
 
-static void tricore_reset(target_s *target)
-{
-    (void)target;
+/* Leave it running, with none of our triggers armed. */
+static void tricore_detach(target_s *target) {
+  const int core = CORE_OF(target);
 
-    /*
-     * Ask the startup software to stop the cores before any application code
-     * runs, then restart the application through OCDS.  Order matters: HARR is
-     * read by the boot ROM on its way up, so it has to be set before the reset,
-     * not after it.
-     */
-    const bool halt_armed = (tricore_set_halt_after_reset(true) == ESP_OK);
-    if (!halt_armed) {
-        ESP_LOGW(TAG, "could not arm halt-after-reset; the cores will run on");
-    }
+  /* GDB gone mid-load: BMP detaches without ending the flash session. */
+  if (target->flash_mode) {
+    tricore_flash_end(false);
+    forget_triggers();
+    target->flash_mode = false;
+  }
 
-    tricore_request_application_reset();
-
-    if (!wait_for_target(20)) {
-        /*
-         * The OCDS reset did not bring it back.  Fall back to the reset pin,
-         * which is heavier - it takes the debug domain down too, so OCDS and
-         * the link have to be rebuilt - but it is the one that always works.
-         */
-        ESP_LOGW(TAG, "no answer after the OCDS reset; falling back to the reset pin");
-        dap_phy_set_trst(true);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        dap_phy_set_trst(false);
-        vTaskDelay(pdMS_TO_TICKS(50));
-
-        if (attach_dap() != ESP_OK || !wait_for_target(10)) {
-            ESP_LOGE(TAG, "the target did not come back after the reset");
-            s_error = true;
-            return;
-        }
-    }
-
-    /*
-     * Clear the request now that it has been served, or the next application
-     * reset - including one the application asks for itself - stops the cores
-     * with no debugger expecting it.
-     */
-    if (halt_armed) {
-        tricore_set_halt_after_reset(false);
-    }
-
-    for (int i = 0; i < tricore_core_count(); i++) {
-        const int core = tricore_core_index(i);
-        ESP_LOGI(TAG, "CPU%d is %s after the reset", core,
-                 tricore_is_halted(core) ? "halted" : "running");
-    }
-
-    /*
-     * A halt-after-reset trigger left on TR0 by any debugger - including one
-     * the device armed for itself - re-halts the core on every resume.
-     */
-    tricore_disarm_reset_trigger();
-
-    for (int i = 0; i < tricore_core_count(); i++) {
-        const int core = tricore_core_index(i);
-        /* The core's triggers went with the reset; drop our record of them so
-         * nothing claims a slot that is no longer armed. */
-        tricore_bp_clear_kind(core, TRICORE_BP_USER);
-        tricore_bp_clear_kind(core, TRICORE_BP_STEP);
-        tricore_bp_clear_kind(core, TRICORE_BP_WATCH);
-        tricore_bp_clear_kind(core, TRICORE_BP_WATCH_HI);
-        tricore_freeze_timer(core, true);
-    }
-    ESP_LOGI(TAG, "target reset; %d core(s) back", tricore_core_count());
+  tricore_bp_clear_kind(core, TRICORE_BP_USER);
+  tricore_bp_clear_kind(core, TRICORE_BP_STEP);
+  tricore_bp_clear_kind(core, TRICORE_BP_WATCH);
+  tricore_bp_clear_kind(core, TRICORE_BP_WATCH_HI);
+  tricore_clear_debug_events(core);
+  tricore_freeze_timer(core, false);
+  s_resumed[core] = false;
+  if (tricore_request_resume(core) != ESP_OK || tricore_is_halted(core)) {
+    ESP_LOGW(TAG, "CPU%d did not resume on detach", core);
+  }
 }
 
-esp_err_t tricore_bmp_probe(void)
-{
-    esp_err_t err = attach_dap();
-    if (err != ESP_OK) {
-        return err;
+/* -- probe and reset ------------------------------------------------------- */
+
+/* Attach over the fabric when the DAP bitstream is loaded (the CPU path then
+ * reads only 0xFFFFFFFF), else over the CPU-driven path. */
+static esp_err_t attach_dap(void) {
+  dap_exchange_t x;
+
+  esp_err_t err = dap_probe_init(CONFIG_AEL_DAP_BRINGUP_CLOCK_HZ);
+  if (err != ESP_OK) {
+    return err;
+  }
+  if (dap_phy_fpga_attach() != ESP_OK) {
+    dap_phy_fpga_use(false);
+    if (dap_probe_attach(&x, 3) != ESP_OK || x.reply != 0xAAAAAAAAu) {
+      ESP_LOGE(TAG, "the target did not answer sync");
+      return ESP_ERR_INVALID_STATE;
     }
-    err = tricore_discover();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "no TriCore cores answered");
-        return err;
+    dap_probe_client_set(1, &x);
+  }
+  dap_probe_clear_error_state();
+  dap_probe_set_rw_mode(true);
+  if (dap_probe_enable_ocds() != ESP_OK) {
+    ESP_LOGE(TAG, "OCDS did not come up");
+    return ESP_ERR_INVALID_STATE;
+  }
+  return ESP_OK;
+}
+
+static bool wait_for_target(int attempts) {
+  for (int i = 0; i < attempts; i++) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (tricore_discover() == ESP_OK) {
+      return true;
+    }
+    dap_probe_clear_error_state();
+    attach_dap();
+  }
+  return false;
+}
+
+/*
+ * GDB `run` / `monitor reset`: restart the application with halt-after-reset
+ * armed, so the cores stop at the entry point.  An OCDS application reset
+ * first; the reset pin if the target does not come back from that.
+ */
+static void tricore_reset(target_s *target) {
+  (void)target;
+
+  const bool armed = (tricore_set_halt_after_reset(true) == ESP_OK);
+  tricore_request_application_reset();
+
+  if (!wait_for_target(20)) {
+    ESP_LOGW(TAG, "no answer after the OCDS reset; pulsing the reset pin");
+    dap_phy_set_trst(true);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    dap_phy_set_trst(false);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (attach_dap() != ESP_OK || !wait_for_target(10)) {
+      ESP_LOGE(TAG, "the target did not come back after the reset");
+      s_error = true;
+      return;
+    }
+  }
+  if (armed) {
+    tricore_set_halt_after_reset(false); /* or the next reset halts too */
+  }
+  tricore_disarm_reset_trigger();
+  forget_triggers();
+}
+
+/* BMP's target list; a probe scan (swd_scan, auto_scan) frees it wholesale. */
+extern target_s *target_list;
+
+static target_s *s_targets[TRICORE_MAX_CORES];
+
+static bool still_listed(const target_s *t) {
+  for (const target_s *it = target_list; it; it = it->next) {
+    if (it == t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static esp_err_t probe_locked(void) {
+  static char s_names[TRICORE_MAX_CORES][24];
+
+  /* A session whose GDB died during `continue` leaves BMP polling forever
+   * without accepting connections; forgetting the resume lets the next poll
+   * halt the core and end that loop. */
+  memset(s_resumed, 0, sizeof(s_resumed));
+
+  esp_err_t err = attach_dap();
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = tricore_discover();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "no TriCore cores answered");
+    return err;
+  }
+
+  for (int i = 0; i < tricore_core_count(); i++) {
+    const int core = tricore_core_index(i);
+
+    snprintf(s_names[core], sizeof(s_names[core]), "CPU%d%s", core,
+             tricore_core_started(core) ? "" : " (not started)");
+    if (s_targets[core] != NULL && still_listed(s_targets[core])) {
+      continue;
     }
 
-    for (int i = 0; i < tricore_core_count(); i++) {
-        const int core = tricore_core_index(i);
-
-        target_s *target = target_new();
-        if (target == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-        target->target_storage = (void *)(intptr_t)core;
-        target->driver = "TriCore TC3xx";
-        target->core = "TriCore";
-        target->designer_code = 0;
-        target->part_id = 0;
-
-        target->attach = tricore_attach;
-        target->detach = tricore_detach;
-        target->check_error = tricore_check_error;
-
-        target->mem_read = tricore_mem_read;
-        target->mem_write = tricore_mem_write;
-
-        target->regs_size = TRICORE_NUM_REGS * sizeof(uint32_t);
-        target->regs_description = tricore_regs_description;
-        target->regs_read = tricore_regs_read;
-        target->regs_write = tricore_regs_write;
-        target->reg_read = tricore_reg_read;
-        target->reg_write = tricore_reg_write;
-
-        target->halt_request = tricore_halt_request_cb;
-        target->halt_poll = tricore_halt_poll_cb;
-        target->halt_resume = tricore_halt_resume;
-
-        target->breakwatch_set = tricore_breakwatch_set;
-        target->breakwatch_clear = tricore_breakwatch_clear;
-
-        /*
-         * Reset restarts the application under test, because on this bench the
-         * probe's TRST is the target's reset line.  That is what GDB's `run`
-         * means, and what debugging anything before main() requires, so it is
-         * wired up - but it is worth knowing it is not a debug-domain-only
-         * reset: the application really does start again.
-         *
-         * Flash is left unset; it needs 64-bit writes through Cerberus, which
-         * is untested.
-         */
-        target->reset = tricore_reset;
-        target->extended_reset = tricore_reset;
-
-        ESP_LOGI(TAG, "registered CPU%d as a GDB target", core);
+    target_s *target = target_new();
+    if (target == NULL) {
+      return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "%d core(s) available - attach with GDB on port 4242",
-             tricore_core_count());
-    return ESP_OK;
+    s_targets[core] = target;
+
+    target->target_storage = (void *)(intptr_t)core;
+    target->driver = "TriCore TC3xx";
+    target->core = s_names[core];
+
+    target->attach = tricore_attach;
+    target->detach = tricore_detach;
+    target->check_error = tricore_check_error;
+
+    target->mem_read = tricore_mem_read;
+    target->mem_write = tricore_mem_write;
+
+    target->regs_size = TRICORE_NUM_REGS * sizeof(uint32_t);
+    target->regs_description = tricore_regs_description;
+    target->regs_read = tricore_regs_read;
+    target->regs_write = tricore_regs_write;
+    target->reg_read = tricore_reg_read;
+    target->reg_write = tricore_reg_write;
+
+    target->halt_request = tricore_halt_request_cb;
+    target->halt_poll = tricore_halt_poll_cb;
+    target->halt_resume = tricore_halt_resume;
+
+    target->breakwatch_set = tricore_breakwatch_set;
+    target->breakwatch_clear = tricore_breakwatch_clear;
+
+    target->reset = tricore_reset;
+    target->extended_reset = tricore_reset;
+
+    target->enter_flash_mode = tricore_enter_flash_mode;
+    target->exit_flash_mode = tricore_exit_flash_mode;
+    add_memory_map(target);
+
+    ESP_LOGI(TAG, "registered %s as a GDB target", s_names[core]);
+  }
+  return ESP_OK;
+}
+
+/* Safe to call again (boot, then /api/dap_gdb/attach): a core that already has
+ * a target keeps it, and only its name is refreshed. */
+esp_err_t tricore_bmp_probe(void) {
+  dap_lock();
+  const esp_err_t err = probe_locked();
+  dap_unlock();
+  return err;
 }

@@ -1,8 +1,6 @@
 #pragma once
 
-/*
- * Shared between tricore.c and tricore_regs.c.  Not part of the interface.
- */
+/* Shared between tricore.c and tricore_regs.c.  Not part of the interface. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,31 +8,13 @@
 #include "esp_err.h"
 #include "tricore.h"
 
-/* ------------------------------------------------------------------------ */
-/* Cerberus, the system debug block                                          */
-/* ------------------------------------------------------------------------ */
-/*
- * Every offset the manual gives is relative to this base, not to 0xF0000000 -
- * a mistake that lands on real registers rather than empty space: 0xF00004B0
- * is TCCB, read-only, so writing it bus-errors, while 0xF00004C0 is TREC0 and
- * quietly accepts the write and reconfigures CPU0 event routing.
- */
+/* Cerberus: manual offsets are relative to CBS_BASE, not 0xF0000000. */
 #define CBS_BASE            0xF0000400u
 #define CBS_OCNTRL          0xF000047Cu
 #define CBS_OSTATE          0xF0000480u
 
-/*
- * OCNTRL is write-only and paired: every control bit sits at an odd position
- * 2n+1 with its write-protection bit at 2n, and the protection bit has to be
- * set in the same write or the change is dropped.  A write missing the key
- * looks like it succeeded and does nothing, which is the failure mode worth
- * guarding against - so these are always used together.
- *
- * Cross-checked two ways before being trusted: OC4/OC4_P at 9/8 is the 0x0300
- * that dap_probe_enable_ocds() writes and that was watched enabling the
- * miniMCDS on silicon, and WDTSUS/WDTSUS_P at 13/12 matches what tas-debug
- * derived independently on the same part.
- */
+/* OCNTRL is write-only; each control bit 2n+1 needs its protection bit 2n set
+ * in the same write, or the change is silently dropped. */
 #define OCNTRL_HARR         (1u << 17)   /* OJC0: halt after reset */
 #define OCNTRL_HARR_P       (1u << 16)
 #define OCNTRL_APPRESET     (1u << 31)   /* OJC7/RSTCL3: application reset */
@@ -48,19 +28,12 @@
 #define TRC_BRKIN_SHIFT     20
 #define TRC_ROUTE_MASK      0xFu
 
-/*
- * Trigger line control: seven 4-bit fields, one per line.  This is the only way
- * to drive a line from the probe; there is no separate assert register.
- */
+/* Trigger line control: seven 4-bit fields, one per line. */
 #define CBS_TLC             (CBS_BASE + 0x90u)
 #define TLSP_NONE           0x0u
 #define TLSP_FORCE_ACTIVE   0x3u
 
-/* ------------------------------------------------------------------------ */
-/* Per-core CSFR window                                                      */
-/* ------------------------------------------------------------------------ */
-
-/* TC38x core bases.  A part with fewer cores simply has fewer of them answer. */
+/* Per-core CSFR window: TC38x core bases. */
 static const uint32_t k_core_base[TRICORE_MAX_CORES] = {
     0xF8810000u, 0xF8830000u, 0xF8850000u, 0xF8870000u, 0xF8890000u, 0xF88B0000u,
 };
@@ -78,12 +51,9 @@ static const uint32_t k_core_base[TRICORE_MAX_CORES] = {
 #define OFF_D0              0xFF00u     /* D0..D15, four bytes apart */
 #define OFF_A0              0xFF80u     /* A0..A15, four bytes apart */
 
-/*
- * The rest of the core registers GDB asks for, from Infineon's IfxCpu_reg.h.
- * PCXI, PSW, PC, D0 and A0 above are the five the tas-debug reference also
- * uses, and agree with it.
- */
+/* Remaining GDB registers, from IfxCpu_reg.h. */
 #define OFF_SYSCON          0xFE14u
+#define SYSCON_BHALT        (1u << 24)
 #define OFF_BIV             0xFE20u
 #define OFF_BTV             0xFE24u
 #define OFF_ISP             0xFE28u
@@ -93,14 +63,9 @@ static const uint32_t k_core_base[TRICORE_MAX_CORES] = {
 #define OFF_DCON0           0x9040u
 #define OFF_PCON0           0x920Cu
 
-/* DBGSR */
+/* DBGSR.HALT is [2:1]; bit 2 is a write mask.  0b10 clears the halt. */
 #define DBGSR_DE            (1u << 0)
 #define DBGSR_HALT_SHIFT    1
-/*
- * HALT is [2:1] and bit 2 is a write mask: HALT[0] changes only when it is set.
- * 0b10 clears the halt (resume); 0b11 sets it, which works but is not a debug
- * event and therefore cannot suspend the timers.
- */
 #define HALT_REQ_CLEAR      0b10u
 
 /* Debug event registers: EVTA in bits [2:0], SUSP at bit 5. */
@@ -108,21 +73,16 @@ static const uint32_t k_core_base[TRICORE_MAX_CORES] = {
 #define EVT_SUSP            (1u << 5)
 #define EXEVT_HALT_AND_SUSPEND (EVT_SUSP | EVTA_HALT)
 
-/*
- * The exact TRnEVT word a working debugger uses for halt-on-instruction-address,
- * reused verbatim so these breakpoints behave like its.  Decodes as EVTA=halt,
- * BBM (break before the instruction runs), SUSP, TYP=1 (compare the PC).
- */
+/* TRnEVT for halt on PC: EVTA=halt, BBM, SUSP, TYP=1. */
 #define TREVT_HALT_ON_ADDR  0x0000102Au
 #define TREVT_RNG           (1u << 13)
 #define TREVT_AST           (1u << 27)   /* store: trigger on writes */
 #define TREVT_ALD           (1u << 28)   /* load: trigger on reads */
 
-/* Each core's own system timer, hardwired to that core's suspend-out signal. */
+/* Each core's own STM, hardwired to that core's suspend-out. */
 #define STM_BASE(core)      (0xF0001000u + 0x100u * (core))
 #define STM_OCS             0xE8u
-/* SUS_P is a write-only key that must accompany any change to SUS; SUS=2 is
- * hard suspend, which stops the counter while the core is halted. */
+/* SUS_P (bit 28) keys any SUS change; SUS=2 is hard suspend. */
 #define STM_OCS_SUS_HARD    ((1u << 28) | (0x2u << 24))
 #define STM_OCS_SUS_OFF     (1u << 28)
 

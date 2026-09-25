@@ -1,19 +1,8 @@
 /*
- * Upload an Intel HEX and program it into the TriCore, over HTTP.
+ * Upload an Intel HEX over HTTP and program it into the TriCore.
  *
- * The image arrives as a HEX rather than an ELF because the ELF for this
- * project is 43 MB and nearly all of it is debug information that flashing
- * never touches; the HEX beside it describes the same bytes in 2 MB.  That is
- * the difference between an image this probe can hold and one it cannot.
- *
- * The records are parsed as they stream in rather than buffered and parsed
- * afterwards, so the 2 MB of text never exists anywhere at once - only the
- * 700 kB of program content it describes.
- *
- * The programming itself runs in a task of its own.  esp_http_server handles
- * every request from one task, so doing it in the handler would block every
- * other endpoint for the length of a flash - including the one that reports
- * progress, which is the only thing anyone wants to look at while it runs.
+ * Records are parsed as they stream in; only the decoded image is kept, in
+ * PSRAM.  Programming runs in its own task so the status endpoint stays live.
  */
 
 #include <inttypes.h>
@@ -29,21 +18,14 @@
 
 static const char *TAG = "FLASH_WEB";
 
-/*
- * The window of program flash this accepts, as physical (uncached) addresses.
- *
- * Anything outside it is counted and skipped rather than programmed: a HEX
- * carries the UCBs, the boot mode headers and data-flash content too, and a bad
- * write to any of those is not recoverable with this tool.  The same rule the
- * reference flasher applies, for the same reason.
- */
+/* Accepted program-flash window (uncached).  Records outside it (UCBs, data
+ * flash) are counted and skipped. */
 #define PFLASH_BASE  0xA0000000u
 #define PFLASH_END   0xA0800000u
 /* The cached alias the linker usually emits; the flash is the same. */
 #define PFLASH_CACHED_BASE 0x80000000u
 
-/* How much image the probe will hold.  TC38x program flash is larger than this,
- * but an application image that needs more than 2 MB is not what this is for. */
+/* Largest image the probe will hold, from PFLASH_BASE. */
 #define IMAGE_MAX_BYTES (3u * 1024u * 1024u)
 
 typedef struct {
@@ -84,13 +66,7 @@ static void fail(const char *why)
     }
 }
 
-/*
- * One complete record, without its leading colon.
- *
- * Checksums are verified rather than assumed.  The whole reason flashing from a
- * HEX is safe is that it is the same bytes as the ELF, and a reader that
- * quietly repaired one would not be checking that any more.
- */
+/* Parse one record (without its leading colon), verifying length and checksum. */
 static void parse_record(const char *text, size_t len)
 {
     uint8_t raw[72];
@@ -297,14 +273,7 @@ static esp_err_t flash_upload_handler(httpd_req_t *req)
 
 static void flash_task(void *arg)
 {
-    /*
-     * Rounded out to whole pages.
-     *
-     * A page is the smallest thing that can be written and it is written whole,
-     * so a region that starts or ends inside one has to be widened rather than
-     * truncated.  It costs nothing: the buffer is erased-filled, so the bytes
-     * this pulls in are the value erased flash already holds.
-     */
+    /* Widen to whole pages; the padding is already erased-filled. */
     const uint32_t from = s_image.lowest & ~(TRICORE_FLASH_PAGE - 1u);
     const uint32_t to   = (s_image.highest + TRICORE_FLASH_PAGE - 1u) &
                           ~(TRICORE_FLASH_PAGE - 1u);
@@ -338,8 +307,7 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* ?slow=1 forces the word-at-a-time path, to tell a fabric problem from
-     * everything else without a rebuild. */
+    /* ?slow=1 forces word-at-a-time transfers instead of block writes. */
     char query[32], val[8];
     bool fast = true;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
@@ -348,11 +316,7 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
     }
     tricore_flash_set_blockwrite(fast);
 
-    /*
-     * Its own task, at a low priority.  The flash takes seconds and the web
-     * server runs every request from one task, so doing it here would block the
-     * progress endpoint - the one thing worth looking at while it runs.
-     */
+    /* Own low-priority task, so the single httpd task keeps serving status. */
     if (xTaskCreate(flash_task, "tricore_flash", 8192, NULL, 4,
                     &s_flash_task) != pdPASS) {
         s_flash_task = NULL;
