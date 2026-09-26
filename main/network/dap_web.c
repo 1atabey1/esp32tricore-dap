@@ -259,17 +259,18 @@ static esp_err_t dap_trace_stats_handler(httpd_req_t *req)
     if (check_auth(req) != ESP_OK) return ESP_OK;
 
     dap_trace_stats_t st;
-    char line[384];
+    char line[512];
 
     dap_trace_get_stats(&st);
     const int n = snprintf(line, sizeof(line),
         "running=%d paragraphs=%" PRIu32 " bytes=%" PRIu32 " lost=%" PRIu32
         " laps=%" PRIu32 " overruns=%" PRIu32 " read_errors=%" PRIu32
         " fifonow=0x%08" PRIX32 " queue_free=%" PRIu32 " queue_dropped=%" PRIu32
-        " poll_us_max=%" PRIu32 "\n",
+        " poll_us_max=%" PRIu32 " read_us=%" PRIu32 " read_paragraphs=%" PRIu32
+        " passes=%" PRIu32 "\n",
         st.running ? 1 : 0, st.paragraphs, st.bytes, st.lost, st.laps,
         st.overruns, st.read_errors, st.fifonow, st.queue_free,
-        st.queue_dropped, st.poll_us_max);
+        st.queue_dropped, st.poll_us_max, st.read_us, st.read_paragraphs, st.passes);
 
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);

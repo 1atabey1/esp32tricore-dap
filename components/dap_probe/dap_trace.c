@@ -292,6 +292,9 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     const uint32_t to_read = available;
     const uint32_t margin  = total_par - available;
     uint32_t i = 0;
+    if (to_read) {
+        s_stats.passes++;
+    }
     while (i < to_read) {
         const uint32_t batch = (to_read - i < TRACE_CHAIN_PARS) ? to_read - i : TRACE_CHAIN_PARS;
         dap_block_req_t reqs[2 * TRACE_CHAIN_PARS];
@@ -304,12 +307,15 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
             reqs[2 * k + 1].count = 1;
             par = (par + 1u) % total_par;
         }
+        const int64_t r0 = esp_timer_get_time();
         if (dap_probe_blockread_many(reqs, 2 * batch, words) != ESP_OK) {
             s_stats.read_errors++;
             dap_probe_clear_error_state();
             s_pending_lost = lost;
             return ESP_ERR_TIMEOUT;
         }
+        s_stats.read_us += (uint32_t)(esp_timer_get_time() - r0);
+        s_stats.read_paragraphs += batch;
 
         for (uint32_t k = 0; k < batch; k++, i++) {
             const uint32_t *pw = words + k * (TRACE_WORDS_PER_PAR + 1u);

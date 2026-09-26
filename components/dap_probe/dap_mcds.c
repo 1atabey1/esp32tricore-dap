@@ -342,6 +342,57 @@ static void restore_link(void)
     dap_phy_fpga_set_div(5);             /* the attach default */
 }
 
+/*
+ * The DAP's address for one the traced CPU uses: its own DSPR/PSPR through the
+ * core-local windows (0xD..., 0xC...) are only visible to that core.
+ */
+static uint32_t dap_view(uint32_t addr, uint8_t cpu)
+{
+    static const uint32_t seg[] = { 0x70000000u, 0x60000000u, 0x50000000u,
+                                    0x40000000u, 0x30000000u, 0x10000000u };
+    if (cpu >= sizeof(seg) / sizeof(seg[0])) {
+        return addr;
+    }
+    if ((addr & 0xFFF00000u) == 0xD0000000u) {
+        return seg[cpu] | (addr & 0x000FFFFFu);                 /* DSPR */
+    }
+    if ((addr & 0xFFF00000u) == 0xC0000000u) {
+        return (seg[cpu] + 0x00100000u) | (addr & 0x000FFFFFu); /* PSPR */
+    }
+    return addr;
+}
+
+/* The watched memory as it is when tracing starts, so a host can decode
+ * partial writes (a byte of a struct, a bitfield) from the first event. */
+static void take_snapshot(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
+{
+    for (int j = 0; j < DAP_MCDS_SLOTS; j++) {
+        dap_mcds_snapshot_t *sn = &info->snapshot[j];
+        const dap_mcds_slot_t *s = &cfg->slot[j];
+        sn->len = 0;
+        if (!s->enabled || s->size == 0) {
+            continue;
+        }
+        const uint32_t lo = s->addr & ~3u;
+        uint32_t len = ((s->addr + s->size + 3u) & ~3u) - lo;
+        if (len > DAP_MCDS_SNAPSHOT_BYTES) {
+            len = DAP_MCDS_SNAPSHOT_BYTES;
+        }
+        const uint32_t from = dap_view(lo, cfg->cpu);
+        uint32_t done = 0;
+        while (done < len) {
+            const uint32_t n = (len - done > 1024u) ? 1024u : len - done;
+            if (dap_probe_blockread(from + done, (uint32_t *)(sn->bytes + done), n / 4u) != ESP_OK) {
+                dap_probe_clear_error_state();
+                break;
+            }
+            done += n;
+        }
+        sn->addr = lo;
+        sn->len = (uint16_t)done;
+    }
+}
+
 esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
 {
     esp_err_t err;
@@ -371,6 +422,7 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
     }
     if (err == ESP_OK) {
         info->emu_hz = measure_emu_hz();
+        take_snapshot(cfg, info);
         dap_probe_read32(REG_TSUEMUCNT, &info->tsu_start);
         dap_probe_write32(DAP_ADDR_FIFOCTL, FIFOCTL_TRON);
         err = dap_probe_write32(DAP_ADDR_FIFOCTL, FIFOCTL_CLR);

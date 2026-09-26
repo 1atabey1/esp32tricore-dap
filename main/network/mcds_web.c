@@ -219,6 +219,33 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "wide_active", s_info.wide);
     cJSON_AddNumberToObject(root, "format", 1);
 
+    /* Initial memory of the watched ranges, hex, per slot. */
+    cJSON *snaps = cJSON_AddArrayToObject(root, "snapshot");
+    for (int j = 0; j < DAP_MCDS_SLOTS; j++) {
+        const dap_mcds_snapshot_t *sn = &s_info.snapshot[j];
+        if (sn->len == 0) {
+            continue;
+        }
+        char *hex = malloc(2u * sn->len + 1u);
+        if (hex == NULL) {
+            continue;
+        }
+        for (uint16_t i = 0; i < sn->len; i++) {
+            static const char digits[] = "0123456789abcdef";
+            hex[2 * i]     = digits[sn->bytes[i] >> 4];
+            hex[2 * i + 1] = digits[sn->bytes[i] & 15];
+        }
+        hex[2u * sn->len] = '\0';
+        char addr[16];
+        snprintf(addr, sizeof(addr), "0x%08lX", (unsigned long)sn->addr);
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "slot", j);
+        cJSON_AddStringToObject(o, "addr", addr);
+        cJSON_AddStringToObject(o, "hex", hex);
+        cJSON_AddItemToArray(snaps, o);
+        free(hex);
+    }
+
     /* Drain counters, so a client can show progress without the text endpoint. */
     dap_trace_stats_t st;
     dap_trace_get_stats(&st);

@@ -69,11 +69,22 @@ typedef struct {
     dap_mcds_slot_t       slot[DAP_MCDS_SLOTS];
 } dap_mcds_config_t;
 
+/* Watched memory read just before tracing started (per slot, from the slot
+ * address rounded down to a word, at most DAP_MCDS_SNAPSHOT_BYTES). */
+#define DAP_MCDS_SNAPSHOT_BYTES 2048
+
+typedef struct {
+    uint32_t addr;             /* as the traced source sees it */
+    uint16_t len;              /* 0: none (slot off, or unreadable) */
+    uint8_t  bytes[DAP_MCDS_SNAPSHOT_BYTES] __attribute__((aligned(4)));
+} dap_mcds_snapshot_t;
+
 /* What the probe measured while starting, for the decoder. */
 typedef struct {
     uint32_t emu_hz;           /* emulation (TSU) clock */
     uint32_t tsu_start;        /* TSUEMUCNT when tracing was armed */
     bool     wide;             /* the session runs in wide mode */
+    dap_mcds_snapshot_t snapshot[DAP_MCDS_SLOTS];
 } dap_mcds_info_t;
 
 void dap_mcds_default_config(dap_mcds_config_t *cfg);

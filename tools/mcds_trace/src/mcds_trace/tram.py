@@ -45,6 +45,9 @@ class Bits:
 
     def __init__(self, data: bytes, start_bit: int = 0, end_bit: int | None = None):
         self.data = data
+        # The whole buffer as one little-endian integer: bit k of the stream
+        # is bit k of the integer, so a field is one shift and mask.
+        self._int = int.from_bytes(data, 'little')
         self.pos = start_bit
         self.end = len(data) * 8 if end_bit is None else end_bit
 
@@ -52,12 +55,9 @@ class Bits:
         return self.end - self.pos
 
     def take(self, n: int) -> int:
-        if n > self.left():
-            raise EOFError('need %d bits, %d left' % (n, self.left()))
-        value = 0
-        for k in range(n):
-            bit = self.pos + k
-            value |= ((self.data[bit >> 3] >> (bit & 7)) & 1) << k
+        if n > self.end - self.pos:
+            raise EOFError('need %d bits, %d left' % (n, self.end - self.pos))
+        value = (self._int >> self.pos) & ((1 << n) - 1)
         self.pos += n
         return value
 

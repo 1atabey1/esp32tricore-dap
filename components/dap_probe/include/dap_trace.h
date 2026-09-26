@@ -47,6 +47,9 @@ typedef struct {
     uint32_t queue_free;     /* ring bytes still available */
     uint32_t queue_dropped;  /* payload bytes dropped because nobody was reading */
     uint32_t poll_us_max;    /* slowest drain pass, to size the poll interval */
+    uint32_t read_us;        /* time inside the chained paragraph reads */
+    uint32_t read_paragraphs;/* paragraphs those reads fetched (torn ones included) */
+    uint32_t passes;         /* drain passes that found paragraphs waiting */
 } dap_trace_stats_t;
 
 /* Start draining the trace FIFO.  Needs OCDS enabled and the miniMCDS

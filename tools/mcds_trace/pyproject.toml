@@ -7,13 +7,21 @@ dependencies = [
     "numpy>=1.26",
     "matplotlib>=3.8",
     "websocket-client>=1.7",
+    "flet[all]>=1.0.1",
+    "pyelftools>=0.33",
+    "flet-charts>=1.0.1",
 ]
 
 [project.scripts]
 mcds-trace = "mcds_trace.cli:main"
+mcds-trace-ui = "mcds_trace.ui.app:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "flet-mcp>=1.0.1",
+    "playwright>=1.63.0",
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["hatchling"]
