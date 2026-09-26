@@ -1739,6 +1739,12 @@ class App:
             self.toast('%s (%s)' % (msg, sess.error), error=True)
         else:
             self.toast(msg)
+        # The live view keeps a window; the file has everything.  Review that.
+        store = sess.store
+        partial = (sess.stats.decode_skipped > 0 or (sess.pipe and sess.pipe.log.dropped > 0)
+                   or (store is not None and store.trimmed))
+        if partial and not sess.error and os.path.exists(sess.out_path):
+            await self.open_capture(sess.out_path)
 
     def _update_start_buttons(self) -> None:
         live = self.mode == 'live'

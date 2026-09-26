@@ -151,3 +151,18 @@ def test_labels_and_workspace_colors():
     ws, missing = Workspace.from_json(d, None)
     colors = [s.color for s in ws.signals.values()]
     assert not missing and len(set(colors)) == 3 and colors[2] == '#123456'
+
+
+def test_exact_stores_then_a_partial_one():
+    # Whole-signal stores skip the shadow until something needs it: a byte
+    # store into the word must still see the latest whole value.
+    a, b = raw_signal(0x100, 4), raw_signal(0x104, 2, signed=True)
+    store = SignalStore()
+    ex = Extractor([a, b], store, HZ)
+    ex.feed([ev(0, 0x100, 0x11223344, 4), ev(10, 0x104, 0xFFFE, 2),
+             ev(20, 0x100, 0x55667788, 4), ev(30, 0x101, 0xAA, 1),
+             ev(40, 0x100, 0x01020304, 4)])
+    ex.feed([ev(50, 0x103, 0xBB, 1)])
+    assert list(store.series[a.id].view()[1]) == [0x11223344, 0x55667788, 0x5566AA88,
+                                                  0x01020304, 0xBB020304]
+    assert list(store.series[b.id].view()[1]) == [-2]

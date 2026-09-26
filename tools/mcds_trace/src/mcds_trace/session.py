@@ -26,11 +26,10 @@ import numpy as np
 
 from . import capfile
 from .capfile import REC_HEADER, REC_MAGIC, Record, write_header
-from .decode import Decoder
+from .decode import KIND_CODE, KINDS, Decoder
 from .signals import Extractor, Signal, SignalStore
 
-KINDS = ('write', 'read', 'wps', 'wpm', 'evc', 'lost', 'gap')
-_KIND_CODE = {k: i for i, k in enumerate(KINDS)}
+_KIND_CODE = KIND_CODE
 
 
 class Row:
@@ -58,19 +57,23 @@ class EventLog:
         self.dropped = 0
 
     def add(self, ev) -> None:
-        self._pending.append((ev.cycles, _KIND_CODE.get(ev.kind, 255),
-                              -1 if ev.addr is None else ev.addr,
-                              -1 if ev.value is None else ev.value,
-                              ev.size or 0, -1 if ev.wp is None else ev.wp,
-                              -1 if ev.count is None else ev.count))
-        self.n += 1
+        self.add_rows([(ev.cycles, _KIND_CODE.get(ev.kind, 255),
+                        -1 if ev.addr is None else ev.addr,
+                        -1 if ev.value is None else ev.value,
+                        ev.size or 0, -1 if ev.wp is None else ev.wp,
+                        -1 if ev.count is None else ev.count)])
+
+    def add_rows(self, rows: list[tuple]) -> None:
+        """Decoder rows (decode.ROW_FIELDS); fields after the seventh are not kept."""
+        self._pending.extend(rows)
+        self.n += len(rows)
         if len(self._pending) >= 65536:
             self._flush()
 
     def _flush(self) -> None:
         if not self._pending:
             return
-        cols = list(zip(*self._pending))
+        cols = list(zip(*self._pending))[:7]
         self._chunks.append({
             'cycles': np.array(cols[0], dtype=np.int64), 'kind': np.array(cols[1], dtype=np.uint8),
             'addr': np.array(cols[2], dtype=np.int64), 'value': np.array(cols[3], dtype=np.int64),
@@ -80,6 +83,16 @@ class EventLog:
         if self.limit:
             while len(self._chunks) > 1 and self.n - self.dropped > self.limit:
                 self.dropped += len(self._chunks.pop(0)['kind'])
+
+    def raw_rows(self, batch: int = 16384):
+        """Every event again, as lists of (cycles, kind, addr, value, size, wp,
+        count) tuples in order - what Extractor.feed_rows takes."""
+        self._flush()
+        for ch in self._chunks:
+            cols = [ch[k].tolist() for k in ('cycles', 'kind', 'addr', 'value', 'size', 'wp',
+                                             'count')]
+            for i in range(0, len(cols[0]), batch):
+                yield list(zip(*(c[i:i + batch] for c in cols)))
 
     def rows(self):
         """Every event again, as Rows, in order."""
@@ -173,18 +186,18 @@ class _Pipeline:
             self._records_in(recs, forced_gap, last_is_final)
 
     def _records_in(self, recs, forced_gap: bool, last_is_final: bool = False) -> None:
-        rows = []
+        rows: list[tuple] = []
+        decode = self.decoder.rows
         for rec in recs:
             gap = forced_gap or rec.gap or (self.prev_seq is not None and rec.seq != self.prev_seq + 1)
             forced_gap = False
             self.prev_seq = rec.seq
             self.records += 1
             final = rec.final or (last_is_final and rec is recs[-1])
-            for ev in self.decoder.paragraph(rec.payload, rec.seq, gap=gap, final=final):
-                self.log.add(ev)
-                rows.append(ev)
+            rows += decode(rec.payload, rec.seq, gap, final)
         if rows:
-            self.extractor.feed(rows)
+            self.log.add_rows(rows)
+            self.extractor.feed_rows(rows)
 
     def reselect(self, signals: list[Signal]) -> SignalStore:
         """Rebuild every series for a new selection from the event log."""
@@ -193,13 +206,8 @@ class _Pipeline:
             # Same time zero even when the log has dropped its oldest events.
             ex = Extractor(signals, store, self.config.get('emu_hz') or 0, self.config,
                            t0=self.extractor.t0)
-            batch = []
-            for row in self.log.rows():
-                batch.append(row)
-                if len(batch) >= 8192:
-                    ex.feed(batch)
-                    batch = []
-            ex.feed(batch)
+            for batch in self.log.raw_rows():
+                ex.feed_rows(batch)
             store.gaps = list(self.store.gaps)
             if self.store.t_end > store.t_end:
                 store.t_end = self.store.t_end

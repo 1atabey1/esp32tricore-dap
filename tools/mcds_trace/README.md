@@ -57,8 +57,11 @@ paragraphs) are marked with red dashed lines; nothing is interpolated.
 
 Throughput: the probe reads the trace RAM at about 3.2 MB/s while tracing
 (wide DAP at 24 MHz); sources that write faster lap the 8 kB trace RAM and
-lose paragraphs (flagged). The application decodes about 1.5 MB/s live; when
-it falls behind it skips ahead in the view only - the file is always complete.
+lose paragraphs (flagged). A 30 s trace of 27 members of a 20 kHz task
+(2.2 MB/s) arrives without a gap. The application decodes and extracts about
+4 MB/s; if it ever falls behind, it skips ahead in the live view only - the
+file is always complete. After Stop, the whole file is loaded for review if
+the live view had skipped, trimmed its history or dropped old events.
 
 ## Command line
 

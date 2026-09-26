@@ -16,13 +16,17 @@ thread while the extractor appends.
 
 from __future__ import annotations
 
+import struct
 import threading
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from .decode import Event
+from .decode import K_GAP, K_LOST, K_READ, K_WPM, K_WPS, row_of
 from .elfsyms import Node, decode_leaf, format_value
+
+_F32 = struct.Struct('<f')
+_F64 = struct.Struct('<d')
 
 PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
            '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#393b79', '#e6550d',
@@ -49,6 +53,34 @@ class Signal:
         if self.node is not None:
             return decode_leaf(self.node, raw)
         return int.from_bytes(raw[:self.size], 'little', signed=self.signed)
+
+    def int_decoder(self):
+        """A function from a store of exactly this signal's bytes (as the
+        unsigned little-endian integer) to what decode() gives for them."""
+        size = self.size
+        node = self.node
+        if node is None:
+            signed = self.signed
+        elif node.size != node.type.size or node.type.size == 0:
+            return lambda v: decode_leaf(node, v.to_bytes(size, 'little'))
+        elif node.bit_size:
+            shift, nb = node.bit_shift, node.bit_size
+            mask, sign = (1 << nb) - 1, 1 << (nb - 1)
+            if node.type.encoding == 'signed':
+                return lambda v: (((v >> shift) & mask) ^ sign) - sign
+            return lambda v: (v >> shift) & mask
+        elif node.type.kind == 'base' and node.type.encoding == 'float':
+            if size == 4:
+                return lambda v: _F32.unpack(v.to_bytes(4, 'little'))[0]
+            if size == 8:
+                return lambda v: _F64.unpack(v.to_bytes(8, 'little'))[0]
+            return lambda v: None
+        else:
+            signed = node.type.encoding == 'signed'
+        if signed:
+            sign = 1 << (8 * size - 1)
+            return lambda v: (v ^ sign) - sign
+        return lambda v: v
 
     def format(self, value) -> str:
         if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -130,8 +162,9 @@ class Series:
         n = self.n
         return self._t[:n], self._v[:n]
 
-    def drop_before(self, t_min: float) -> None:
-        """Forget samples older than t_min (keeps one before it for step plots)."""
+    def drop_before(self, t_min: float) -> bool:
+        """Forget samples older than t_min (keeps one before it for step plots);
+        True if any went."""
         t, _ = self.view()
         i = int(np.searchsorted(t, t_min)) - 1
         if i > 0:
@@ -139,6 +172,8 @@ class Series:
             self._t[:k] = self._t[i:self.n]
             self._v[:k] = self._v[i:self.n]
             self.n = k
+            return True
+        return False
 
 
 class SignalStore:
@@ -150,6 +185,7 @@ class SignalStore:
         self.gaps: list[float] = []        # times where data was lost
         self.t_end = 0.0                    # latest time seen, seconds
         self.samples = 0
+        self.trimmed = False                # trim() dropped old samples
 
     def get(self, sid: str) -> Series:
         s = self.series.get(sid)
@@ -174,7 +210,7 @@ class SignalStore:
         with self.lock:
             cut = self.t_end - keep_seconds
             for s in self.series.values():
-                s.drop_before(cut)
+                self.trimmed |= s.drop_before(cut)
             self.gaps = [g for g in self.gaps if g >= cut]
 
 
@@ -253,6 +289,8 @@ class Extractor:
         self._starts = np.array([s.addr for s in self.values], dtype=np.int64)
         self._max_size = max((s.size for s in self.values), default=0)
         self.single = self.values[0] if len(self.values) == 1 else None
+        self._plans: dict[int, object] = {}         # addr * 64 + size -> _plan()
+        self._exact_pending: dict[int, tuple] = {}  # exact stores not in the shadow yet
         if config:
             self.seed(config)
             if self.t0 is not None:          # re-extraction: time zero is known already
@@ -284,15 +322,15 @@ class Extractor:
                 self.store.get(s.id).append(0.0, float(v))
                 self.stats.samples += 1
 
-    def _time(self, ev) -> float | None:
-        if ev.cycles < 0:
+    def _time(self, cycles: int) -> float | None:
+        if cycles < 0:
             return None
         if self.t0 is None:
-            self.t0 = ev.cycles
+            self.t0 = cycles
             self._initial_samples()
         if self.emu_hz:
-            return (ev.cycles - self.t0) / self.emu_hz
-        return float(ev.cycles - self.t0)
+            return (cycles - self.t0) / self.emu_hz
+        return float(cycles - self.t0)
 
     def _overlapping(self, lo: int, hi: int) -> list[Signal]:
         if not self.values:
@@ -306,68 +344,137 @@ class Extractor:
                 out.append(s)
         return out
 
+    def _plan(self, addr: int, size: int):
+        """How a store of `size` bytes at `addr` is handled: None (no signal),
+        an _Exact list when it covers exactly the signals it touches, else the
+        overlapping signals (decoded through the shadow)."""
+        hit = self._overlapping(addr, addr + size)
+        if not hit:
+            return None
+        if all(s.addr == addr and s.size == size for s in hit):
+            return _Exact([(s.id, s.int_decoder()) for s in hit], hit)
+        return hit
+
     def feed(self, events) -> int:
-        """Process events; returns the samples produced."""
+        """Process Events; returns the samples produced."""
+        return self.feed_rows([row_of(ev) for ev in events])
+
+    def feed_rows(self, rows) -> int:
+        """Process decoder rows (decode.ROW_FIELDS); returns the samples produced."""
         st = self.stats
-        produced = 0
         store = self.store
+        plans = self._plans
+        exact = self._exact_pending
+        pend: dict[str, tuple[list, list]] = {}
+        produced = 0
+        hz = self.emu_hz
         with store.lock:
-            for ev in events:
+            t_end = store.t_end
+            t0 = self.t0
+            for r in rows:
                 st.events += 1
-                kind = ev.kind
-                if kind == 'gap':
+                cycles, kind = r[0], r[1]
+                if kind == K_GAP:
                     st.gaps += 1
-                    store.gaps.append(store.t_end)
+                    store.gaps.append(t_end)
                     continue
-                if kind == 'lost':
-                    st.lost += ev.count or 0
-                    t = self._time(ev)
-                    store.gaps.append(store.t_end if t is None else t)
+                if t0 is None and cycles >= 0:
+                    self._time(cycles)          # time zero: initial samples
+                    t0 = self.t0
+                if kind == K_LOST:
+                    st.lost += max(r[6], 0)
+                    store.gaps.append(t_end if cycles < 0 else
+                                      ((cycles - t0) / hz if hz else float(cycles - t0)))
                     continue
-                t = self._time(ev)
-                if t is None:
+                if cycles < 0:
                     st.untimed += 1
                     continue
-                if t > store.t_end:
-                    store.t_end = t
-                if kind in ('write', 'read'):
-                    produced += self._access(ev, t)
-                elif kind == 'wps':
-                    s = self.hits.get(ev.wp)
-                    if s is not None:
-                        store.get(s.id).append(t, 1.0)
-                        produced += 1
-                elif kind == 'wpm':
-                    for j, s in self.hits.items():
-                        if ev.wp is not None and ev.wp & (1 << j):
-                            store.get(s.id).append(t, 1.0)
+                t = (cycles - t0) / hz if hz else float(cycles - t0)
+                if t > t_end:
+                    t_end = t
+                if kind <= K_READ:
+                    addr, value, size = r[2], r[3], r[4] or 4
+                    if addr < 0:
+                        produced += self._data_only(value, r[4], t, pend)
+                        continue
+                    key = addr * 64 + size
+                    plan = plans.get(key, 0)
+                    if plan == 0:
+                        plan = plans[key] = self._plan(addr, size)
+                    if plan is None:
+                        st.unmatched += 1
+                        continue
+                    if value >= 0 and type(plan) is _Exact:
+                        # The whole of each signal: no shadow round trip (the
+                        # shadow gets the last value before it is next read).
+                        exact[key] = (addr, size, value)
+                        for sid, dec in plan:
+                            v = dec(value)
+                            if v is None:
+                                continue
+                            p = pend.get(sid)
+                            if p is None:
+                                p = pend[sid] = ([], [])
+                            p[0].append(t)
+                            p[1].append(float(v))
                             produced += 1
+                        continue
+                    if type(plan) is _Exact:
+                        plan = plan.hit             # an address-only access
+                    if exact:
+                        # Only a hit signal's own exact stores can overlap it.
+                        for s in plan:
+                            e = exact.pop(s.addr * 64 + s.size, None)
+                            if e is not None:
+                                self.shadow.write(e[0], e[2].to_bytes(e[1], 'little'))
+                    produced += self._through_shadow(plan, addr, value, size, t, pend)
+                elif kind == K_WPS:
+                    s = self.hits.get(r[5])
+                    if s is not None:
+                        _pend(pend, s.id, t, 1.0)
+                        produced += 1
+                elif kind == K_WPM:
+                    wp = r[5]
+                    if wp >= 0:
+                        for j, s in self.hits.items():
+                            if wp & (1 << j):
+                                _pend(pend, s.id, t, 1.0)
+                                produced += 1
+            store.t_end = t_end
+            if exact:
+                self._flush_exact()
+            for sid, (tl, vl) in pend.items():
+                store.get(sid).extend(np.array(tl, dtype=float), np.array(vl, dtype=float))
             st.samples += produced
             store.samples += produced
         return produced
 
-    def _access(self, ev: Event, t: float) -> int:
-        if ev.addr is None:
-            # Data-only payload: attributable only when one signal is traced.
-            s = self.single
-            if s is None or ev.value is None:
-                self.stats.unmatched += 1
-                return 0
-            raw = int(ev.value).to_bytes(max(ev.size, 1), 'little', signed=False)[:s.size]
-            v = s.decode(raw.ljust(s.size, b'\0'))
-            self.store.get(s.id).append(t, np.nan if v is None else float(v))
-            return 1
-        size = ev.size or 4
-        hit = self._overlapping(ev.addr, ev.addr + size)
-        if not hit:
+    def _flush_exact(self) -> None:
+        # An exact store's range is its signals' range, which no other
+        # signal overlaps (or the store would not be exact): order is free.
+        for addr, size, value in self._exact_pending.values():
+            self.shadow.write(addr, value.to_bytes(size, 'little'))
+        self._exact_pending.clear()
+
+    def _data_only(self, value: int, size: int, t: float, pend: dict) -> int:
+        # Data-only payload: attributable only when one signal is traced.
+        s = self.single
+        if s is None or value < 0:
             self.stats.unmatched += 1
             return 0
-        if ev.value is None:
+        raw = int(value).to_bytes(max(size, 1), 'little', signed=False)[:s.size]
+        v = s.decode(raw.ljust(s.size, bytes(1)))
+        _pend(pend, s.id, t, np.nan if v is None else float(v))
+        return 1
+
+    def _through_shadow(self, hit: list[Signal], addr: int, value: int, size: int, t: float,
+                        pend: dict) -> int:
+        if value < 0:
             # Address-only payload: the access is known, the value is not.
             for s in hit:
-                self.store.get(s.id).append(t, np.nan)
+                _pend(pend, s.id, t, np.nan)
             return len(hit)
-        self.shadow.write(ev.addr, int(ev.value).to_bytes(size, 'little', signed=False))
+        self.shadow.write(addr, int(value).to_bytes(size, 'little', signed=False))
         n = 0
         for s in hit:
             raw = self.shadow.read(s.addr, s.size)
@@ -376,9 +483,25 @@ class Extractor:
             v = s.decode(raw)
             if v is None:
                 continue
-            self.store.get(s.id).append(t, float(v))
+            _pend(pend, s.id, t, float(v))
             n += 1
         return n
+
+
+class _Exact(list):
+    """A store plan: (signal id, int decoder) of the signals it covers exactly."""
+
+    def __init__(self, items, hit):
+        super().__init__(items)
+        self.hit = hit
+
+
+def _pend(pend: dict, sid: str, t: float, v: float) -> None:
+    p = pend.get(sid)
+    if p is None:
+        p = pend[sid] = ([], [])
+    p[0].append(t)
+    p[1].append(v)
 
 
 # -- watch slots --------------------------------------------------------------
