@@ -33,9 +33,11 @@ static const char *TAG = "DAP_TRACE";
 /* Pointer registers hold a TRAM offset in bits [12:5]. */
 #define TRACE_PTR_MASK      0x1FE0u
 
-/* Output ring: 1 MB in PSRAM is ~0.5 s of slack at 2 MB/s against WiFi stalls;
+/* Output ring in PSRAM: slack against network stalls (a host hiccup of over a
+ * second was seen).  4 MB is ~1.8 s at 2.2 MB/s; 1 MB if PSRAM is short; the
  * internal RAM fallback is small. */
-#define TRACE_RING_PSRAM    (1024u * 1024u)
+#define TRACE_RING_PSRAM    (4u * 1024u * 1024u)
+#define TRACE_RING_PSRAM_MIN (1024u * 1024u)
 #define TRACE_RING_INTERNAL (64u * 1024u)
 #define TRACE_RING_BYTES    s_ring_bytes
 
@@ -156,6 +158,10 @@ static esp_err_t trace_begin(void)
     if (s_ring == NULL) {
         s_ring_bytes = TRACE_RING_PSRAM;
         s_ring = heap_caps_malloc(s_ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_ring == NULL) {
+            s_ring_bytes = TRACE_RING_PSRAM_MIN;
+            s_ring = heap_caps_malloc(s_ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
         if (s_ring == NULL) {
             s_ring_bytes = TRACE_RING_INTERNAL;
             s_ring = heap_caps_malloc(s_ring_bytes, MALLOC_CAP_8BIT);
