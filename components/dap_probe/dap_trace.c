@@ -56,6 +56,8 @@ static uint8_t          *s_ring;
 static size_t            s_ring_bytes;
 static size_t            s_ring_head;      /* next write; the drain's */
 static size_t            s_ring_tail;      /* next read; the sender's */
+static size_t            s_ring_reset_to;  /* a new trace starts here ... */
+static bool              s_ring_reset;     /* ... once the sender has moved its tail */
 
 static bool     s_running;
 static uint32_t s_bot, s_top;              /* FIFO bounds, byte offsets */
@@ -192,8 +194,10 @@ static esp_err_t trace_begin(void)
     s_last_ovrcnt  = ovr;
     s_pending_lost = 0;
     s_seq          = 0;
-    s_ring_head    = 0;
-    s_ring_tail    = 0;
+    /* A previous trace's unread bytes are dropped by the sender (it owns the
+     * tail), at its next read: a sender may be reading right now. */
+    s_ring_reset_to = __atomic_load_n(&s_ring_head, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_ring_reset, true, __ATOMIC_RELEASE);
 
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.queue_free = TRACE_RING_BYTES - 1u;
@@ -410,6 +414,11 @@ size_t dap_trace_read(uint8_t *out, size_t max)
 
     if (s_ring == NULL) {
         return 0;
+    }
+    if (__atomic_load_n(&s_ring_reset, __ATOMIC_ACQUIRE)) {
+        /* A trace started: skip what is left of the one before. */
+        __atomic_store_n(&s_ring_tail, s_ring_reset_to, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_ring_reset, false, __ATOMIC_RELAXED);
     }
     const size_t used = ring_used();
     const size_t tail = s_ring_tail;
