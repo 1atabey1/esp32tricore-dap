@@ -15,6 +15,7 @@ import json
 import math
 import multiprocessing
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -48,6 +49,11 @@ def fmt_time(t: float) -> str:
     if a >= 1e-6 or a == 0:
         return '%.1f us' % (t * 1e6)
     return '%.1f ns' % (t * 1e9)
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, 'rb') as f:
+        return f.read()
 
 
 def quiet() -> None:
@@ -1210,6 +1216,7 @@ class App:
             ib(ft.Icons.ADD_CHART, 'Add a plot', lambda e: self.add_plot()),
             ib(ft.Icons.IMAGE_OUTLINED, 'Export the view as PNG', self.export_png),
             ib(ft.Icons.TABLE_VIEW_OUTLINED, 'Export the visible samples as CSV', self.export_csv),
+            ib(ft.Icons.DOWNLOAD, 'Save the capture file as...', self.save_capture),
             gap(),
             self.cursor_text,
         ], spacing=4, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)
@@ -1313,7 +1320,8 @@ class App:
             'the time to it), right-click removes it. A plot\'s menu has statistics of the view, '
             'normalize, and splitting or merging plots.\n\n'
             '**Offline.** Open a capture file (.mcds) to analyse it; change the selected '
-            'signals at any time. Export PNG or CSV from the toolbar.\n\n'
+            'signals at any time. Export PNG or CSV from the toolbar; the download button saves '
+            'the capture file anywhere (in the browser: downloads it).\n\n'
             '**Keys.** F5 start/stop, Ctrl+O open capture, Ctrl+S save workspace.')
         dlg = ft.AlertDialog(
             title=ft.Text('How to use MCDS Trace'),
@@ -1397,7 +1405,9 @@ class App:
 
     def _refresh_recent(self) -> None:
         items = [ft.PopupMenuItem(content='Open a capture file...', icon=ft.Icons.FOLDER_OPEN,
-                                  on_click=self.guard(self.pick_capture))]
+                                  on_click=self.guard(self.pick_capture)),
+                 ft.PopupMenuItem(content='Save the capture file as...', icon=ft.Icons.DOWNLOAD,
+                                  on_click=self.guard(self.save_capture))]
         recent = [p for p in self.settings.recent_captures if os.path.exists(p)]
         if recent:
             items.append(ft.PopupMenuItem())
@@ -2008,6 +2018,46 @@ class App:
             data = f.read()
         os.unlink(tmp)
         await self._save_bytes(data, 'mcds-plot.png', 'Export PNG')
+
+    def capture_path(self) -> str | None:
+        """The capture file of the current session, if there is one."""
+        sess = self.session
+        path = getattr(sess, 'path', None) or getattr(sess, 'out_path', None)
+        return path if path and os.path.exists(path) else None
+
+    async def save_capture(self, e=None) -> None:
+        """Copy the current capture file to a place of the user's choice (in
+        the browser: download it)."""
+        path = self.capture_path()
+        if path is None:
+            self.toast('Open or record a capture first.', error=True)
+            return
+        if self.mode in ('live', 'starting', 'stopping', 'loading'):
+            self.toast('Wait until the capture is complete (stop the trace first).', error=True)
+            return
+        name = os.path.basename(path)
+        if self.page.web:
+            data = await asyncio.to_thread(_read_bytes, path)
+            await ft.FilePicker().save_file(file_name=name, src_bytes=data)
+            return
+        dest = await ft.FilePicker().save_file(
+            dialog_title='Save the capture as', file_name=name, allowed_extensions=['mcds'],
+            initial_directory=os.path.expanduser('~'))
+        if not dest:
+            return
+        if not dest.lower().endswith('.mcds'):
+            dest += '.mcds'
+        if os.path.abspath(dest) == os.path.abspath(path):
+            self.toast('That is the capture file itself.')
+            return
+        self.busy_text = 'Saving %s' % os.path.basename(dest)
+        try:
+            await asyncio.to_thread(shutil.copyfile, path, dest)
+        except OSError as ex:
+            raise RuntimeError('saving %s: %s' % (dest, ex)) from None
+        finally:
+            self.busy_text = ''
+        self.toast('Saved %s (%s)' % (dest, fmt_bytes(os.path.getsize(dest))))
 
     async def export_csv(self, e=None) -> None:
         store = self.store()

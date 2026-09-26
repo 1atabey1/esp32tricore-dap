@@ -57,7 +57,8 @@ reload or a network drop only pauses drawing; a running trace carries on.
 5. **Offline** - open a `.mcds` file (toolbar, recent list, or command line).
    Selection changes re-extract from the decoded events without decoding
    again; variables the capture has accesses to are offered after opening.
-6. **Export** - PNG of the view, CSV of the visible samples; workspaces
+6. **Export** - PNG of the view, CSV of the visible samples, the capture file
+   itself to any folder (a download in the browser); workspaces
    (`.mcdsws`: ELF, signals, plots, capture settings) save and load.
 
 Compact mode records hit times per range instead of values. Gaps (lost
