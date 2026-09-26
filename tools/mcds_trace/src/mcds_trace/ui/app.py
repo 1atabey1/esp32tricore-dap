@@ -280,7 +280,7 @@ class PlotCard:
             if s.kind == 'hits' or (self.app.hits_mode()):
                 txt.value = '%d hits' % ser.n if at is None else ''
             else:
-                txt.value = s.format(v)
+                txt.value = s.format_display(s.apply(v))
 
     # rendering ---------------------------------------------------------------
 
@@ -295,6 +295,8 @@ class PlotCard:
                     continue
                 t, v = store.window(app.trace_id(s), app.view.x0, app.view.x1)
                 kind = 'hits' if (s.kind == 'hits' or app.hits_mode()) else 'value'
+                if kind == 'value':
+                    v = s.apply(v)
                 if self.model.normalize and kind == 'value' and len(v):
                     v = normalized(t, v, app.view.x0, app.view.x1)
                 traces.append(Trace(t, v, s.color, kind, s.label))
@@ -440,7 +442,9 @@ class PlotCard:
         sigs = [s for s in (self.app.ws.signals.get(sid) for sid in self.model.signals)
                 if s is not None]
         layout = tuple((s.id, s.color) for s in sigs)
-        key = (layout, x0, x1, id(store), store.samples if store else 0, self.app.hits_mode())
+        scales = tuple((s.gain, s.offset, s.unit) for s in sigs)
+        key = (layout, scales, x0, x1, id(store), store.samples if store else 0,
+               self.app.hits_mode())
         if key == getattr(self, '_stats_key', None):
             return                        # nothing changed since the last time
         self._stats_key = key
@@ -458,11 +462,12 @@ class PlotCard:
             t, v = store.window(self.app.trace_id(s), x0, x1)
             i0, i1 = int(np.searchsorted(t, x0)), int(np.searchsorted(t, x1, side='right'))
             tt, vv = t[i0:i1], v[i0:i1]
-            fin = vv[np.isfinite(vv)]
+            fin = s.apply(vv[np.isfinite(vv)])
             parts = ['n %d' % len(tt)]
             if len(fin) and not (s.kind == 'hits' or self.app.hits_mode()):
-                parts += ['min %s' % s.format(float(fin.min())), 'max %s' % s.format(float(fin.max())),
-                          'mean %.6g' % float(fin.mean())]
+                parts += ['min %s' % s.format_display(float(fin.min())),
+                          'max %s' % s.format_display(float(fin.max())),
+                          'mean %.6g%s' % (float(fin.mean()), ' ' + s.unit if s.unit else '')]
             if len(tt) > 1:
                 parts.append('dt %s' % fmt_time(float(np.median(np.diff(tt)))))
             txt.value = '  '.join(parts)
@@ -873,12 +878,20 @@ class App:
             items += [ft.PopupMenuItem(content='New plot with it', icon=ft.Icons.ADD_CHART,
                                        on_click=self.guard(lambda e, sid=s.id: self.plot_signal(sid, -1))),
                       ft.PopupMenuItem(content='Rename...', icon=ft.Icons.EDIT_OUTLINED,
-                                       on_click=self.guard(lambda e, sid=s.id: self._rename(sid))),
-                      ft.PopupMenuItem(),
+                                       on_click=self.guard(lambda e, sid=s.id: self._rename(sid)))]
+            if s.kind == 'value':
+                items.append(ft.PopupMenuItem(
+                    content='Scale and unit...', icon=ft.Icons.STRAIGHTEN,
+                    on_click=self.guard(lambda e, sid=s.id: self._scale_dialog(sid))))
+            items += [ft.PopupMenuItem(),
                       ft.PopupMenuItem(content='Remove', icon=ft.Icons.DELETE_OUTLINE,
                                        on_click=self.guard(lambda e, sid=s.id: self.remove_signal(sid)))]
             desc = '%s  %s  %dB' % (s.node.type_name() if s.node else ('signed' if s.signed else 'raw'),
                                     hexaddr(s.addr), s.size) if s.kind == 'value' else 'watch-point hits'
+            if s.scaled or s.unit:
+                desc += '  ' + ' '.join(p for p in (
+                    '×%g' % s.gain if s.gain != 1 else '',
+                    '%+g' % s.offset if s.offset else '', s.unit) if p)
             body = ft.Container(
                 content=ft.Row([
                     ft.Icon(ft.Icons.DRAG_INDICATOR, size=16, color=ft.Colors.ON_SURFACE_VARIANT),
@@ -928,6 +941,44 @@ class App:
         field.on_submit = ok
         dlg = ft.AlertDialog(title=ft.Text('Signal name'), content=field,
                              actions=[ft.FilledButton('OK', on_click=ok)])
+        self.page.show_dialog(dlg)
+
+    def _scale_dialog(self, sid: str) -> None:
+        s = self.ws.signals.get(sid)
+        if s is None:
+            return
+        gain = ft.TextField(label='Gain', value='%g' % s.gain, width=120, dense=True)
+        offset = ft.TextField(label='Offset', value='%g' % s.offset, width=120, dense=True)
+        unit = ft.TextField(label='Unit', value=s.unit, width=90, dense=True)
+
+        def ok(e):
+            try:
+                g = float(gain.value or 1)
+                o = float(offset.value or 0)
+            except (TypeError, ValueError):
+                g = o = math.nan
+            gain.error = None if math.isfinite(g) and g != 0 else 'a number, not 0'
+            offset.error = None if math.isfinite(o) else 'a number'
+            if gain.error or offset.error:
+                dlg.update()
+                return
+            s.gain, s.offset, s.unit = g, o, (unit.value or '').strip()[:16]
+            close_dialog(dlg)
+            self.selection_changed(retrace=False)
+            self.page.update()
+
+        def reset(e):
+            gain.value, offset.value, unit.value = '1', '0', ''
+            ok(e)
+
+        dlg = ft.AlertDialog(
+            title=ft.Text('Scale %s' % s.label),
+            content=ft.Column([
+                ft.Text('Shown as value x gain + offset (the capture keeps the raw values).',
+                        size=12),
+                ft.Row([gain, offset, unit])], tight=True, width=380),
+            actions=[ft.TextButton('Raw values', on_click=reset),
+                     ft.FilledButton('Apply', on_click=ok)])
         self.page.show_dialog(dlg)
 
     # capture panel -------------------------------------------------------------
@@ -1640,17 +1691,25 @@ class App:
                         if isinstance(sess, LiveSession) else
                         '%s: outside the watch ranges of this capture (no data for %s).')
                        % (names, 'them' if len(outside) > 1 else 'it'))
-        # The worker answers in order, so the newest selection is applied
-        # last; only its completion clears the status.
-        self._select_gen = gen = getattr(self, '_select_gen', 0) + 1
+        # One re-extraction at a time; changes made meanwhile collapse into
+        # one more run with the newest selection.
+        self._want_selection = (sess, sigs)
+        if getattr(self, '_reselecting', False):
+            return
+        self._reselecting = True
         self.busy_text = 'Re-extracting signals'
         try:
-            await asyncio.to_thread(sess.pipe.reselect, sigs)
+            while self._want_selection is not None:
+                sess, sigs = self._want_selection
+                self._want_selection = None
+                if sess is not self.session or sess.pipe is None:
+                    continue
+                await asyncio.to_thread(sess.pipe.reselect, sigs)
+                for c in self.plot_cards:
+                    c.last_key = None
         finally:
-            if gen == self._select_gen:
-                self.busy_text = ''
-        for c in self.plot_cards:
-            c.last_key = None
+            self._reselecting = False
+            self.busy_text = ''
 
     def rebuild_plots(self) -> None:
         cards = {c.model.id: c for c in self.plot_cards}
@@ -1895,19 +1954,23 @@ class App:
             self.toast('Nothing to export yet.', error=True)
             return
         x0, x1 = self.view.x0, self.view.x1
+        def num(x):
+            return '' if x != x else (int(x) if float(x).is_integer() else x)
+
         rows = []
         for s in self.ws.plotted():
-            t, v = store.snapshot(self.trace_id(s))
+            t, v = store.window(self.trace_id(s), x0, x1)
             m = (t >= x0) & (t <= x1)
-            for tt, vv in zip(t[m].tolist(), v[m].tolist()):
-                rows.append((tt, s.label, '' if vv != vv else (int(vv) if float(vv).is_integer() else vv)))
+            shown = s.apply(v[m]) if s.kind == 'value' else v[m]
+            for tt, vv, ss in zip(t[m].tolist(), v[m].tolist(), shown.tolist()):
+                rows.append((tt, s.label, num(ss), s.unit, num(vv)))
         rows.sort(key=lambda r: r[0])
         import io
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(['time_s', 'signal', 'value'])
+        w.writerow(['time_s', 'signal', 'value', 'unit', 'raw'])
         for r in rows:
-            w.writerow(['%.9f' % r[0], r[1], r[2]])
+            w.writerow(['%.9f' % r[0]] + list(r[1:]))
         await self._save_bytes(buf.getvalue().encode(), 'mcds-samples.csv', 'Export CSV')
 
     async def _save_bytes(self, data: bytes, name: str, title: str) -> None:
@@ -1942,6 +2005,12 @@ class App:
                 if self.mode == 'live' and isinstance(self.session, LiveSession) and \
                         self.ws.capture.duration > 0 and not self._auto_stopping and \
                         t_start - self.session.stats.started >= self.ws.capture.duration:
+                    self._auto_stopping = True
+                    self.spawn(self.guard(self.start_stop)())
+                sess = self.session
+                if self.mode == 'live' and isinstance(sess, LiveSession) and sess.pipe is not None \
+                        and sess.pipe.done.is_set() and not self._auto_stopping:
+                    # The stream ended by itself (probe gone, worker failed).
                     self._auto_stopping = True
                     self.spawn(self.guard(self.start_stop)())
                 if self.mode == 'live' and store is not None and t_start - last_trim > 2.0:
@@ -2101,7 +2170,7 @@ class App:
                 if sess is self._pending:
                     # Still starting: wait for it, then stop it.
                     for _ in range(300):
-                        if sess.running or sess.error:
+                        if sess.running or sess.error or self._pending is not sess:
                             break
                         time.sleep(0.1)
                 _close_session(sess)

@@ -166,3 +166,25 @@ def test_exact_stores_then_a_partial_one():
     assert list(store.series[a.id].view()[1]) == [0x11223344, 0x55667788, 0x5566AA88,
                                                   0x01020304, 0xBB020304]
     assert list(store.series[b.id].view()[1]) == [-2]
+
+
+def test_scale_and_unit_are_display_only_and_saved():
+    from mcds_trace.ui.model import Workspace
+    s = raw_signal(0x100, 2, signed=True)
+    s.gain, s.offset, s.unit = 0.5, -1.0, 'V'
+    assert s.apply(np.array([4.0]))[0] == 1.0 and s.format_display(1.0) == '1 V'
+    ws = Workspace()
+    ws.add_signal(s)
+    back, missing = Workspace.from_json(ws.to_json(), None)
+    b = back.signals[s.id]
+    assert not missing and (b.gain, b.offset, b.unit) == (0.5, -1.0, 'V')
+    plain = raw_signal(0x200, 4)
+    assert not plain.scaled and plain.format_display(7.0) == '7'
+
+
+def test_snapshot_samples_count_in_the_store():
+    s = raw_signal(0x300, 2)
+    store = SignalStore()
+    ex = Extractor([s], store, HZ, {'snapshot': [{'addr': '0x300', 'hex': '3412'}]})
+    ex.feed([ev(100, 0x9999, 1, 1)])                        # first timed event: time zero
+    assert store.series[s.id].n == 1 and store.samples == 1

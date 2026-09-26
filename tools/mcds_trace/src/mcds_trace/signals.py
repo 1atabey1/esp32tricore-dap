@@ -44,10 +44,28 @@ class Signal:
     slot: int = -1                # hits: the watch slot
     color: str = PALETTE[0]
     signed: bool = False          # raw signals only
+    gain: float = 1.0             # shown as value * gain + offset, in `unit`
+    offset: float = 0.0
+    unit: str = ''
 
     @property
     def end(self) -> int:
         return self.addr + self.size
+
+    @property
+    def scaled(self) -> bool:
+        return self.gain != 1.0 or self.offset != 0.0
+
+    def apply(self, v):
+        """Stored (decoded) value(s) -> displayed value(s)."""
+        return v * self.gain + self.offset if self.scaled else v
+
+    def format_display(self, value) -> str:
+        """A displayed value (after apply) with its unit."""
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return '-'
+        text = '%.6g' % value if self.scaled else self.format(value)
+        return '%s %s' % (text, self.unit) if self.unit else text
 
     def decode(self, raw: bytes):
         if self.node is not None:
@@ -97,6 +115,10 @@ class Signal:
             d['slot'] = self.slot
         if self.node is None and self.kind == 'value':
             d['signed'] = self.signed
+        if self.scaled:
+            d['gain'], d['offset'] = self.gain, self.offset
+        if self.unit:
+            d['unit'] = self.unit
         return d
 
 
@@ -286,11 +308,16 @@ class Extractor:
     """Turns decoder events into samples of the selected signals."""
 
     def __init__(self, signals: list[Signal], store: SignalStore, emu_hz: float,
-                 config: dict | None = None, t0: int | None = None):
+                 config: dict | None = None, t0: int | None = None,
+                 memory: list[tuple[int, bytes]] | None = None, initial_t: float = 0.0):
+        """memory: known bytes on top of the start snapshot (a re-extraction
+        from an event log that dropped its oldest events); initial_t: when
+        the initial samples of fully known signals are placed."""
         self.store = store
         self.emu_hz = float(emu_hz or 0)
         self.stats = ExtractStats()
         self.t0: int | None = t0          # cycles at time zero (first timed event)
+        self.initial_t = initial_t
         self.shadow = Shadow()
         self.values = [s for s in signals if s.kind == 'value' and s.size > 0]
         self.hits = {s.slot: s for s in signals if s.kind == 'hits'}
@@ -305,8 +332,11 @@ class Extractor:
         self._exact_pending: dict[int, tuple] = {}  # exact stores not in the shadow yet
         if config:
             self.seed(config)
-            if self.t0 is not None:          # re-extraction: time zero is known already
-                self._initial_samples()
+        for addr, raw in memory or ():
+            self.shadow.write(addr, raw)
+            self._seeded = True
+        if self.t0 is not None and (config or memory):   # re-extraction: time zero is known
+            self._initial_samples()
 
     def seed(self, config: dict) -> None:
         """Apply the probe's start snapshot (config['snapshot'])."""
@@ -331,8 +361,9 @@ class Extractor:
                 continue
             v = s.decode(raw)
             if v is not None:
-                self.store.get(s.id).append(0.0, float(v))
+                self.store.get(s.id).append(self.initial_t, float(v))
                 self.stats.samples += 1
+                self.store.samples += 1
 
     def _time(self, cycles: int) -> float | None:
         if cycles < 0:

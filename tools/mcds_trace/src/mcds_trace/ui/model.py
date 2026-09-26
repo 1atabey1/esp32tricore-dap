@@ -4,6 +4,7 @@ signals are selected, how they are plotted, how the trace is configured)."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -327,6 +328,13 @@ class Workspace:
             sig.color = sd.get('color') or ws.next_color()
             if sd.get('label'):
                 sig.label = sd['label']
+            try:
+                gain, offset = float(sd.get('gain', 1.0)), float(sd.get('offset', 0.0))
+                if math.isfinite(gain) and math.isfinite(offset) and gain != 0:
+                    sig.gain, sig.offset = gain, offset
+            except (TypeError, ValueError):
+                pass
+            sig.unit = str(sd.get('unit', ''))[:16]
             ws.signals[sig.id] = sig
         for pd in d.get('subplots', []):
             sp = SubplotModel(int(pd.get('id', ws._next_plot)),
