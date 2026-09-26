@@ -74,3 +74,21 @@ def test_decimation_keeps_extremes_in_order():
     v[1234], v[5678] = 5.0, -7.0
     dt, dv = minmax_decimate(t, v, 0, 1, 100)
     assert dv.max() == 5.0 and dv.min() == -7.0 and (np.diff(dt) >= 0).all()
+
+
+def test_decimation_bins_the_view_not_far_neighbours():
+    t = np.concatenate(([0.0], np.linspace(100, 101, 20000), [1000.0]))
+    v = np.sin(t * 50)
+    dt, dv = minmax_decimate(t, v, 100, 101, 800)
+    inside = (dt >= 100) & (dt <= 101)
+    assert inside.sum() > 800 and dt[0] == 0.0 and dt[-1] == 1000.0
+
+
+def test_log_scale_and_held_step_value_autoscale():
+    t = np.linspace(0, 1, 100)
+    info, _ = _frame(traces=[Trace(t, 1 + 999 * t, '#ff0000')], ylog=True)
+    assert 0 < info.y0 < 1 and info.y1 > 1000              # a real log range
+    # 100 held from before the view, then 0..1 inside: 100 must be in range
+    tt = np.array([-1.0, 0.5, 0.6])
+    info, _ = _frame(traces=[Trace(tt, np.array([100.0, 0.0, 1.0]), '#00ff00')])
+    assert info.y1 >= 100 and info.y0 <= 0

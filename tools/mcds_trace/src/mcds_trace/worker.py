@@ -24,12 +24,59 @@ import threading
 import time
 from dataclasses import asdict
 
+import struct
+
 from . import capfile
-from .capfile import write_header
-from .session import RecordStream, SessionStats, _Pipeline
+from .capfile import REC_HEADER, REC_MAGIC, write_header
+from .session import Probe, RecordStream, SessionStats, _Pipeline
 
 BATCH_S = 0.05                # how often samples go to the UI
 QUIET_S = 1.5                 # after stop: the stream has ended once it is quiet this long
+
+
+_MAGIC = struct.pack('<I', REC_MAGIC)
+
+
+def _record_starts(data: bytes, seq: int) -> list[int]:
+    """Offsets of record headers with this sequence number."""
+    out, pos = [], data.find(_MAGIC)
+    while pos >= 0:
+        if len(data) - pos >= REC_HEADER.size:
+            m, sq, _, length, _, _ = REC_HEADER.unpack_from(data, pos)
+            if sq == seq and 0 < length <= 65535:
+                out.append(pos)
+        pos = data.find(_MAGIC, pos + 1)
+    return out
+
+
+class _StartGate:
+    """Passes the stream from the new trace's first record (sequence 0) on:
+    bytes an earlier trace left in the probe come before it."""
+
+    def __init__(self):
+        self.open = False
+        self.buf = b''
+
+    def start(self, early: bytes) -> bytes:
+        # The last first record received so far is the new trace's.
+        starts = _record_starts(early, 0)
+        if starts:
+            self.open = True
+            return early[starts[-1]:]
+        self.buf = early[-(REC_HEADER.size - 1):]      # a header may straddle frames
+        return b''
+
+    def feed(self, data: bytes) -> bytes:
+        if self.open:
+            return data
+        buf = self.buf + data
+        starts = _record_starts(buf, 0)
+        if starts:
+            self.open = True
+            self.buf = b''
+            return buf[starts[0]:]
+        self.buf = buf[-(REC_HEADER.size - 1):]
+        return b''
 
 
 def _take_samples(pipe: _Pipeline) -> tuple[dict, list, float, int]:
@@ -73,6 +120,17 @@ class _Serve:
             self.conn.send(('batch', {}, [], t_end, 0, _stats(st, self.pipe)))
 
     def handle(self, cmd, st: SessionStats) -> str | None:
+        """Answer a request; returns the kinds the caller acts on itself.  A
+        request that fails is answered with ('failed', text)."""
+        try:
+            return self._handle(cmd, st)
+        except (EOFError, OSError, BrokenPipeError):
+            raise
+        except Exception as e:
+            self.conn.send(('failed', '%s: %s' % (cmd[0], e)))
+            return None
+
+    def _handle(self, cmd, st: SessionStats) -> str | None:
         kind = cmd[0]
         if kind == 'select':
             self.send_batch(st)                    # the old selection's last samples
@@ -123,8 +181,12 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
     error: list[str] = []
     early: list[bytes] = []            # frames before the header is written
     begun = [False]
+    gate = _StartGate()
 
     def take(frame: bytes) -> None:
+        frame = gate.feed(frame)
+        if not frame:
+            return
         f.write(frame)
         st.bytes += len(frame)
         st.frames += 1
@@ -195,9 +257,10 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
     pipe = _Pipeline(config, signals, log_limit=log_limit)
     with lock:
         write_header(f, config)
-        for frame in early:
-            take(frame)
+        first = gate.start(b''.join(early))
         early.clear()
+        if first:
+            take(first)
         begun[0] = True
     st.started = time.monotonic()
     serve = _Serve(conn, pipe)
@@ -220,6 +283,11 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                         except Exception:
                             pass
             except (EOFError, OSError):                  # the UI is gone
+                if not stop.is_set():
+                    try:
+                        Probe(host, auth, timeout=10).stop()   # nobody records it now
+                    except Exception:
+                        pass
                 stop.set()
                 decoding = False
                 try:
@@ -255,12 +323,19 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                     rs = RecordStream()
                     skip_gap = True
                 else:
-                    recs = rs.feed(item)
-                    if recs:
-                        for r in recs:
-                            st.probe_lost += r.lost
-                        pipe.records_in(recs, forced_gap=skip_gap)
-                        skip_gap = False
+                    try:
+                        recs = rs.feed(item)
+                        if recs:
+                            for r in recs:
+                                st.probe_lost += r.lost
+                            pipe.records_in(recs, forced_gap=skip_gap)
+                            skip_gap = False
+                    except Exception as e:
+                        # The live view ends here; the file is still written.
+                        decoding = False
+                        error.append('decoder: %s' % e)
+                        conn.send(('error', 'the live view stopped (decoder: %s); the capture '
+                                            'file is still being written' % e))
             elif item:
                 with lock:
                     st.backlog -= len(item)
@@ -295,6 +370,7 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                     break
         except (EOFError, OSError, BrokenPipeError):
             pass
+        conn.close()
 
 
 def file_main(conn, path: str, signals: list) -> None:
@@ -340,3 +416,5 @@ def file_main(conn, path: str, signals: list) -> None:
             conn.send(('error', 'decoder: %s' % e))
         except (EOFError, OSError, BrokenPipeError):
             pass
+    finally:
+        conn.close()

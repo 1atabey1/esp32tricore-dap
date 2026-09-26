@@ -175,3 +175,29 @@ def test_probe_errors_are_readable():
         p.config()
     with pytest.raises(session.ProbeError):
         session.Probe('1.2.3.4:abc').config()
+
+
+def test_start_gate_drops_an_earlier_trace():
+    from mcds_trace.worker import _StartGate
+    old = record(7, b'o' * 1024) + record(8, b'o' * 1024)
+    new = record(0, b'n' * 1024) + record(1, b'n' * 1024)
+    g = _StartGate()
+    assert g.start(old + new[:30]) == new[:30]              # from the new first record on
+    assert g.feed(new[30:]) == new[30:]
+    g2 = _StartGate()
+    assert g2.start(old) == b'' and g2.feed(old[:10]) == b''
+    blob = new
+    got = g2.feed(blob[:5]) + g2.feed(blob[5:])             # header split across frames
+    assert got == blob
+
+
+def test_event_log_keeps_the_memory_of_dropped_events():
+    from mcds_trace.decode import Event
+    log = session.EventLog(limit=70000)
+    log.add(Event(0, 'write', addr=0x100, value=0x11223344, size=4))
+    log.add(Event(1, 'write', addr=0x101, value=0xAA, size=1))
+    for i in range(140000):
+        log.add(Event(10 + i, 'write', addr=0x200, value=i & 0xFF, size=1))
+    list(log.raw_rows())
+    assert log.dropped and log.memory()[0] == (0x100, bytes([0x44, 0xAA, 0x22, 0x11]))
+    assert log.first_cycles() > 10

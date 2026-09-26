@@ -57,6 +57,7 @@ class EventLog:
         self.n = 0
         self.limit = limit            # keep at most this many (oldest chunks go)
         self.dropped = 0
+        self.base: dict[int, int] = {}    # memory as the dropped events left it: addr -> byte
 
     def add(self, ev) -> None:
         self.add_rows([(ev.cycles, _KIND_CODE.get(ev.kind, 255),
@@ -84,7 +85,44 @@ class EventLog:
         self._pending = []
         if self.limit:
             while len(self._chunks) > 1 and self.n - self.dropped > self.limit:
-                self.dropped += len(self._chunks.pop(0)['kind'])
+                ch = self._chunks.pop(0)
+                self._absorb(ch)
+                self.dropped += len(ch['kind'])
+
+    def _absorb(self, ch: dict) -> None:
+        """Fold a dropped chunk's accesses into `base`: the last value of each byte."""
+        m = (ch['kind'] <= 1) & (ch['addr'] >= 0) & (ch['value'] >= 0)
+        a, v = ch['addr'][m], ch['value'][m]
+        size = ch['size'][m].astype(np.int64)
+        size[size == 0] = 4
+        if not len(a):
+            return
+        which = np.repeat(np.arange(len(a)), size)
+        off = np.arange(len(which)) - np.repeat(np.cumsum(size) - size, size)
+        byte_addr = a[which] + off
+        byte_val = (v[which] >> (8 * off)) & 0xFF
+        uniq, first_rev = np.unique(byte_addr[::-1], return_index=True)
+        last = len(byte_addr) - 1 - first_rev
+        self.base.update(zip(uniq.tolist(), byte_val[last].tolist()))
+
+    def memory(self) -> list[tuple[int, bytes]]:
+        """`base` as contiguous (address, bytes) runs."""
+        out: list[tuple[int, bytes]] = []
+        for addr in sorted(self.base):
+            if out and out[-1][0] + len(out[-1][1]) == addr:
+                out[-1] = (out[-1][0], out[-1][1] + bytes((self.base[addr],)))
+            else:
+                out.append((addr, bytes((self.base[addr],))))
+        return out
+
+    def first_cycles(self) -> int | None:
+        """Time of the oldest event kept."""
+        self._flush()
+        for ch in self._chunks:
+            c = ch['cycles'][ch['cycles'] >= 0]
+            if len(c):
+                return int(c[0])
+        return None
 
     def raw_rows(self, batch: int = 16384):
         """Every event again, as lists of (cycles, kind, addr, value, size, wp,
@@ -205,9 +243,18 @@ class _Pipeline:
         """Rebuild every series for a new selection from the event log."""
         with self.lock:
             store = SignalStore()
-            # Same time zero even when the log has dropped its oldest events.
-            ex = Extractor(signals, store, self.config.get('emu_hz') or 0, self.config,
-                           t0=self.extractor.t0)
+            hz = self.config.get('emu_hz') or 0
+            t0 = self.extractor.t0              # the same time zero as before
+            memory, initial_t = None, 0.0
+            if self.log.dropped:
+                # The oldest events are gone: start from the memory they left,
+                # at the first event kept.
+                memory = self.log.memory()
+                first = self.log.first_cycles()
+                if first is not None and t0 is not None:
+                    initial_t = (first - t0) / hz if hz else float(first - t0)
+            ex = Extractor(signals, store, hz, self.config, t0=t0, memory=memory,
+                           initial_t=initial_t)
             for batch in self.log.raw_rows():
                 ex.feed_rows(batch)
             store.gaps = list(self.store.gaps)
@@ -330,7 +377,7 @@ class _Remote:
                     store.trimmed = self.store.trimmed
                     self.store = store
                     self._replies.put(('store', store))
-                elif kind == 'addresses':
+                elif kind in ('addresses', 'failed'):
                     self._replies.put(msg)
                 elif kind == 'progress':
                     if self.on_progress:
@@ -399,6 +446,8 @@ class _Remote:
                     raise ProbeError('the trace worker did not answer') from None
                 if msg[0] == 'closed':
                     raise ProbeError(self.error or 'the trace worker has ended')
+                if msg[0] == 'failed':
+                    raise ProbeError(msg[1])
                 if msg[0] == reply:
                     return msg
 
@@ -452,7 +501,11 @@ class LiveSession:
 
     def start(self) -> None:
         from . import worker
-        applied = self.probe.post_config(self.request)
+        try:
+            applied = self.probe.post_config(self.request)
+        except ProbeError as e:
+            self._error = str(e)
+            raise
         # The stream is connected before the trace starts (see worker.live_main).
         self.pipe = _Remote(worker.live_main,
                             (self.probe.host, self.probe.auth, self.out_path, self.signals,
@@ -462,7 +515,8 @@ class LiveSession:
         msg = self.pipe.wait_control(('ready',), timeout=30)
         if msg[0] != 'ready':
             self.pipe.close(timeout=2)
-            raise ProbeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+            self._error = msg[1] if len(msg) > 1 else 'the trace worker ended'
+            raise ProbeError(self._error)
         started = False
         try:
             reply = self.probe.start()
@@ -473,8 +527,9 @@ class LiveSession:
             self.config.setdefault('slots', applied.get('slots', []))
             if not self.pipe.send(('begin', self.config)):
                 raise ProbeError(self.pipe.error or 'the trace worker ended')
-        except Exception:
+        except Exception as e:
             # Nothing records this trace: do not leave the probe running it.
+            self._error = str(e) or type(e).__name__
             if started:
                 try:
                     self.probe.stop()

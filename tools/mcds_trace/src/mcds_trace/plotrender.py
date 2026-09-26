@@ -48,12 +48,23 @@ def minmax_decimate(t: np.ndarray, v: np.ndarray, x0: float, x1: float,
     bin - each bin's minimum and maximum, in time order."""
     if len(t) == 0:
         return t, v
-    i0 = max(int(np.searchsorted(t, x0, side='left')) - 1, 0)
-    i1 = min(int(np.searchsorted(t, x1, side='right')) + 1, len(t))
-    t, v = t[i0:i1], v[i0:i1]
-    if len(t) <= 2 * bins or bins <= 0:
-        return t, v
-    edges = np.linspace(t[0], t[-1], bins + 1)
+    j0 = int(np.searchsorted(t, x0, side='left'))
+    j1 = int(np.searchsorted(t, x1, side='right'))
+    i0, i1 = max(j0 - 1, 0), min(j1 + 1, len(t))
+    if j1 - j0 <= 2 * bins or bins <= 0:
+        return t[i0:i1], v[i0:i1]
+    # Bins over the view, not over the neighbours outside it (which may lie
+    # far away); those are kept as they are.
+    dt, dv = _decimate(t[j0:j1], v[j0:j1], x0, x1, bins)
+    if i0 < j0 or j1 < i1:
+        dt = np.concatenate((t[i0:j0], dt, t[j1:i1]))
+        dv = np.concatenate((v[i0:j0], dv, v[j1:i1]))
+    return dt, dv
+
+
+def _decimate(t: np.ndarray, v: np.ndarray, x0: float, x1: float,
+              bins: int) -> tuple[np.ndarray, np.ndarray]:
+    edges = np.linspace(x0, x1, bins + 1)
     idx = np.clip(np.searchsorted(t, edges[1:-1], side='left'), 0, len(t))
     starts = np.concatenate(([0], idx))
     ends = np.concatenate((idx, [len(t)]))
@@ -311,11 +322,13 @@ class SubplotRenderer:
             prepared.append((tr, t, v, finite))
             inside = finite & (t >= x0) & (t <= x1)
             vis = v[inside]
-            if len(vis) == 0 and spec.style == 'step':
-                before = finite & (t < x0)
-                vis = v[before][-1:]          # the value held into the view
+            if spec.style == 'step':
+                # The value held into the view is drawn too.
+                vis = np.concatenate((v[finite & (t < x0)][-1:], vis))
             elif len(vis) == 0:
                 vis = v[finite]               # a line crossing the view
+            if spec.ylog:
+                vis = vis[vis > 0]
             if len(vis):
                 ymin = min(ymin, float(np.min(vis)))
                 ymax = max(ymax, float(np.max(vis)))
@@ -328,6 +341,8 @@ class SubplotRenderer:
             ylim = None
         if ylim is not None:
             y0, y1 = ylim
+        elif spec.ylog and value_traces and 0 < ymin <= ymax < math.inf:
+            y0, y1 = (ymin / 1.15, ymax * 1.15) if ymax > ymin else (ymin / 2, ymax * 2)
         elif math.isfinite(ymin) and math.isfinite(ymax):
             if ymax == ymin:
                 pad = max(abs(ymin) * 0.05, 0.5)
