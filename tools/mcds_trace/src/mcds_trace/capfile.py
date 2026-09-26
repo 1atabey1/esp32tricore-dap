@@ -20,6 +20,7 @@ FILE_MAGIC = b'MCDSCAP1'
 REC_MAGIC = 0x50525444          # "DTRP"
 REC_HEADER = struct.Struct('<IIIHHI')
 FLAG_GAP = 1 << 0
+FLAG_FINAL = 1 << 1               # the session's last paragraph (may end early)
 
 
 @dataclass
@@ -33,6 +34,10 @@ class Record:
     @property
     def gap(self) -> bool:
         return bool(self.flags & FLAG_GAP)
+
+    @property
+    def final(self) -> bool:
+        return bool(self.flags & FLAG_FINAL)
 
 
 def write_header(f: BinaryIO, config: dict) -> None:

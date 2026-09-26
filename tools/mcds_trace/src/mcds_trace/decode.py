@@ -21,6 +21,12 @@ from .tram import (CORE_DTU0, CORE_DTU1, CORE_NAMES, CORE_TSU, CORE_WTU,
 DSIZE_BYTES = {0: 1, 1: 2, 2: 4, 3: 4}      # DOUBLE: lower 32 bits only
 ADDR_BITS = 32
 
+# A paragraph whose first absolute time stamp lies this many paragraph
+# intervals past the end of the one before was written a lap later (the
+# reader missed a whole lap); at a real boundary time is continuous.
+LAP_FACTOR = 3
+LAP_MIN_INTERVALS = 4          # paragraph intervals measured before judging
+
 
 @dataclass
 class Event:
@@ -58,6 +64,8 @@ class DecodeStats:
     gaps: int = 0
     backsteps: int = 0       # time went backwards: a paragraph was torn by a lap
     unsynced: int = 0        # compressed messages dropped before a base was known
+    torn: int = 0            # paragraphs dropped as inconsistent (overwritten while read)
+    laps: int = 0            # paragraphs a whole lap newer than the one before
     by_type: dict = field(default_factory=dict)
     malformed: dict = field(default_factory=dict)   # 'core/TTn/bits' -> count
 
@@ -69,6 +77,10 @@ class Decoder:
         self.tick_mode = tick_mode
         self.stats = DecodeStats()
         self.reset()
+        self._prev_first = None    # first absolute TSR of the paragraph before
+        self._interval = 0.0       # running mean of the paragraph interval
+        self._intervals = 0
+        self._first_abs = None     # this paragraph's first absolute TSR
 
     def reset(self) -> None:
         """Forget every compression base (after a gap).  The TSR history is
@@ -100,6 +112,7 @@ class Decoder:
                 self.epoch += 1 << 32
             else:
                 self.stats.backsteps += 1
+                self._suspect = True
         self.tsr = value
         self.base_cycles = self.epoch + value
         self.ticks = 0
@@ -206,11 +219,14 @@ class Decoder:
                 # The XOR chain broke (a TSR was dropped under overload):
                 # time is unknown until the next uncompressed TSR.
                 self.stats.backsteps += 1
+                self._suspect = True
                 self.tsr_ok = False
                 self.base_cycles = -1
                 return
             self._tsr(value)
             self.tsr_ok = True
+            if not comp and self._first_abs is None:
+                self._first_abs = self.base_cycles
         elif m.tt in (2, 3):
             self._count('TSA')
             if comp and not self.tsa_ok:
@@ -222,15 +238,71 @@ class Decoder:
 
     # -- paragraphs -----------------------------------------------------------
 
-    def paragraph(self, par_bytes: bytes, index: int = 0, gap: bool = False) -> Iterator[Event]:
-        """Decode one 1 kB paragraph.  gap=True: data was lost before it."""
+    def paragraph(self, par_bytes: bytes, index: int = 0, gap: bool = False,
+                  final: bool = True) -> Iterator[Event]:
+        """Decode one 1 kB paragraph.  gap=True: data was lost before it.
+
+        A paragraph the writer overwrote while it was read is a mix of new and
+        old messages: time runs backwards inside it, or the message stream
+        breaks off (an invalid length code, unknown units, fields running past
+        the paragraph).  Such a paragraph is dropped as a whole, the decoder
+        state rewound to before it, and a gap reported instead."""
+        if not gap and self._lapped(par_bytes):
+            # Its leading compressed messages refer to a paragraph never read.
+            self.stats.laps += 1
+            gap = True
         if gap:
             self.stats.gaps += 1
             self.reset()
             yield Event(-1, 'gap', paragraph=index)
         self.stats.paragraphs += 1
+        saved = (self.tsr, self.epoch, self.base_cycles, self.ticks, self.tsr_ok)
+        counts = (self.stats.unknown, sum(self.stats.malformed.values()))
+        self._suspect = False
+        self._first_abs = None
+        events = list(self._paragraph_events(par_bytes, index, final))
+        if (self._suspect or self.stats.unknown != counts[0]
+                or sum(self.stats.malformed.values()) != counts[1]):
+            self.stats.torn += 1
+            self.reset()
+            self.tsr, self.epoch, self.base_cycles, self.ticks, self.tsr_ok = saved
+            self.tsr_ok = False
+            self.base_cycles = -1
+            self._prev_first = None
+            yield Event(-1, 'gap', paragraph=index)
+            return
+        first = self._first_abs
+        if first is not None and self._prev_first is not None and not gap                 and first > self._prev_first:
+            n = min(self._intervals, 15)
+            self._interval = (self._interval * n + (first - self._prev_first)) / (n + 1)
+            self._intervals += 1
+        if first is not None:
+            self._prev_first = first
+        yield from events
+
+    def _lapped(self, par_bytes: bytes) -> bool:
+        """True if this paragraph starts a lap after the one decoded before."""
+        if not self.tsr_ok or self.tsr is None or self._intervals < LAP_MIN_INTERVALS:
+            return False
+        for k, m in enumerate(parse_paragraph(par_bytes)):
+            if m.kind == 'msg' and m.core == CORE_TSU and m.tt == 0:
+                jump = ((m.data & 0xFFFFFFFF) - self.tsr) & 0xFFFFFFFF
+                return LAP_FACTOR * self._interval < jump < 1 << 31
+            if k >= 16:
+                break
+        return False
+
+    def _paragraph_events(self, par_bytes: bytes, index: int, final: bool) -> Iterator[Event]:
         self._pending_dta = None
         for m in parse_paragraph(par_bytes):
+            if m.kind == 'damaged':
+                self._suspect = True
+                return
+            if m.kind == 'end' and not final:
+                # Only the last written paragraph ends early: this one was
+                # still being written (the reader fell a lap behind).
+                self._suspect = True
+                return
             if m.kind == 'tick':
                 self.ticks += 1
                 continue
@@ -271,8 +343,11 @@ def decode_records(records: Iterable, tick_mode: bool = False) -> tuple[list[Eve
     dec = Decoder(tick_mode=tick_mode)
     events: list[Event] = []
     prev = None
-    for rec in records:
+    records = list(records)
+    legacy = not any(r.final for r in records)     # files from before the FINAL flag
+    for k, rec in enumerate(records):
         gap = rec.gap or (prev is not None and rec.seq != prev + 1)
         prev = rec.seq
-        events.extend(dec.paragraph(rec.payload, rec.seq, gap=gap))
+        final = rec.final or (legacy and k == len(records) - 1)
+        events.extend(dec.paragraph(rec.payload, rec.seq, gap=gap, final=final))
     return events, dec.stats

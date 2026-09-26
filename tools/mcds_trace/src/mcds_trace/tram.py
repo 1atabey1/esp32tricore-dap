@@ -111,8 +111,14 @@ def parse_paragraph(par: bytes) -> Iterator[RawMessage]:
         elif code in SYMLEN_BITS:
             length = SYMLEN_BITS[code]
         else:
-            return                         # not a valid length: stop here
+            # Not a valid length code.  The writer ends a paragraph with
+            # <endoftrace> or <skip>, so this is damage (e.g. overwritten
+            # while it was read), not the end.
+            yield RawMessage('damaged', at)
+            return
         if length > bits.left():
+            if bits.left() > 32:
+                yield RawMessage('damaged', at)
             return                         # truncated at the paragraph end
         if length < 8:
             bits.take(length)

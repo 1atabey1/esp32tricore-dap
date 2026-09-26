@@ -92,6 +92,9 @@ def cmd_decode(a) -> int:
     print('gaps %d (%d paragraphs lost in the probe), ERR %d (%d messages lost on target), '
           'unknown %d, time backsteps %d' % (st.gaps, lost, st.errors, st.lost_messages,
                                              st.unknown, st.backsteps))
+    if st.torn or st.laps:
+        print('reader fell a lap behind: %d torn paragraphs dropped, %d lapped'
+              % (st.torn, st.laps))
     if st.malformed:
         print('malformed:', ', '.join('%s %d' % kv for kv in sorted(st.malformed.items())))
     hz = config.get('emu_hz') or 0

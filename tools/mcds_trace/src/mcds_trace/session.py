@@ -168,18 +168,19 @@ class _Pipeline:
         self.records = 0
         self.lock = threading.Lock()     # records_in vs reselect
 
-    def records_in(self, recs, forced_gap: bool = False) -> None:
+    def records_in(self, recs, forced_gap: bool = False, last_is_final: bool = False) -> None:
         with self.lock:
-            self._records_in(recs, forced_gap)
+            self._records_in(recs, forced_gap, last_is_final)
 
-    def _records_in(self, recs, forced_gap: bool) -> None:
+    def _records_in(self, recs, forced_gap: bool, last_is_final: bool = False) -> None:
         rows = []
         for rec in recs:
             gap = forced_gap or rec.gap or (self.prev_seq is not None and rec.seq != self.prev_seq + 1)
             forced_gap = False
             self.prev_seq = rec.seq
             self.records += 1
-            for ev in self.decoder.paragraph(rec.payload, rec.seq, gap=gap):
+            final = rec.final or (last_is_final and rec is recs[-1])
+            for ev in self.decoder.paragraph(rec.payload, rec.seq, gap=gap, final=final):
                 self.log.add(ev)
                 rows.append(ev)
         if rows:
@@ -448,11 +449,12 @@ class FileSession:
         self.pipe = _Pipeline(config, signals)
         recs = list(capfile.records(stream))
         n = len(recs)
+        legacy = not any(r.final for r in recs)   # files from before the FINAL flag
         for i in range(0, n, 64):
             batch = recs[i:i + 64]
             for r in batch:
                 self.stats.probe_lost += r.lost
-            self.pipe.records_in(batch)
+            self.pipe.records_in(batch, last_is_final=legacy and i + 64 >= n)
             if progress:
                 progress(min(1.0, (i + 64) / max(1, n)))
         self.stats.records = n
