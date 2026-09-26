@@ -16,7 +16,12 @@ uv run mcds-trace-ui run.mcds                          # open a capture
 uv run mcds-trace-ui --web                             # in the browser instead of a window
 uv run mcds-trace-ui --serve --port 8550 --bind 0.0.0.0   # serve only, open http://HOST:8550
 uv run mcds-trace-ui --host 192.168.178.99 --workspace bench.mcdsws
+uv run flet run                                         # the same through Flet (src/main.py)
+uv run flet run --web -- --elf /abs/path/app.elf        # app arguments after --
 ```
+
+`flet run` starts the app with `.flet/storage/data` as working directory, so
+pass absolute paths.
 
 Pure Python (flet, matplotlib, numpy, Pillow, pyelftools); `uv` resolves
 everything on each platform, nothing is compiled.
