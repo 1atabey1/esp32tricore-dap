@@ -25,7 +25,8 @@ import flet as ft
 import numpy as np
 
 from .. import elfsyms
-from ..plotrender import FrameSpec, SubplotRenderer, Trace, export_png, value_at
+from ..plotrender import (THEMES, FrameInfo, FrameSpec, SubplotRenderer, Trace, export_png,
+                          value_at)
 from ..session import FileSession, LiveSession, Probe, ProbeError
 from ..signals import PALETTE, Signal, hits_signal, leaf_signal, raw_signal
 from .model import Settings, SubplotModel, Workspace
@@ -47,6 +48,16 @@ def fmt_time(t: float) -> str:
     if a >= 1e-6 or a == 0:
         return '%.1f us' % (t * 1e6)
     return '%.1f ns' % (t * 1e9)
+
+
+def quiet() -> None:
+    """In a pointer handler: skip the whole-page update Flet runs after each
+    event (tens of milliseconds, dozens of events a second); the handler
+    updates what it changed, the refresh loop the rest."""
+    try:
+        ft.context.disable_auto_update()
+    except Exception:
+        pass
 
 
 def close_dialog(dlg) -> None:
@@ -169,15 +180,23 @@ class PlotCard:
         # onto exactly the plot box and its size is reported back.
         self.raw = ft.RawImage(fit=ft.BoxFit.FILL, expand=True,
                                on_size_change=self._on_size, size_change_interval=100)
+        # Cursor and marker are lines over the frame, composited by the
+        # client: moving them costs a tiny update, not a new frame.
+        self.cursor_line = ft.Container(width=1, left=0, top=0, height=10, visible=False)
+        self.marker_line = ft.Container(width=1, left=0, top=0, height=10, visible=False)
+        self.shown: FrameInfo | None = None       # axes of the frame on screen
+        self._overlay: dict[int, tuple] = {}       # what each line shows now
+        self.stack = ft.Stack([self.raw, self.marker_line, self.cursor_line],
+                              fit=ft.StackFit.EXPAND, expand=True)
         self.gesture = ft.GestureDetector(
-            content=ft.Row([self.raw], spacing=0,
+            content=ft.Row([self.stack], spacing=0,
                            vertical_alignment=ft.CrossAxisAlignment.STRETCH),
             mouse_cursor=ft.MouseCursor.PRECISE,
             drag_interval=16, hover_interval=30,
             on_scroll=self._on_scroll, on_pan_start=self._on_pan_start,
             on_pan_update=self._on_pan_update, on_pan_end=self._on_pan_end,
             on_hover=self._on_hover, on_exit=self._on_exit,
-            on_tap=self._on_tap, on_secondary_tap=lambda e: app.set_marker(None),
+            on_tap=self._on_tap, on_secondary_tap=lambda e: (quiet(), app.set_marker(None)),
             on_double_tap=lambda e: app.fit_or_follow())
         self.legend = ft.Row(wrap=True, spacing=4, run_spacing=2, expand=True)
         self.empty_hint = ft.Text('Drop signals here, or use "Add to plot" in the Signals tab.',
@@ -304,16 +323,15 @@ class PlotCard:
         last = app.plot_cards and app.plot_cards[-1] is self
         return FrameSpec(int(w), int(h), app.view.x0, app.view.x1, traces, self.model.style,
                          tuple(self.model.ylim) if self.model.ylim else None,
-                         list(store.gaps) if store is not None else [], app.view.cursor,
+                         list(store.gaps) if store is not None else [], None,
                          xlabel=bool(last) or len(app.plot_cards) == 1,
                          theme=app.theme_name(), scale=app.pixel_ratio(), ylog=self.model.ylog,
-                         t_end=store.t_end if store is not None else None,
-                         marker=app.view.marker)
+                         t_end=store.t_end if store is not None else None)
 
     def key(self):
         app = self.app
         store = app.store()
-        return (app.view.version, app.view.cursor, app.view.marker, self.size, self.model.style,
+        return (app.view.version, self.size, self.model.style,
                 tuple(self.model.ylim or ()), self.model.ylog, self.model.normalize,
                 tuple(self.model.signals),
                 app.theme_name(), id(store), store.samples if store else 0,
@@ -336,8 +354,12 @@ class PlotCard:
         try:
             spec = self.spec()
             buf, w, h = await asyncio.to_thread(self.renderer.render, spec)
+            info = self.renderer.info
             await self.raw.render_rgba(w, h, buf)
             self.last_key = k
+            self.shown = info
+            self.app.frames_drawn += 1
+            self.place_overlays()
         except (TimeoutError, RuntimeError):
             pass                          # not attached or not visible yet; next tick
         except Exception:
@@ -345,6 +367,30 @@ class PlotCard:
             self.last_key = k             # do not retry a failing frame every tick
         finally:
             self.rendering = False
+
+    def place_overlays(self) -> None:
+        """Put the cursor and marker lines where their times are in the frame
+        on screen (only lines that change are sent)."""
+        info, app = self.shown, self.app
+        colors = THEMES.get(app.theme_name(), THEMES['light'])
+        for line, x, color in ((self.cursor_line, app.view.cursor, colors['cursor']),
+                               (self.marker_line, app.view.marker, colors['marker'])):
+            vis = info is not None and x is not None and info.x0 <= x <= info.x1
+            state = (vis, round(info.left + (x - info.x0) / (info.x1 - info.x0)
+                                * (info.right - info.left), 1) if vis else None,
+                     info.top if vis else None, info.bottom if vis else None, color)
+            if self._overlay.get(id(line)) == state:
+                continue
+            self._overlay[id(line)] = state
+            line.visible = vis
+            if vis:
+                line.left = state[1] - 0.5
+                line.top, line.height = info.top, max(1.0, info.bottom - info.top)
+                line.bgcolor = color
+            try:
+                line.update()
+            except (RuntimeError, AssertionError):
+                pass                      # not on the page (yet)
 
     # events ------------------------------------------------------------------
 
@@ -360,12 +406,13 @@ class PlotCard:
             self.size = (max(200.0, width), float(self.model.height))
 
     def _x_at(self, px: float) -> float | None:
-        info = self.renderer.info
+        info = self.shown or self.renderer.info
         if info is None:
             return None
         return info.x_of(px)
 
     def _on_scroll(self, e) -> None:
+        quiet()
         p = pos(e)
         dy = getattr(getattr(e, 'scroll_delta', None), 'y', 0.0) or 0.0
         if p is None or not dy:
@@ -380,8 +427,9 @@ class PlotCard:
         self.drag_x = p[0] if p else None
 
     def _on_pan_update(self, e) -> None:
+        quiet()
         p = pos(e)
-        info = self.renderer.info
+        info = self.shown or self.renderer.info
         if p is None or self.drag_x is None or info is None:
             return
         dx = p[0] - self.drag_x
@@ -395,18 +443,21 @@ class PlotCard:
         self.drag_x = None
 
     def _on_hover(self, e) -> None:
+        quiet()
         p = pos(e)
-        info = self.renderer.info
+        info = self.shown
         if p is None or info is None:
             return
         self.app.set_cursor(info.x_of(p[0]) if info.left <= p[0] <= info.right else None)
 
     def _on_exit(self, e) -> None:
+        quiet()
         self.app.set_cursor(None)
 
     def _on_tap(self, e) -> None:
+        quiet()
         p = pos(e)
-        info = self.renderer.info
+        info = self.shown
         if p is not None and info is not None and info.left <= p[0] <= info.right:
             self.app.set_marker(info.x_of(p[0]))
 
@@ -557,6 +608,7 @@ class App:
         self._pending: LiveSession | None = None    # a session still starting
         self._leaf_counts: dict[tuple, int] = {}      # tree rows: numeric members inside
         self.connected = True                        # a web client can be away for a while
+        self.frames_drawn = 0                        # plot frames shown (perf log)
         self._tasks: set[asyncio.Task] = set()
 
     # -- small helpers ---------------------------------------------------------
@@ -1745,13 +1797,22 @@ class App:
         if x == self.view.cursor:
             return
         self.view.cursor = x
-        self._cursor_readout()
+        self._pointer_moved()
 
     def set_marker(self, x: float | None) -> None:
         """Click a plot: a reference line; the readout then shows the delta to it.
         Right-click removes it."""
         self.view.marker = x
+        self._pointer_moved()
+
+    def _pointer_moved(self) -> None:
+        for c in self.plot_cards:
+            c.place_overlays()
         self._cursor_readout()
+        try:
+            self.cursor_text.update()
+        except (RuntimeError, AssertionError):
+            pass
 
     def _cursor_readout(self) -> None:
         x, m = self.view.cursor, self.view.marker
@@ -2059,9 +2120,11 @@ class App:
             if perf is not None:
                 perf.append(dt)
                 if t_start - perf_t >= 5.0:
-                    print('tick: %.1f frames/s, %.1f ms mean, %.1f ms max (%s)' % (
-                        len(perf) / (t_start - perf_t), 1e3 * sum(perf) / len(perf),
-                        1e3 * max(perf), self.mode), file=sys.stderr, flush=True)
+                    print('tick: %.1f frames/s, %.1f ms mean, %.1f ms max (%s), plot frames %.1f/s'
+                          % (len(perf) / (t_start - perf_t), 1e3 * sum(perf) / len(perf),
+                             1e3 * max(perf), self.mode,
+                             self.frames_drawn / (t_start - perf_t)), file=sys.stderr, flush=True)
+                    self.frames_drawn = 0
                     if phases:
                         print('  phases ms: pre %.1f  plots %.1f  legend+stats %.1f  update %.1f'
                               % tuple(1e3 * sum(p[i] for p in phases) / len(phases)
