@@ -140,7 +140,7 @@ esp_err_t dap_probe_read32_fast(uint32_t addr, uint32_t *value);
  * optionally wide, `chain` blocks per chained batch) and describe where the
  * time went in `out`. */
 esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
-                         int chain, int trail, char *out, size_t outlen);
+                         int chain, int trail, int vreps, char *out, size_t outlen);
 
 /*
  * Sweep bit rate, idle clocks before the first frame, TRST pulse and sync LEN,

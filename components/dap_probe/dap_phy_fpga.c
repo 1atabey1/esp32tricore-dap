@@ -810,6 +810,16 @@ static esp_err_t dap_phy_fpga_blockread_chain_locked(const dap_fpga_block_t *blo
         const uint8_t status = low[REG_STATUS];
         const bool    queued = (low[REG_LEVEL + 1] & LEVEL_HI_QUEUED) != 0;
         size_t avail = (size_t)low[REG_LEVEL] | ((size_t)(low[REG_LEVEL + 1] & 0x0F) << 8);
+        /*
+         * The two LEVEL bytes are sampled a byte time apart while the block
+         * fills the FIFO: a carry out of the low byte in between reads 256 too
+         * many, and the surplus would come back as zeros (an empty FIFO does
+         * not pop), shifting every later byte of the chain.  Near a wrap, take
+         * the lower reading; draining less is harmless.
+         */
+        if (low[REG_LEVEL] >= 0xF0 && avail >= 0x100) {
+            avail -= 0x100;
+        }
 
         /* The last start has been taken, so its frame registers are free. */
         if (next < n && !queued && !(status & (ST_TIMED_OUT | ST_OVERRUN))) {

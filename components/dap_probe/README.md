@@ -131,6 +131,10 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   bit 4) and taken on idle, so blocks run back to back while the host drains. With the reply FIFO
   full the fabric pauses between parcels (DAP0 stopped, DAP1 released) instead of overrunning;
   CTRL bit 2 aborts such a block.
+- LEVEL's two bytes are sampled a byte time apart while a block fills the FIFO, so a carry out of
+  the low byte in between reads 256 too high. The drain takes the lower reading near a wrap: an
+  over-read returns zeros (an empty FIFO does not pop) and shifts every later byte of the chain,
+  which showed up as trace paragraphs starting with ~150-235 zero bytes.
 - Wide mode calibrates its capture taps at the session's clock against a pattern written narrow
   into the trace RAM; taps chosen at one divider are wrong at another (24 MHz returned corrupt
   data with div-5 taps). Block writes are refused in wide mode (parcels arrive corrupted).

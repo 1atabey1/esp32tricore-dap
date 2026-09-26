@@ -691,7 +691,7 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
 
     char query[128] = "", val[16];
     uint32_t addr = 0x70000000u;
-    int n = 64, words = 256, div = 0, wide = 0, chain = 1, trail = 1;
+    int n = 64, words = 256, div = 0, wide = 0, chain = 1, trail = 1, vreps = 8;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "addr", val, sizeof(val)) == ESP_OK) addr = strtoul(val, NULL, 0);
         if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) n = atoi(val);
@@ -700,11 +700,12 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "wide", val, sizeof(val)) == ESP_OK) wide = atoi(val);
         if (httpd_query_key_value(query, "chain", val, sizeof(val)) == ESP_OK) chain = atoi(val);
         if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) trail = atoi(val);
+        if (httpd_query_key_value(query, "vrep", val, sizeof(val)) == ESP_OK) vreps = atoi(val);
     }
     char out[640];
     dap_capture_begin();
     const esp_err_t err = dap_fpga_bench(addr, n, (size_t)words, (uint8_t)div, wide != 0,
-                                         chain, trail, out, sizeof(out));
+                                         chain, trail, vreps, out, sizeof(out));
     ESP_LOGW(TAG, "%s", out);
     dap_capture_end(req, err == ESP_OK ? "\n=== bench done ===\n" : "\n=== bench had errors ===\n");
     return ESP_OK;

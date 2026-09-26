@@ -136,7 +136,7 @@ void dap_fpga_block_read_sweep(const char *label)
 }
 
 esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
-                         int chain, int trail, char *out, size_t outlen)
+                         int chain, int trail, int vreps, char *out, size_t outlen)
 {
     dap_fpga_stats_t st;
     dap_block_req_t  reqs[16];
@@ -197,14 +197,25 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
             vreq[i].count = 256;
         }
         uint32_t *vbuf = malloc(256 * sizeof(uint32_t) * (size_t)chain);
-        for (int rep = 0; vbuf != NULL && rep < 8; rep++) {
+        for (int rep = 0; vbuf != NULL && rep < vreps; rep++) {
             if (dap_probe_blockread_many(vreq, (size_t)chain, vbuf) != ESP_OK) {
                 mismatch += chain;
                 dap_probe_clear_error_state();
                 continue;
             }
             for (int i = 0; i < chain; i++) {
-                mismatch += memcmp(vbuf + 256 * i, ref, sizeof(ref)) != 0;
+                if (memcmp(vbuf + 256 * i, ref, sizeof(ref)) == 0) {
+                    continue;
+                }
+                mismatch++;
+                for (int k = 0; k < 256 && mismatch <= 4; k++) {
+                    if (vbuf[256 * i + k] != ref[k]) {
+                        ESP_LOGW(TAG, "verify: rep %d block %d word %d: 0x%08" PRIX32
+                                 " read 0x%08" PRIX32 " (xor 0x%08" PRIX32 ")", rep, i, k,
+                                 ref[k], vbuf[256 * i + k], ref[k] ^ vbuf[256 * i + k]);
+                        break;
+                    }
+                }
             }
         }
         free(vbuf);
@@ -309,7 +320,7 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
              ok, n, (unsigned)words, chain, kbps, (double)us / n,
              (double)st.xfers / n, (double)st.xfer_bytes / n, (double)st.xfer_us / n,
              us ? 100.0 * st.xfer_us / (double)us : 0.0, (double)st.polls / n,
-             mismatch, 8 * chain, bw_bad,
+             mismatch, vreps * chain, bw_bad,
              (long long)read_us, (long long)fast_us, wr_bad,
              sck_khz, ns_short / 1000.0, ns_long / 1000.0,
              ns_long ? 1024.0 * 1e6 / 1024.0 / ns_long * 1000.0 : 0.0);
