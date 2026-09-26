@@ -224,6 +224,10 @@ module tb_dap_top;
 
     reg [7:0] b0, b1, b2, b3;
     integer   p;
+    reg       stall_seen;
+    reg [31:0] fc_words [0:19];
+    integer   fc_bad, fc_got, fc_n, fc_i;
+    reg [7:0] c0, c1, c2, c3;          /* the drain thread's own bytes */
 
     initial begin
         $dumpfile("tb_dap_top.vcd");
@@ -373,6 +377,120 @@ module tb_dap_top;
         check("fifo now empty", scratch[5], 1'b1);
 
         /*
+         * ---- two chained block reads ----
+         *
+         * The second start is written while the first block runs; the fabric
+         * holds it and starts the next block as soon as the first is done.
+         */
+        $display("chained block reads: second start queued while busy");
+        wr(7'h01, 8'h08);      /* CTRL: clear the fifo */
+        wr(7'h0A, 8'd1);       /* PARCELS = 2 - 1 */
+
+        fork
+            begin
+                wr(7'h01, 8'h02);                  /* start block 1 */
+                wait (dut.q == 4'd3);              /* receiving its parcels */
+                wr(7'h01, 8'h02);                  /* queue block 2 */
+                rd(7'h0E, scratch);
+                check("start queued", scratch[4], 1'b1);
+            end
+            begin
+                for (p = 0; p < 4; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_parcel(32'hA0B0C000 + p, (p == 1) || (p == 3));
+                    target_drive = 1'b0;
+                    @(posedge clk);
+                    /* Between the blocks the master sends the next frame. */
+                    if (p == 1) wait (dut.u_rx.dat_oe == 1'b1);
+                end
+            end
+        join
+
+        scratch = 8'h01;
+        while (scratch[0]) rd(7'h00, scratch);  /* busy until both are done */
+        check("chain done", scratch[1], 1'b1);
+        check("chain not timed out", scratch[2], 1'b0);
+        rd(7'h0D, b0);
+        check("chain left 16 bytes", {24'd0, b0}, 32'd16);
+        rd(7'h0E, scratch);
+        check("nothing left queued", scratch[4], 1'b0);
+
+        ss = 1'b0; #HALF;
+        spi_byte(8'h40, scratch);
+        spi_byte(8'h00, scratch);              /* the dummy */
+        for (p = 0; p < 4; p = p + 1) begin
+            spi_byte(8'h00, b0);
+            spi_byte(8'h00, b1);
+            spi_byte(8'h00, b2);
+            spi_byte(8'h00, b3);
+            check("chained parcel", {b3, b2, b1, b0}, 32'hA0B0C000 + p);
+        end
+        #HALF; ss = 1'b1; #(HALF*4);
+
+        /*
+         * ---- flow control ----
+         *
+         * 20 parcels into a 64-byte FIFO with nobody draining: the block must
+         * stall between parcels (DAP0 quiet, DAP1 released) and finish intact
+         * once the host drains.
+         */
+        $display("flow control: a block larger than the FIFO");
+        wr(7'h01, 8'h08);      /* CTRL: clear the fifo */
+        wr(7'h0A, 8'd19);      /* PARCELS = 20 - 1 */
+        stall_seen = 1'b0;
+
+        fork
+            wr(7'h01, 8'h02);
+            begin
+                for (p = 0; p < 20; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_parcel(32'hC0DE0000 + p, (p == 19));
+                    /* The device keeps the line through the gap. */
+                    @(posedge clk);
+                end
+                target_drive = 1'b0;
+            end
+            begin
+                /* Let it fill and stall before draining anything. */
+                wait (dut.q == 4'd4 && !dut.fifo_room);
+                repeat (200) @(posedge clk);
+                stall_seen = (dut.q == 4'd4) && !dut.dap0;
+                check("stall releases DAP1", {31'd0, dut.drive}, 32'd0);
+                /* Drain as the host does: only what LEVEL reports. */
+                fc_got = 0;
+                while (fc_got < 20) begin
+                    rd(7'h0D, c0);
+                    fc_n = c0 / 4;
+                    if (fc_n > 0) begin
+                        ss = 1'b0; #HALF;
+                        spi_byte(8'h40, scratch);
+                        spi_byte(8'h00, scratch);
+                        for (fc_i = 0; fc_i < fc_n; fc_i = fc_i + 1) begin
+                            spi_byte(8'h00, c0);
+                            spi_byte(8'h00, c1);
+                            spi_byte(8'h00, c2);
+                            spi_byte(8'h00, c3);
+                            fc_words[fc_got + fc_i] = {c3, c2, c1, c0};
+                        end
+                        #HALF; ss = 1'b1; #(HALF*4);
+                        fc_got = fc_got + fc_n;
+                    end
+                end
+            end
+        join
+
+        scratch = 8'h01;
+        while (scratch[0]) rd(7'h00, scratch);
+        check("flow-controlled block stalled", {31'd0, stall_seen}, 32'd1);
+        check("flow-controlled block not timed out", scratch[2], 1'b0);
+        check("flow-controlled block no overrun", scratch[7], 1'b0);
+        fc_bad = 0;
+        for (p = 0; p < 20; p = p + 1) if (fc_words[p] !== 32'hC0DE0000 + p) fc_bad = fc_bad + 1;
+        check("flow-controlled words intact", fc_bad, 32'd0);
+
+        /*
          * ---- the fastest divider ----
          *
          * DIV 0: one-clock half period, one bit every two fabric clocks, with
@@ -496,6 +614,9 @@ module tb_dap_top;
 
     initial begin
         #20000000;
+        $display("  at timeout: q %0d, fifo %0d, room %0d, parcels_left %0d, rx state %0d, oe %0d",
+                 dut.q, dut.fifo_count, dut.fifo_room, dut.parcels_left, dut.u_rx.state,
+                 dut.u_rx.dat_oe);
         $display("FAILED (timeout)");
         $finish;
     end

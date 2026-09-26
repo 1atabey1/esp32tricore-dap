@@ -1,158 +1,192 @@
 /*
  * DAP wide mode (DAPISC.MODE = 01B): DAP1 carries a frame's even bits, DAP2
- * (the target's P21.7) the odd ones.  Brings the link up wide, proves it with
- * real bus reads, measures block-read throughput, and returns to narrow -
- * everything else in the firmware runs narrow.
+ * (the target's P21.7) the odd ones.  dap_wide_enter/exit run it as a session;
+ * dap_wide_check measures it for /api/dap_fpga?wide=1.
  */
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "dap_fpga_priv.h"
 #include "dap_frame.h"
+#include "dap_lock.h"
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
+#include "dap_wide.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "tricore.h"
 
-static const char *TAG = "DAP_FPGA_RT";
+static const char *TAG = "DAP_WIDE";
 
-#define HALT_LINE   1               /* line 0 does not halt */
-#define MCDS_ID     0xFB718008u
-#define MCDS_ID_VAL 0x00D6C007u
+/* Calibration reference: a pattern written narrow into the second half of the
+ * trace RAM (a trace session rewrites all of it), read back wide. */
+#define REF_ADDR    0xB8001000u
+#define REF_WORDS   64u
 
-static uint8_t  s_halted;           /* cores this file halted */
-static uint32_t s_iocr4_saved;
-static bool     s_iocr4_dirty;
+static bool s_active;
 
-/* -- P21.7 ------------------------------------------------------------------ */
-
-/* The application owns P21.7 and would reconfigure it behind us; halt it. */
-static void halt_application(void)
+bool dap_wide_active(void)
 {
-    s_halted = 0;
-    for (int core = 0; core < TRICORE_MAX_CORES; core++) {
-        if (tricore_core_present(core) && tricore_core_started(core) &&
-            !tricore_is_halted(core) &&
-            tricore_halt(core, HALT_LINE, 200) == ESP_OK) {
-            s_halted |= (uint8_t)(1u << core);
-        }
-    }
+    return s_active;
 }
 
-static void resume_application(void)
+/* P21.7 must be an input (IOCR bit 4 clear): an output fights DAP2 through
+ * the 22 ohm series resistor. */
+static bool p21_7_is_input(void)
 {
-    for (int core = 0; core < TRICORE_MAX_CORES; core++) {
-        if (s_halted & (1u << core)) {
-            tricore_resume(core, 200);
-        }
-    }
-    s_halted = 0;
-}
+    uint32_t iocr4 = 0;
 
-/*
- * Make P21.7 an input (with pull-up) so the interface can drive it.  A
- * push-pull output there fights DAP2 through a 22 ohm resistor.  Returns
- * whether it is safe to drive DAP2.
- */
-static bool release_p21_7(void)
-{
-    const uint32_t mask = 0x1Fu << IOCR4_SHIFT(DAP2_PIN);
-    uint32_t now = 0;
-
-    if (dap_probe_read32(P21_IOCR4, &s_iocr4_saved) != ESP_OK) {
+    if (dap_probe_read32(P21_IOCR4, &iocr4) != ESP_OK) {
+        ESP_LOGE(TAG, "P21_IOCR4 unreadable");
         return false;
     }
-    if (!((s_iocr4_saved >> IOCR4_SHIFT(DAP2_PIN)) & IOCR_PP_OUT)) {
-        return true;                            /* already an input */
-    }
-    const uint32_t as_in = (s_iocr4_saved & ~mask) |
-                           (IOCR_IN_PULLUP << IOCR4_SHIFT(DAP2_PIN));
-    if (dap_probe_write32(P21_IOCR4, as_in) != ESP_OK ||
-        dap_probe_read32(P21_IOCR4, &now) != ESP_OK ||
-        ((now >> IOCR4_SHIFT(DAP2_PIN)) & IOCR_PP_OUT)) {
+    const uint32_t pc = (iocr4 >> IOCR4_SHIFT(DAP2_PIN)) & 0x1Fu;
+    if (pc & IOCR_PP_OUT) {
+        ESP_LOGE(TAG, "P21.7 is an output (PC 0x%02" PRIX32 "); wide mode refused", pc);
         return false;
     }
-    s_iocr4_dirty = true;
-    ESP_LOGW(TAG, "  P21.7 made an input for DAP2 (IOCR4 0x%08" PRIX32 ")", now);
+    ESP_LOGI(TAG, "P21.7 is an input (PC 0x%02" PRIX32 ")", pc);
     return true;
 }
 
-/* Narrow again, the application running, P21.7 as the application had it. */
-static void revert(void)
+/* Reference data written narrow before the switch, compared wide. */
+static uint32_t s_ref_block[REF_WORDS];
+
+/* Every bit position toggling, both lines busy: an xorshift sequence. */
+static esp_err_t write_reference(void)
 {
-    dap_dapisc_narrow();
-    resume_application();
-    if (s_iocr4_dirty) {
-        s_iocr4_dirty = false;
-        dap_probe_write32(P21_IOCR4, s_iocr4_saved);
-        dap_probe_clear_error_state();
+    uint32_t x = 0x9E3779B9u;
+    static uint32_t back[REF_WORDS];
+
+    for (size_t i = 0; i < REF_WORDS; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        s_ref_block[i] = x;
     }
-    dap_phy_fpga_set_div(1);
+    /* Word writes: a block write drops its first parcel (see the flash loader). */
+    for (size_t i = 0; i < REF_WORDS; i++) {
+        if (dap_probe_write32(REF_ADDR + 4u * i, s_ref_block[i]) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    if (dap_probe_blockread(REF_ADDR, back, REF_WORDS) != ESP_OK ||
+        memcmp(back, s_ref_block, sizeof(back)) != 0) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
-/* -- capture taps ----------------------------------------------------------- */
+/* Does this tap pair carry real traffic: a word read with its CRC and a block
+ * read, both matching what narrow mode read? */
+static bool taps_carry_data(void)
+{
+    static uint32_t blk[REF_WORDS];
+    uint32_t w = 0;
+
+    const bool ok = dap_probe_set_rw_mode(true) == ESP_OK &&
+                    dap_probe_read32(REF_ADDR + 4u, &w) == ESP_OK && w == s_ref_block[1] &&
+                    dap_probe_blockread(REF_ADDR, blk, REF_WORDS) == ESP_OK &&
+                    memcmp(blk, s_ref_block, sizeof(blk)) == 0;
+    if (!ok) {
+        dap_probe_clear_error_state();
+    }
+    return ok;
+}
 
 /*
- * Find a pair of capture taps (where each line is sampled) that reads a wide
- * sync correctly.  The reply is the 0xAAAAAAAA training pattern on each line,
- * so it reassembles to WIDE_SYNC_EXPECT; its CRC cannot validate and is not
- * part of the test.
+ * Pick the capture taps at the session's clock (at the fast dividers each tap
+ * is a large part of a bit).  First the wide sync (0xAAAAAAAA on each line,
+ * reassembled WIDE_SYNC_EXPECT; its CRC cannot validate) over every pair; it is
+ * periodic, so a pair one sample off can pass it too.  Then real reads over
+ * the passing pairs, most passing neighbours first, until one returns the
+ * reference data.
  */
 static bool calibrate(uint8_t *tap1, uint8_t *tap2)
 {
-    bool found = false;
+    bool ok[4][4] = { { false } };
+    int  score[4][4] = { { 0 } };
+    int  found = 0;
 
-    ESP_LOGW(TAG, "  capture taps (D = sync reads 0x%08X):", WIDE_SYNC_EXPECT);
     for (uint8_t t1 = 0; t1 < 4; t1++) {
-        char line[48];
-        int n = snprintf(line, sizeof(line), "    DAP1 tap %u:", t1);
-
+        char line[40];
+        int n = snprintf(line, sizeof(line), "  sync taps DAP1 %u:", t1);
         for (uint8_t t2 = 0; t2 < 4; t2++) {
             dap_exchange_t x = {0};
-
             dap_phy_fpga_set_skew(t1, t2);
-            vTaskDelay(pdMS_TO_TICKS(5));
             (void)dap_probe_sync(&x);
-            const bool ok = (x.reply == WIDE_SYNC_EXPECT);
-            n += snprintf(line + n, sizeof(line) - (size_t)n, " %c", ok ? 'D' : '.');
-            if (ok && !found) {
-                found = true;
-                *tap1 = t1;
-                *tap2 = t2;
+            ok[t1][t2] = (x.reply == WIDE_SYNC_EXPECT);
+            found += ok[t1][t2];
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %c", ok[t1][t2] ? 'D' : '.');
+        }
+        ESP_LOGI(TAG, "%s", line);
+    }
+    if (!found) {
+        return false;
+    }
+    for (int t1 = 0; t1 < 4; t1++) {
+        for (int t2 = 0; t2 < 4; t2++) {
+            for (int d1 = -1; d1 <= 1 && ok[t1][t2]; d1++) {
+                for (int d2 = -1; d2 <= 1; d2++) {
+                    const int a = t1 + d1, b = t2 + d2;
+                    score[t1][t2] += (a >= 0 && a < 4 && b >= 0 && b < 4 && ok[a][b]);
+                }
             }
         }
-        ESP_LOGW(TAG, "%s", line);
     }
-    return found;
+
+    /* Failing reads are expected while searching; keep them out of the log. */
+    const esp_log_level_t was = esp_log_level_get("DAP");
+    esp_log_level_set("DAP", ESP_LOG_ERROR);
+    bool done = false;
+    for (int want = 9; want >= 1 && !done; want--) {
+        for (int t1 = 0; t1 < 4 && !done; t1++) {
+            for (int t2 = 0; t2 < 4 && !done; t2++) {
+                if (score[t1][t2] != want) {
+                    continue;
+                }
+                dap_phy_fpga_set_skew((uint8_t)t1, (uint8_t)t2);
+                if (taps_carry_data()) {
+                    *tap1 = (uint8_t)t1;
+                    *tap2 = (uint8_t)t2;
+                    done = true;
+                } else {
+                    ESP_LOGI(TAG, "  taps DAP1 %d DAP2 %d pass sync but not data", t1, t2);
+                }
+            }
+        }
+    }
+    esp_log_level_set("DAP", was);
+    return done;
 }
 
-/* -- bring-up --------------------------------------------------------------- */
-
-esp_err_t dap_wide_check(void)
+static esp_err_t enter_locked(uint8_t div)
 {
     uint16_t now = 0;
     uint8_t tap1 = 0, tap2 = 0;
 
-    ESP_LOGW(TAG, "--- DAP wide mode ---");
-
-    /* Baseline in narrow, past the dapisc telegrams the device swallows. */
-    dap_dapisc_prime();
-    const uint16_t narrowv = DAPISC_VALUE | (DAPISC_MODE_NARROW << DAPISC_MODE_SHIFT);
-    if (!dap_dapisc_write_read(16, narrowv, 16, &now)) {
-        ESP_LOGE(TAG, "  DAPISC does not read back narrow");
-        return ESP_FAIL;
+    if (s_active) {
+        dap_wide_exit();                 /* re-enter to calibrate at this clock */
     }
+    if (!dap_phy_fpga_in_use()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    dap_phy_fpga_set_div(div);
     dap_probe_clear_error_state();
-
-    halt_application();
-    if (!release_p21_7()) {
-        ESP_LOGE(TAG, "  P21.7 is still driven by the target; DAP2 unusable");
-        revert();
+    if (!p21_7_is_input()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* What calibration must read back once wide; the trace RAM needs OCDS. */
+    if (dap_probe_enable_ocds() != ESP_OK || write_reference() != ESP_OK) {
+        ESP_LOGE(TAG, "the calibration pattern did not read back narrow at div %u",
+                 (unsigned)div);
         return ESP_FAIL;
     }
+
+    /* Past the dapisc telegrams the device swallows after an attach. */
+    dap_dapisc_prime();
 
     /* The mode change goes out narrow; its reply already comes back wide. */
     const uint16_t widev = DAPISC_VALUE | (DAPISC_MODE_WIDE << DAPISC_MODE_SHIFT);
@@ -163,39 +197,52 @@ esp_err_t dap_wide_check(void)
                           ((now >> DAPISC_MODE_SHIFT) & 3u) == DAPISC_MODE_WIDE;
     dap_dapisc_rx_wide = false;
     dap_phy_fpga_set_rx_wide(false);
-    ESP_LOGW(TAG, "  handshake: DAPISC 0x%04X, MODE %u", (unsigned)now,
-             (unsigned)((now >> DAPISC_MODE_SHIFT) & 3u));
     if (!switched || dap_phy_fpga_set_wide(true) != ESP_OK) {
-        ESP_LOGE(TAG, "  the device did not switch to wide mode");
-        revert();
+        ESP_LOGE(TAG, "the device did not switch to wide mode (DAPISC 0x%04X)", now);
+        dap_dapisc_narrow();
         return ESP_FAIL;
     }
-
     if (!calibrate(&tap1, &tap2)) {
-        ESP_LOGE(TAG, "  no capture tap pair reads the wide sync");
-        revert();
+        ESP_LOGE(TAG, "no capture tap pair carries data at div %u", (unsigned)div);
+        dap_dapisc_narrow();
+        dap_phy_fpga_set_skew(0, 0);
         return ESP_FAIL;
     }
     dap_phy_fpga_set_skew(tap1, tap2);
-    ESP_LOGW(TAG, "  taps DAP1 %u, DAP2 %u", tap1, tap2);
+    s_active = true;
+    ESP_LOGI(TAG, "wide mode on at div %u, taps DAP1 %u DAP2 %u", (unsigned)div, tap1, tap2);
+    return ESP_OK;
+}
 
-    /* Real transactions: DAPISC over both lines, a bus read, a block read.
-     * The client selected in narrow mode carries over; client_set, with its
-     * odd 3-bit payload, does not answer wide and is not needed. */
-    uint32_t mcds = 0;
-    const bool reg = dap_dapisc_write_read(16, widev, 16, &now);
-    dap_probe_set_rw_mode(true);
-    const bool bus = dap_probe_read32(MCDS_ID, &mcds) == ESP_OK && mcds == MCDS_ID_VAL;
-    ESP_LOGW(TAG, "  wide: DAPISC %s 0x%04X, miniMCDS ID 0x%08" PRIX32 " %s",
-             reg ? "reads" : "does not read", (unsigned)now, mcds,
-             bus ? "(correct)" : "(WRONG)");
-    if (!bus) {
-        revert();
-        return ESP_FAIL;
+esp_err_t dap_wide_enter(uint8_t div)
+{
+    dap_lock();
+    const esp_err_t err = enter_locked(div);
+    dap_unlock();
+    return err;
+}
+
+void dap_wide_exit(void)
+{
+    dap_lock();
+    if (s_active) {
+        dap_dapisc_narrow();
+        dap_phy_fpga_set_skew(0, 0);
+        s_active = false;
+        ESP_LOGI(TAG, "back to narrow mode");
     }
+    dap_unlock();
+}
 
+esp_err_t dap_wide_check(void)
+{
+    ESP_LOGW(TAG, "--- DAP wide mode ---");
+    const esp_err_t err = dap_wide_enter(5);
+    if (err != ESP_OK) {
+        return err;
+    }
     dap_fpga_block_read_sweep("wide");
-    revert();
-    ESP_LOGW(TAG, "  back to narrow mode");
+    dap_wide_exit();
+    dap_phy_fpga_set_div(1);
     return ESP_OK;
 }

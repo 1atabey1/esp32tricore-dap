@@ -7,8 +7,9 @@
  * Register map.  Byte wide, multi-byte fields little-endian.
  *
  *   0x00 STATUS   ro  0 busy, 1 done, 2 timed_out, 3 idle_high, 4 crc_ok,
- *                     5 fifo_empty, 6 fifo_full, 7 overrun
- *   0x01 CTRL     wo  0 start frame, 1 start block read, 2 abort,
+ *                     5 fifo_empty, 6 fifo_full, 7 overrun (aborted on a full FIFO)
+ *   0x01 CTRL     wo  0 start frame, 1 start block read (queued if busy),
+ *                     2 abort a block stalled on its FIFO (and drop a queued start),
  *                     3 clear reply fifo, 4 start block write,
  *                     5 clear write fifo
  *   0x02 DIV      rw  bit period = 2*(DIV+1) fabric clocks
@@ -24,7 +25,8 @@
  *                     3 raw frame (DATA is the whole frame, DBITS its length),
  *                     5 receive wide without driving DAP2
  *   0x0C LEAD     rw  idle clocks before each frame
- *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
+ *   0x0D LEVEL    ro  12-bit bytes waiting in the FIFO, low byte first;
+ *                     0x0E bit 4: a block start is queued (chaining)
  *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
  *   0x10 DATA     rw  64-bit frame payload, low byte first
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
@@ -135,6 +137,8 @@ module dap_top #(
     /* Registered flags, updated alongside the counter. */
     reg        fifo_empty = 1'b1;
     reg        fifo_full  = 1'b0;
+    /* Space for a whole parcel with a cycle of slack (the sequencer's gate). */
+    reg        fifo_room  = 1'b1;
 
     reg        fifo_push;
     reg [7:0]  fifo_din;
@@ -225,6 +229,7 @@ module dap_top #(
     end
 
     always @(posedge clk) begin
+        fifo_room <= (fifo_count < FIFO_DEPTH - 8);
         if (rst || fifo_clear) begin
             fifo_wr    <= 12'd0;
             fifo_rd    <= 12'd0;
@@ -276,7 +281,13 @@ module dap_top #(
 
     /* dap1 is driven while either engine claims it; only one is ever busy. */
     wire dap1_in;
-    wire drive    = tx_busy ? tx_oe : rx_oe;
+    /*
+     * Between the parcels of a block the device keeps driving DAP1, and with
+     * flow control that gap can last; the receiver's idle "take the line
+     * back" must not fight it there.
+     */
+    wire block_gap = is_block && (q == Q_PARCEL || q == Q_STORE);
+    wire drive    = tx_busy ? tx_oe : (rx_oe && !block_gap);
     wire dap1_out = tx_dap1;
 
     assign dap1 = drive ? dap1_out : 1'bz;
@@ -319,13 +330,17 @@ module dap_top #(
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
     );
 
+    /* Registered: the OR otherwise lands on the receiver's start path. */
+    reg rx_wide_any = 1'b0;
+    always @(posedge clk) rx_wide_any <= r_wide | r_rx_wide;
+
     dap_frame_rx #(.DIV_WIDTH(8)) u_rx (
         .clk (clk), .rst (rst), .div (r_div),
         .start (rx_start), .reply_bits (rx_bits),
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
-        .wide (r_wide | r_rx_wide),
+        .wide (rx_wide_any),
         .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
@@ -349,7 +364,8 @@ module dap_top #(
                      Q_WFETCH  = 4'd7,
                      Q_WPARCEL = 4'd8;
 
-    reg [3:0] q;
+    /* One-hot: the state decode sits on the sequencer's critical paths. */
+    (* fsm_encoding = "one-hot" *) reg [3:0] q;
     reg       is_block;
     reg       is_bwrite;
     reg [8:0] parcels_left;
@@ -362,14 +378,28 @@ module dap_top #(
     /* Registered "last parcel" flag, updated alongside the counter. */
     reg        wlast;
 
-    reg start_frame_req, start_block_req, start_bwrite_req;
+    reg start_frame_req, start_bwrite_req;
+    /* CTRL bit 2: leave a block stalled on a full reply or empty write FIFO. */
+    reg abort_req = 1'b0;
+
+    /*
+     * A block-read start written while the sequencer is busy is held and
+     * taken the moment it goes idle, so the host can queue the next block
+     * (frame registers loaded after this one began) and blocks run back to
+     * back with the FIFO drained continuously.  A failed block drops it.
+     */
+    reg  r_block_pend = 1'b0;
+    /* The host never mixes a queued block with another start. */
+    wire block_take   = (q == Q_IDLE) && r_block_pend;
+    wire block_cancel = (q == Q_DONE) && (s_timed_out || s_overrun);
 
     always @(posedge clk) begin
         tx_start    <= 1'b0;
         rx_start    <= 1'b0;
         fifo_push   <= 1'b0;
         wfetch_wait <= 1'b0;
-        s_busy      <= (q != Q_IDLE);
+        /* Busy through the idle cycle between chained blocks. */
+        s_busy      <= (q != Q_IDLE) || r_block_pend;
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -379,14 +409,15 @@ module dap_top #(
         end else begin
             case (q)
                 Q_IDLE: begin
-                    if (start_frame_req || start_block_req || start_bwrite_req) begin
-                        is_block      <= start_block_req;
+                    if (start_frame_req || r_block_pend || start_bwrite_req) begin
+                        is_block      <= r_block_pend;
                         is_bwrite     <= start_bwrite_req;
                         parcels_left  <= {1'b0, r_parcels} + 9'd1;
                         /* At least one parcel always follows the command. */
                         wlast         <= 1'b0;
                         /* The reply flags are cleared in Q_TX. */
                         s_done        <= 1'b0;
+                        s_overrun     <= 1'b0;
                         tx_start      <= 1'b1;
                         q             <= Q_TX;
                     end
@@ -440,7 +471,10 @@ module dap_top #(
                  * catches a host that has stopped.
                  */
                 Q_WFETCH: begin
-                    if (wfetch_go) begin
+                    if (abort_req) begin
+                        s_timed_out <= 1'b1;
+                        q           <= Q_DONE;
+                    end else if (wfetch_go) begin
                         wfetch_wait <= 1'b1;
                         if (wbyte == 2'd3) begin
                             tx_start <= 1'b1;
@@ -492,11 +526,19 @@ module dap_top #(
                     end
                 end
 
+                /*
+                 * Flow control: a word is stored only with room for it (the
+                 * flag is a cycle old, hence the margin).  Waiting here stops
+                 * DAP0 between parcels, which pauses the device; the host
+                 * catches up and the block resumes.  An abort gives up.
+                 */
                 Q_STORE: begin
-                    if (fifo_full) begin
-                        /* Nobody is draining: stop and flag overrun. */
-                        s_overrun <= 1'b1;
-                        q         <= Q_DONE;
+                    if (store_byte == 2'd0 && !fifo_room) begin
+                        if (abort_req) begin
+                            s_overrun   <= 1'b1;
+                            s_timed_out <= 1'b1;
+                            q           <= Q_DONE;
+                        end
                     end else begin
                         fifo_push <= 1'b1;
                         fifo_din  <= store_word[7:0];
@@ -532,11 +574,19 @@ module dap_top #(
 
     always @(posedge clk) begin
         start_frame_req <= 1'b0;
-        start_block_req <= 1'b0;
         start_bwrite_req <= 1'b0;
         /* Driven only from this block; two drivers get resolved to one by yosys. */
         fifo_clear      <= 1'b0;
         wfifo_clear     <= 1'b0;
+
+        abort_req <= !rst && reg_we && reg_addr == 7'h01 && reg_wdata[2];
+
+        if (rst || block_take || block_cancel || abort_req) begin
+            r_block_pend <= 1'b0;
+        end
+        if (!rst && reg_we && reg_addr == 7'h01 && reg_wdata[1]) begin
+            r_block_pend <= 1'b1;
+        end
 
         if (rst) begin
             trst      <= 1'b1;         /* released; asserting it resets the target */
@@ -559,7 +609,6 @@ module dap_top #(
                 case (reg_addr)
                     7'h01: begin
                         start_frame_req <= reg_wdata[0];
-                        start_block_req <= reg_wdata[1];
                         start_bwrite_req <= reg_wdata[4];
                         if (reg_wdata[3]) fifo_clear <= 1'b1;
                         if (reg_wdata[5]) wfifo_clear <= 1'b1;
@@ -655,7 +704,8 @@ module dap_top #(
             3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
             /* LEVEL: reply FIFO fill, so the host can drain during a block. */
             3'h5: rd_ctrl_hi = fifo_count[7:0];
-            default: rd_ctrl_hi = {4'd0, fifo_count[11:8]};   /* 0x0E */
+            /* 0x0E: LEVEL high nibble, and a block start still queued. */
+            default: rd_ctrl_hi = {3'd0, r_block_pend, fifo_count[11:8]};
         endcase
 
         case (reg_addr[2:0])

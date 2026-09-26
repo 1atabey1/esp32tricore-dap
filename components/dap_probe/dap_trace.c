@@ -27,6 +27,9 @@ static const char *TAG = "DAP_TRACE";
 #define TRACE_TRAM_BASE     0xB8000000u
 #define TRACE_PARAGRAPH     0x400u          /* 1 kB, the framing unit */
 #define TRACE_WORDS_PER_PAR (TRACE_PARAGRAPH / 4u)
+/* Paragraphs per chained read; the 8 kB TRAM holds 8, and a chain of 8 keeps
+ * the fabric busy while the FIFO drains. */
+#define TRACE_CHAIN_PARS    8u
 
 /* Pointer registers hold a TRAM offset in bits [12:5]. */
 #define TRACE_PTR_MASK      0x1FE0u
@@ -238,7 +241,8 @@ esp_err_t dap_trace_finish(void)
  * self-test passes its own. */
 static esp_err_t drain_to(uint32_t now, uint32_t ovr)
 {
-    static uint32_t words[TRACE_WORDS_PER_PAR];
+    /* A chain's worth: each paragraph and the FIFONOW word read after it. */
+    static uint32_t words[TRACE_CHAIN_PARS * (TRACE_WORDS_PER_PAR + 1u)];
 
     const int64_t t0 = esp_timer_get_time();
 
@@ -280,22 +284,38 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     }
 
     /* The writer must cross `margin` paragraphs before it reaches the oldest
-     * unread one; each read paragraph shifts that by one. */
+     * unread one; each read paragraph shifts that by one.
+     *
+     * Paragraphs go in chains of block reads, each followed by a one-word read
+     * of FIFONOW: the fabric runs the chain back to back, and the pointer read
+     * right after each paragraph tells whether the writer tore it. */
     const uint32_t to_read = available;
     const uint32_t margin  = total_par - available;
-    for (uint32_t i = 0; i < to_read; i++) {
-        const uint32_t addr = TRACE_TRAM_BASE + s_bot + s_next_par * TRACE_PARAGRAPH;
+    uint32_t i = 0;
+    while (i < to_read) {
+        const uint32_t batch = (to_read - i < TRACE_CHAIN_PARS) ? to_read - i : TRACE_CHAIN_PARS;
+        dap_block_req_t reqs[2 * TRACE_CHAIN_PARS];
+        uint32_t par = s_next_par;
 
-        if (dap_probe_blockread(addr, words, TRACE_WORDS_PER_PAR) != ESP_OK) {
+        for (uint32_t k = 0; k < batch; k++) {
+            reqs[2 * k].addr      = TRACE_TRAM_BASE + s_bot + par * TRACE_PARAGRAPH;
+            reqs[2 * k].count     = TRACE_WORDS_PER_PAR;
+            reqs[2 * k + 1].addr  = TRACE_FIFONOW;
+            reqs[2 * k + 1].count = 1;
+            par = (par + 1u) % total_par;
+        }
+        if (dap_probe_blockread_many(reqs, 2 * batch, words) != ESP_OK) {
             s_stats.read_errors++;
             dap_probe_clear_error_state();
             s_pending_lost = lost;
             return ESP_ERR_TIMEOUT;
         }
 
-        /* Torn if the writer reached this paragraph while it was read. */
-        uint32_t w = now;
-        if (dap_probe_read32(TRACE_FIFONOW, &w) == ESP_OK) {
+        for (uint32_t k = 0; k < batch; k++, i++) {
+            const uint32_t *pw = words + k * (TRACE_WORDS_PER_PAR + 1u);
+            const uint32_t  w  = pw[TRACE_WORDS_PER_PAR];
+
+            /* Torn if the writer reached this paragraph while it was read. */
             const uint32_t w_par = (((w & TRACE_PTR_MASK) - s_bot) % s_span) / TRACE_PARAGRAPH;
             const uint32_t moved = (w_par + total_par - now_par) % total_par;
             if (moved >= margin + i) {
@@ -304,12 +324,13 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
                 s_stats.laps++;
                 s_stats.lost += n;
                 s_next_par = w_par;
+                i = to_read;
                 break;
             }
+            publish(s_next_par, pw, lost);
+            lost = 0;                   /* the marker belongs to one record only */
+            s_next_par = (s_next_par + 1u) % total_par;
         }
-        publish(s_next_par, words, lost);
-        lost = 0;                       /* the marker belongs to one record only */
-        s_next_par = (s_next_par + 1u) % total_par;
     }
     s_pending_lost = lost;
 
@@ -330,7 +351,7 @@ esp_err_t dap_trace_poll(void)
 
     static uint32_t polls;
     uint32_t now = 0, ovr = s_last_ovrcnt;
-    if (dap_probe_read32(TRACE_FIFONOW, &now) != ESP_OK) {
+    if (dap_probe_read32_fast(TRACE_FIFONOW, &now) != ESP_OK) {
         s_stats.read_errors++;
         dap_probe_clear_error_state();
         return ESP_ERR_TIMEOUT;

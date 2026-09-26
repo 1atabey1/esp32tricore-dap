@@ -103,6 +103,18 @@ esp_err_t dap_probe_enable_ocds(void);
 /* Read `count` words (1..256) in one client_blockread; the device post-increments IOADDR. */
 esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count);
 
+/* One read of a dap_probe_blockread_many() batch. */
+typedef struct {
+    uint32_t addr;
+    uint16_t count;          /* words, 1..256 */
+} dap_block_req_t;
+
+/*
+ * Several block reads, results packed in request order.  Through the fabric
+ * they run back to back as one chain; otherwise one after another.
+ */
+esp_err_t dap_probe_blockread_many(const dap_block_req_t *reqs, size_t n, uint32_t *words);
+
 /* Block read throughput in kB/s, against the 38 kB/s baseline. */
 esp_err_t dap_probe_block_throughput(void);
 
@@ -120,6 +132,15 @@ esp_err_t dap_probe_spi_bringup(void);
  * measure block-read throughput.  `wide` adds wide mode, then returns to narrow.
  */
 esp_err_t dap_probe_fpga_route_check(bool wide);
+
+/* Single-word read as a one-parcel block read (fabric): for polling. */
+esp_err_t dap_probe_read32_fast(uint32_t addr, uint32_t *value);
+
+/* Time `n` block reads of `words` words at `addr` (fabric, divider `div`,
+ * optionally wide, `chain` blocks per chained batch) and describe where the
+ * time went in `out`. */
+esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
+                         int chain, int trail, char *out, size_t outlen);
 
 /*
  * Sweep bit rate, idle clocks before the first frame, TRST pulse and sync LEN,

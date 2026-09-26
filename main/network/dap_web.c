@@ -355,11 +355,27 @@ static int            s_trace_ws_fd = -1;
 static TaskHandle_t   s_trace_ws_task;
 static volatile bool  s_trace_ws_run;
 
+/* Bumped per client, so a stale session's close cannot stop a newer sender. */
+static uint32_t       s_trace_ws_gen;
+
 static void trace_ws_close(void)
 {
     s_trace_ws_fd = -1;
     s_trace_ws_hd = NULL;
     s_trace_ws_run = false;
+}
+
+/*
+ * Session context destructor: httpd calls it when the client's socket closes,
+ * before the descriptor can be reused.  Without it the sender idles on an
+ * empty ring, never notices the client left, and later writes frames into
+ * whatever connection inherits the descriptor.
+ */
+static void trace_ws_session_gone(void *ctx)
+{
+    if ((uint32_t)(uintptr_t)ctx == s_trace_ws_gen) {
+        s_trace_ws_run = false;
+    }
 }
 
 /* Sender task: forward the drain as binary frames until the socket closes or
@@ -387,6 +403,9 @@ static void trace_ws_task(void *arg)
         if (n == 0) {
             vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
             continue;
+        }
+        if (!s_trace_ws_run) {
+            break;                      /* the client left while we read */
         }
 
         httpd_ws_frame_t pkt = {
@@ -420,11 +439,18 @@ static void trace_ws_task(void *arg)
 static esp_err_t trace_ws_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_GET) {
-        if (s_trace_ws_fd >= 0) {
+        /* A sender whose client just left exits within one idle tick. */
+        for (int i = 0; i < 10 && s_trace_ws_task != NULL && !s_trace_ws_run; i++) {
+            vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
+        }
+        if (s_trace_ws_fd >= 0 || s_trace_ws_task != NULL) {
             ESP_LOGW(TAG, "trace ws: already streaming to fd %d",
                      s_trace_ws_fd);
             return ESP_FAIL;      /* refuse rather than split the stream */
         }
+        s_trace_ws_gen++;
+        req->sess_ctx  = (void *)(uintptr_t)s_trace_ws_gen;
+        req->free_ctx  = trace_ws_session_gone;
         s_trace_ws_hd  = req->handle;
         s_trace_ws_fd  = httpd_req_to_sockfd(req);
         s_trace_ws_run = true;
@@ -657,6 +683,32 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/dap_bench?addr=&n=&words=&div=&wide=&chain= - block-read benchmark. */
+static esp_err_t dap_bench_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    char query[128] = "", val[16];
+    uint32_t addr = 0x70000000u;
+    int n = 64, words = 256, div = 0, wide = 0, chain = 1, trail = 1;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "addr", val, sizeof(val)) == ESP_OK) addr = strtoul(val, NULL, 0);
+        if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) n = atoi(val);
+        if (httpd_query_key_value(query, "words", val, sizeof(val)) == ESP_OK) words = atoi(val);
+        if (httpd_query_key_value(query, "div", val, sizeof(val)) == ESP_OK) div = atoi(val);
+        if (httpd_query_key_value(query, "wide", val, sizeof(val)) == ESP_OK) wide = atoi(val);
+        if (httpd_query_key_value(query, "chain", val, sizeof(val)) == ESP_OK) chain = atoi(val);
+        if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) trail = atoi(val);
+    }
+    char out[640];
+    dap_capture_begin();
+    const esp_err_t err = dap_fpga_bench(addr, n, (size_t)words, (uint8_t)div, wide != 0,
+                                         chain, trail, out, sizeof(out));
+    ESP_LOGW(TAG, "%s", out);
+    dap_capture_end(req, err == ESP_OK ? "\n=== bench done ===\n" : "\n=== bench had errors ===\n");
+    return ESP_OK;
+}
+
 /*
  * GET /api/dap_gdb/attach - register the TC3xx cores as targets of the Black
  * Magic GDB server on port 4242; returns the log and a verdict.  On request
@@ -765,6 +817,10 @@ static httpd_uri_t uri_dap_fpga = {
     .uri = "/api/dap_fpga", .method = HTTP_GET,
     .handler = dap_fpga_handler, .user_ctx = NULL
 };
+static httpd_uri_t uri_dap_bench = {
+    .uri = "/api/dap_bench", .method = HTTP_GET,
+    .handler = dap_bench_handler, .user_ctx = NULL
+};
 static httpd_uri_t uri_dap_gdb_attach = {
     .uri = "/api/dap_gdb/attach", .method = HTTP_GET,
     .handler = dap_gdb_attach_handler, .user_ctx = NULL
@@ -788,6 +844,7 @@ void dap_web_register(httpd_handle_t server)
     httpd_register_uri_handler(server, &uri_fpga_image);
     httpd_register_uri_handler(server, &uri_fpga_load);
     httpd_register_uri_handler(server, &uri_dap_fpga);
+    httpd_register_uri_handler(server, &uri_dap_bench);
     httpd_register_uri_handler(server, &uri_dap_gdb_attach);
     httpd_register_uri_handler(server, &uri_dap_gdb_status);
 }

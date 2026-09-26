@@ -17,6 +17,7 @@
 #include "dap_probe.h"
 #include "dap_probe_priv.h"
 #include "dap_trace.h"
+#include "dap_wide.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -86,6 +87,7 @@ static const struct {
 #define EVENT_SYNC_RQ       20u              /* pulses at each new paragraph */
 
 static bool s_running;
+static bool s_wide;                     /* this session switched the link wide */
 
 void dap_mcds_default_config(dap_mcds_config_t *cfg)
 {
@@ -95,6 +97,7 @@ void dap_mcds_default_config(dap_mcds_config_t *cfg)
     cfg->payload    = DAP_MCDS_PAYLOAD_ADDR_DATA;
     cfg->timestamps = DAP_MCDS_TS_HIT;
     cfg->dap_div    = 0;                     /* 24 MHz */
+    cfg->wide       = true;                  /* two data lines when available */
     for (int j = 0; j < DAP_MCDS_SLOTS; j++) {
         cfg->slot[j].size = 4;
         cfg->slot[j].wr = true;
@@ -326,6 +329,19 @@ static esp_err_t configure(const dap_mcds_config_t *cfg)
     return w.err;
 }
 
+/* Back to the narrow attach clock the rest of the probe expects. */
+static void restore_link(void)
+{
+    if (!dap_phy_fpga_in_use()) {
+        return;
+    }
+    if (s_wide) {
+        dap_wide_exit();
+        s_wide = false;
+    }
+    dap_phy_fpga_set_div(5);             /* the attach default */
+}
+
 esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
 {
     esp_err_t err;
@@ -334,9 +350,18 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
         dap_mcds_stop();
     }
     dap_lock();
+    info->wide = false;
     if (dap_phy_fpga_in_use()) {
+        /* Calibrated at the session's clock; narrow at that clock otherwise. */
+        if (cfg->wide) {
+            info->wide = dap_wide_enter(cfg->dap_div) == ESP_OK;
+            if (!info->wide) {
+                ESP_LOGW(TAG, "wide mode unavailable; tracing over one data line");
+            }
+        }
         dap_phy_fpga_set_div(cfg->dap_div);
     }
+    s_wide = info->wide;
     err = dap_probe_enable_ocds();
     if (err == ESP_OK) {
         err = configure(cfg);
@@ -357,11 +382,13 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "trace setup failed: %s", esp_err_to_name(err));
+        restore_link();
         return err;
     }
     s_running = true;
-    ESP_LOGI(TAG, "tracing: mode %s, emulation clock %" PRIu32 " Hz",
-             cfg->mode == DAP_MCDS_MODE_COMPACT ? "compact" : "full", info->emu_hz);
+    ESP_LOGI(TAG, "tracing: mode %s, emulation clock %" PRIu32 " Hz, DAP %s at div %u",
+             cfg->mode == DAP_MCDS_MODE_COMPACT ? "compact" : "full", info->emu_hz,
+             info->wide ? "wide" : "narrow", (unsigned)cfg->dap_div);
     return ESP_OK;
 }
 
@@ -383,9 +410,7 @@ esp_err_t dap_mcds_stop(void)
     dap_lock();
     dap_trace_finish();
     mcds_reset();                        /* no trace, no heartbeat left armed */
-    if (dap_phy_fpga_in_use()) {
-        dap_phy_fpga_set_div(5);         /* the attach default */
-    }
+    restore_link();
     dap_unlock();
     s_running = false;
     ESP_LOGI(TAG, "tracing stopped");

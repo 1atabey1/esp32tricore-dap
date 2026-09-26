@@ -40,7 +40,6 @@
 
 #define IOCR4_SHIFT(n)      (3u + 8u * ((n) - 4u))
 #define IOCR_PP_OUT         0x10u
-#define IOCR_IN_PULLUP      0x02u
 
 /* -- dap_dapisc.c ------------------------------------------------------- */
 

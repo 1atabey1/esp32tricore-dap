@@ -31,7 +31,7 @@ void dap_phy_fpga_invalidate(void);
 void dap_phy_fpga_use(bool enable);
 bool dap_phy_fpga_in_use(void);
 
-/* DAP clock = 24 MHz / (2 * (div + 1)); 5 gives 2 MHz.  Keep div >= 2. */
+/* DAP clock = 48 MHz / (2 * (div + 1)); 5 gives 4 MHz, 0 gives 24 MHz. */
 esp_err_t dap_phy_fpga_set_div(uint8_t div);
 
 /* Trailing clocks after each frame, and the start-bit wait limit, in DAP clocks. */
@@ -65,7 +65,8 @@ esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap);
 #define DAP_FPGA_BLOCK_WORDS  128
 #define DAP_FPGA_BURST_WORDS  128
 
-/* One client_blockwrite: `count` words streamed to `address` by the fabric. */
+/* One client_blockwrite: `count` words streamed to `address` by the fabric.
+ * ESP_ERR_NOT_SUPPORTED in wide mode: use word writes there. */
 esp_err_t dap_phy_fpga_block_write(uint32_t address, const uint32_t *words,
                                    size_t count);
 
@@ -82,8 +83,39 @@ esp_err_t dap_phy_fpga_exchange(uint8_t cmd, uint8_t len_field,
 esp_err_t dap_phy_fpga_blockread(uint64_t cmd_payload, size_t payload_bits,
                                  uint32_t *words, size_t count);
 
+/* One client_blockread of a chain: the command payload and its word count. */
+typedef struct {
+    uint64_t payload;
+    uint8_t  payload_bits;
+    uint16_t count;          /* 1..256 */
+} dap_fpga_block_t;
+
+/*
+ * Several block reads back to back: the fabric starts each one as the previous
+ * ends while the host drains.  The words of all blocks land in `words` in
+ * order.  Fails as a whole; nothing after a failed block is read.
+ */
+esp_err_t dap_phy_fpga_blockread_chain(const dap_fpga_block_t *blocks, size_t n,
+                                       uint32_t *words);
+
+/* Idle clocks before each chained block after the first (0..63). */
+void dap_phy_fpga_set_chain_lead(uint8_t clocks);
+
 /* Log the fabric's last status, for diagnosis. */
 void dap_phy_fpga_log_status(void);
+
+/* SPI link counters since the last reset. */
+typedef struct {
+    uint32_t xfers;          /* SPI transactions */
+    uint32_t xfer_bytes;     /* bytes clocked, headers included */
+    uint32_t xfer_us;        /* time inside those transactions */
+    uint32_t polls;          /* STATUS/LEVEL polls during block reads */
+} dap_fpga_stats_t;
+
+void dap_phy_fpga_stats(dap_fpga_stats_t *out, bool reset);
+
+/* Time a 7-byte and a 1 KB register read (ns each), and report the SPI clock. */
+void dap_phy_fpga_link_timing(uint32_t *ns_short, uint32_t *ns_long, int *clock_khz);
 
 /*
  * Attach the target through the fabric (sync, LEN-48 DAPISC, error clear,

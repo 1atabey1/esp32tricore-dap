@@ -371,6 +371,16 @@ static esp_err_t dap_probe_read32_locked(uint32_t addr, uint32_t *value)
     return ESP_OK;
 }
 
+/* One-word block read: one frame instead of two exchanges.  For polling
+ * known-good addresses (FIFONOW); bus errors are not distinguished. */
+esp_err_t dap_probe_read32_fast(uint32_t addr, uint32_t *value)
+{
+    if (!dap_phy_fpga_in_use()) {
+        return dap_probe_read32(addr, value);
+    }
+    return dap_probe_blockread(addr, value, 1);
+}
+
 static esp_err_t dap_probe_write32_locked(uint32_t addr, uint32_t value)
 {
     dap_exchange_t x;
@@ -544,6 +554,53 @@ esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count)
 {
     dap_lock();
     const esp_err_t err = dap_probe_blockread_locked(addr, words, count);
+    dap_unlock();
+    return err;
+}
+
+/* Blocks per fabric chain; the chain descriptors live on the stack. */
+#define BLOCKREAD_CHAIN_MAX 16
+
+esp_err_t dap_probe_blockread_many(const dap_block_req_t *reqs, size_t n, uint32_t *words)
+{
+    if (reqs == NULL || words == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = ESP_OK;
+
+    dap_lock();
+    while (n > 0 && err == ESP_OK) {
+        const size_t batch = (n > BLOCKREAD_CHAIN_MAX) ? BLOCKREAD_CHAIN_MAX : n;
+        size_t words_in_batch = 0;
+
+        if (dap_phy_fpga_in_use()) {
+            dap_fpga_block_t chain[BLOCKREAD_CHAIN_MAX];
+            for (size_t i = 0; i < batch; i++) {
+                if (reqs[i].count == 0 || reqs[i].count > 256) {
+                    err = ESP_ERR_INVALID_ARG;
+                    break;
+                }
+                /* Payload layout as in dap_probe_blockread_locked. */
+                chain[i].payload = ((uint64_t)(reqs[i].count & 0xFFu) << 2) |
+                                   ((uint64_t)(reqs[i].addr >> 2) << 10);
+                chain[i].payload_bits = 40;
+                chain[i].count = reqs[i].count;
+                words_in_batch += reqs[i].count;
+            }
+            if (err == ESP_OK) {
+                err = dap_phy_fpga_blockread_chain(chain, batch, words);
+            }
+        } else {
+            for (size_t i = 0; i < batch && err == ESP_OK; i++) {
+                err = dap_probe_blockread_locked(reqs[i].addr, words + words_in_batch,
+                                                 reqs[i].count);
+                words_in_batch += reqs[i].count;
+            }
+        }
+        reqs  += batch;
+        words += words_in_batch;
+        n     -= batch;
+    }
     dap_unlock();
     return err;
 }

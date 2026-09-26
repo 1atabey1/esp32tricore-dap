@@ -28,7 +28,7 @@ FABRIC_MHZ := 48
 # Placement seed, pinned: the spread between seeds is several MHz.  Re-check
 # with `bash seedsweep.sh build/board.json <seeds...>` whenever the netlist
 # changes; if most seeds fail, fix the critical paths rather than hunt seeds.
-SEED := 2
+SEED := 4
 
 bitstream: $(BUILD)/dap_master.bin
 
