@@ -453,28 +453,34 @@ class LiveSession:
     def start(self) -> None:
         from . import worker
         applied = self.probe.post_config(self.request)
-        reply = self.probe.start()
-        if not reply.startswith('started'):
-            raise ProbeError('the probe did not start the trace: %s' % reply)
+        # The stream is connected before the trace starts (see worker.live_main).
+        self.pipe = _Remote(worker.live_main,
+                            (self.probe.host, self.probe.auth, self.out_path, self.signals,
+                             self.LOG_LIMIT, self.MAX_BACKLOG),
+                            self.in_process)
+        self.pipe.on_stats = self._on_stats
+        msg = self.pipe.wait_control(('ready',), timeout=30)
+        if msg[0] != 'ready':
+            self.pipe.close(timeout=2)
+            raise ProbeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+        started = False
         try:
+            reply = self.probe.start()
+            if not reply.startswith('started'):
+                raise ProbeError('the probe did not start the trace: %s' % reply)
+            started = True
             self.config = self.probe.config()
             self.config.setdefault('slots', applied.get('slots', []))
-            self.pipe = _Remote(worker.live_main,
-                                (self.probe.host, self.probe.auth, self.out_path, self.config,
-                                 self.signals, self.LOG_LIMIT, self.MAX_BACKLOG),
-                                self.in_process)
-            self.pipe.on_stats = self._on_stats
-            msg = self.pipe.wait_control(('ready',), timeout=30)
-            if msg[0] != 'ready':
-                raise ProbeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+            if not self.pipe.send(('begin', self.config)):
+                raise ProbeError(self.pipe.error or 'the trace worker ended')
         except Exception:
             # Nothing records this trace: do not leave the probe running it.
-            try:
-                self.probe.stop()
-            except ProbeError:
-                pass
-            if self.pipe is not None:
-                self.pipe.close(timeout=2)
+            if started:
+                try:
+                    self.probe.stop()
+                except ProbeError:
+                    pass
+            self.pipe.close(timeout=2)
             raise
         self.stats.started = time.monotonic()
         self.running = True

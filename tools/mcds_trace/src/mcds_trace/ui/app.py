@@ -440,6 +440,10 @@ class PlotCard:
         sigs = [s for s in (self.app.ws.signals.get(sid) for sid in self.model.signals)
                 if s is not None]
         layout = tuple((s.id, s.color) for s in sigs)
+        key = (layout, x0, x1, id(store), store.samples if store else 0, self.app.hits_mode())
+        if key == getattr(self, '_stats_key', None):
+            return                        # nothing changed since the last time
+        self._stats_key = key
         if layout != getattr(self, '_stats_layout', None):
             # Controls only when the signals change; the texts are reused.
             self._stats_layout = layout

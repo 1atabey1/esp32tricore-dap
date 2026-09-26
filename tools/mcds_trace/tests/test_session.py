@@ -114,9 +114,12 @@ def test_live_session_with_fake_probe(tmp_path, monkeypatch):
         def __init__(self):
             self.q = list(frames)
 
+        def settimeout(self, t):
+            pass
+
         def recv(self):
             import websocket
-            if self.q:
+            if self.q and FakeProbe.state.get('started'):    # data only once tracing
                 return self.q.pop(0)
             time.sleep(0.05)
             raise websocket.WebSocketTimeoutException()

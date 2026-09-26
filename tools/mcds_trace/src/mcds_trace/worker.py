@@ -87,21 +87,30 @@ class _Serve:
         return kind
 
 
-def live_main(conn, host: str, auth: str, out_path: str, config: dict, signals: list,
+def live_main(conn, host: str, auth: str, out_path: str, signals: list,
               log_limit: int | None, max_backlog: int) -> None:
+    """The stream is connected before the trace starts, so its first
+    paragraphs cannot overflow the probe's buffer while this process comes
+    up: connect, drop what an earlier session left, report 'ready', then wait
+    for ('begin', config) - the trace has started - to write the file."""
     import websocket
     st = SessionStats()
-    st.started = time.monotonic()
     try:
         f = open(out_path, 'wb')
     except OSError as e:
         conn.send(('error', 'capture file: %s' % e))
         return
     try:
-        write_header(f, config)
-        pipe = _Pipeline(config, signals, log_limit=log_limit)
         hdr = {'Authorization': 'Basic ' + base64.b64encode(auth.encode()).decode()}
-        ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=1)
+        ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=0.2)
+        quiet_since, t0 = time.monotonic(), time.monotonic()
+        while time.monotonic() - quiet_since < 0.3 and time.monotonic() - t0 < 5:
+            try:
+                if ws.recv():
+                    quiet_since = time.monotonic()
+            except websocket.WebSocketTimeoutException:
+                pass
+        ws.settimeout(1)
     except Exception as e:
         f.close()
         conn.send(('error', 'trace stream: %s' % e))
@@ -110,8 +119,17 @@ def live_main(conn, host: str, auth: str, out_path: str, config: dict, signals: 
 
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
-    lock = threading.Lock()            # SessionStats counters shared with the receiver
+    lock = threading.Lock()            # the file start and SessionStats, shared with rx
     error: list[str] = []
+    early: list[bytes] = []            # frames before the header is written
+    begun = [False]
+
+    def take(frame: bytes) -> None:
+        f.write(frame)
+        st.bytes += len(frame)
+        st.frames += 1
+        st.backlog += len(frame)
+        q.put(frame)
 
     def rx() -> None:
         idle_since = None
@@ -134,13 +152,12 @@ def live_main(conn, host: str, auth: str, out_path: str, config: dict, signals: 
                     break
                 now = time.monotonic()
                 if frame and not isinstance(frame, str):
-                    f.write(frame)
                     with lock:
-                        st.bytes += len(frame)
-                        st.frames += 1
-                        st.backlog += len(frame)
+                        if begun[0]:
+                            take(frame)
+                        else:
+                            early.append(frame)
                     window += len(frame)
-                    q.put(frame)
                     idle_since = None if not stop.is_set() else now
                 if now - last >= 0.5:
                     st.rate = 0.6 * st.rate + 0.4 * window / (now - last)
@@ -157,6 +174,32 @@ def live_main(conn, host: str, auth: str, out_path: str, config: dict, signals: 
 
     rx_thread = threading.Thread(target=rx, name='trace-rx', daemon=True)
     rx_thread.start()
+    # The trace starts now; its configuration (clock, snapshot) comes with 'begin'.
+    try:
+        while True:
+            cmd = conn.recv()
+            if cmd[0] == 'begin':
+                config = cmd[1]
+                break
+            if cmd[0] in ('abort', 'close', 'stop'):
+                raise EOFError
+    except (EOFError, OSError):
+        stop.set()
+        try:
+            ws.close()
+        except Exception:
+            pass
+        rx_thread.join(timeout=QUIET_S + 2)
+        f.close()
+        return
+    pipe = _Pipeline(config, signals, log_limit=log_limit)
+    with lock:
+        write_header(f, config)
+        for frame in early:
+            take(frame)
+        early.clear()
+        begun[0] = True
+    st.started = time.monotonic()
     serve = _Serve(conn, pipe)
     rs = RecordStream()
     skip_gap = False
