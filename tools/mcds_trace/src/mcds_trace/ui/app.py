@@ -328,7 +328,7 @@ class PlotCard:
         if k == self.last_key:
             return
         self.rendering = True
-        self.app.page.run_task(self._render, k)
+        self.app.spawn(self._render(k))
 
     async def _render(self, k) -> None:
         try:
@@ -551,6 +551,8 @@ class App:
         self.warned: set[str] = set()       # signals already reported as not traced
         self._pending: LiveSession | None = None    # a session still starting
         self._leaf_counts: dict[tuple, int] = {}      # tree rows: numeric members inside
+        self.connected = True                        # a web client can be away for a while
+        self._tasks: set[asyncio.Task] = set()
 
     # -- small helpers ---------------------------------------------------------
 
@@ -1723,9 +1725,15 @@ class App:
 
     def _zoom(self, factor: float) -> None:
         if self.mode == 'live' and self.view.follow:
-            w = max(1e-4, self.view.window * factor)
+            # Step through the presets, so the Window box shows what is used.
+            cur = self.view.window
+            if factor < 1:
+                w = max((x for x in WINDOWS if x < cur * 0.99), default=WINDOWS[0])
+            else:
+                w = min((x for x in WINDOWS if x > cur * 1.01), default=WINDOWS[-1])
             self.view.window = w
-            self.window_dd.value = min(('%g' % x for x in WINDOWS), key=lambda s: abs(float(s) - w))
+            self.window_dd.value = '%g' % w
+            self.settings.window_s = w
             return
         self.view.zoom(factor)
 
@@ -1935,10 +1943,15 @@ class App:
                         self.ws.capture.duration > 0 and not self._auto_stopping and \
                         t_start - self.session.stats.started >= self.ws.capture.duration:
                     self._auto_stopping = True
-                    self.page.run_task(self.guard(self.start_stop))
+                    self.spawn(self.guard(self.start_stop)())
                 if self.mode == 'live' and store is not None and t_start - last_trim > 2.0:
                     last_trim = t_start
                     await asyncio.to_thread(store.trim, self.settings.history_s)
+                if not self.connected:
+                    # A web client is away (reload, network): keep the trace
+                    # going, draw again when it is back.
+                    await asyncio.sleep(0.25)
+                    continue
                 t_a = time.monotonic()
                 for c in self.plot_cards:
                     c.schedule()
@@ -1952,7 +1965,7 @@ class App:
                     if t_start - self.last_status_poll > (5.0 if self.probe_ok else 3.0) \
                             and self.mode not in ('live', 'starting', 'stopping'):
                         self.last_status_poll = t_start
-                        self.page.run_task(self._poll_probe)
+                        self.spawn(self._poll_probe())
                     t_c = time.monotonic()
                     # Only what the loop changed; a whole-page diff costs tens
                     # of milliseconds with a big symbol tree.  A full update
@@ -2051,6 +2064,20 @@ class App:
             await self.guard(lambda e: self.open_capture(self.args.capture))()
         self.page.update()
 
+    def spawn(self, coro) -> asyncio.Task:
+        """Run a coroutine on the app's loop (page.run_task needs a connected
+        client; this does not)."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def set_connected(self, on: bool) -> None:
+        self.connected = on
+        if on:
+            for c in self.plot_cards:
+                c.last_key = None         # the client lost its frames
+
     def _replace_session(self, new) -> None:
         """Make `new` the session; the one before goes (its worker ends)."""
         old, self.session = self.session, new
@@ -2122,6 +2149,8 @@ def main(argv=None) -> int:
         # A browser reload or a network drop only disconnects: the session
         # reconnects and carries on.  Closing ends it (and a live trace).
         page.on_close = lambda e: app.shutdown(wait=False)
+        page.on_disconnect = lambda e: app.set_connected(False)
+        page.on_connect = lambda e: app.set_connected(True)
         if not web:
             atexit.register(app.shutdown)   # desktop: the window closed
         await app.start()

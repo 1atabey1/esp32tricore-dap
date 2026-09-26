@@ -18,8 +18,16 @@ uv run mcds-trace-ui --serve --port 8550 --bind 0.0.0.0   # serve only, open htt
 uv run mcds-trace-ui --host 192.168.178.99 --workspace bench.mcdsws
 ```
 
-Pure Python (flet, matplotlib, numpy, pyelftools); `uv` resolves everything on
-each platform, nothing is compiled.
+Pure Python (flet, matplotlib, numpy, Pillow, pyelftools); `uv` resolves
+everything on each platform, nothing is compiled.
+
+The trace data path - the probe's stream, the capture file, decoding and
+signal extraction - runs in a worker process of its own, so neither a busy
+UI nor plotting can slow the stream down; the UI receives the samples in
+batches and draws its frames directly (a few milliseconds for dozens of
+signals, 12 frames/s while tracing). In the browser (`--web`, `--serve`) a
+reload or a network drop only pauses drawing; a running trace carries on.
+`MCDS_TRACE_PERF=1` prints frame times.
 
 1. **Symbols** - open the ELF of the traced application (the one that is
    flashed). Search by name: variables, and struct members at any depth

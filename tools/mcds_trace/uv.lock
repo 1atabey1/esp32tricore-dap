@@ -1045,18 +1045,6 @@ all = [
 ]
 
 [[package]]
-name = "flet-charts"
-version = "1.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "flet" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/51/fbc999ea2e062b0a225fb150662ae3f2799e8b0a7713806e6f1ae691e754/flet_charts-1.0.1.tar.gz", hash = "sha256:5cba0ce191a9316b6acb8b98c3fb535eb5a48b3994138345cf4738956873f201", size = 55266, upload-time = "2026-09-22T20:25:19.111Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/32/9772dbd79d95058db0edd249324f5e549fe31a82045232e70fbcc209fd02/flet_charts-1.0.1-py3-none-any.whl", hash = "sha256:d9ae6f053b195190388c5739f2fc2be666318e4050e6df6b46afb07e31822c83", size = 74786, upload-time = "2026-09-22T20:25:18.107Z" },
-]
-
-[[package]]
 name = "flet-cli"
 version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2069,12 +2057,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "flet", extra = ["all"] },
-    { name = "flet-charts" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pillow" },
     { name = "pyelftools" },
     { name = "websocket-client" },
 ]
@@ -2089,9 +2077,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "flet", extras = ["all"], specifier = ">=1.0.1" },
-    { name = "flet-charts", specifier = ">=1.0.1" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "pillow", specifier = ">=10" },
     { name = "pyelftools", specifier = ">=0.33" },
     { name = "websocket-client", specifier = ">=1.7" },
 ]
