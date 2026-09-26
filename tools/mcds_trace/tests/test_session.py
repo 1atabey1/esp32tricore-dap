@@ -1,10 +1,8 @@
 """Record framing, file sessions, live sessions against a fake probe."""
 
-import base64
 import json
 import os
 import socket
-import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,12 +16,6 @@ from mcds_trace.signals import raw_signal
 
 def record(seq: int, payload: bytes, lost: int = 0) -> bytes:
     return REC_HEADER.pack(REC_MAGIC, seq, 0, len(payload), 0, lost) + payload
-
-
-def par_with_tsr(tsr: int, word_writes: list[tuple[int, int]]) -> bytes:
-    """A paragraph from the decoder's own tests would be ideal; reuse the tram
-    encoder of test_decode if present, else build nothing (framing tests only)."""
-    return b'\xff' * 1024
 
 
 def test_record_stream_across_chunks():

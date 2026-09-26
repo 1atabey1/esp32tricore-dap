@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import capfile
-from .capfile import FLAG_GAP, REC_HEADER, REC_MAGIC, Record, write_header
+from .capfile import REC_HEADER, REC_MAGIC, Record, write_header
 from .decode import Decoder
 from .signals import Extractor, Signal, SignalStore
 
@@ -92,15 +92,18 @@ class EventLog:
                 yield Row(c, KINDS[k] if k < len(KINDS) else '?', None if a < 0 else a,
                           None if v < 0 else v, s, None if w < 0 else w, None if n < 0 else n)
 
-    def addresses(self) -> dict[int, int]:
-        """Access count per address (writes and reads), for 'what did the trace see'."""
+    def addresses(self) -> dict[tuple[int, int], int]:
+        """Access count per (address, size) - writes and reads - for 'what did
+        the trace see'."""
         self._flush()
-        out: dict[int, int] = {}
+        out: dict[tuple[int, int], int] = {}
         for ch in self._chunks:
             m = (ch['kind'] <= 1) & (ch['addr'] >= 0)
-            a, c = np.unique(ch['addr'][m], return_counts=True)
+            key = ch['addr'][m] * 16 + np.maximum(ch['size'][m].astype(np.int64), 1)
+            a, c = np.unique(key, return_counts=True)
             for x, y in zip(a.tolist(), c.tolist()):
-                out[x] = out.get(x, 0) + y
+                k = (x >> 4, x & 15)
+                out[k] = out.get(k, 0) + y
         return out
 
 

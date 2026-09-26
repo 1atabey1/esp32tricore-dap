@@ -20,7 +20,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 
 # Leaf kinds a Node can decode.
 NUMERIC_KINDS = ('base', 'enum', 'pointer')
@@ -532,6 +532,8 @@ class _Parser:
         starts = [lo for lo, _ in covered]
         import bisect
         for name, addr, size in symbols:
+            if name.startswith(('_ZTV', '_ZTI', '_ZTS', '_ZTT', '_ZGV', '_ZTh', '_ZTc')):
+                continue                 # vtables, typeinfo, guards: nothing to trace
             i = bisect.bisect_right(starts, addr) - 1
             if i >= 0 and covered[i][0] <= addr < covered[i][1]:
                 continue
@@ -672,10 +674,15 @@ class SymbolTable:
     machine: str = ''
 
     def search(self, text: str, limit: int = 500) -> list[Variable]:
-        """Case-insensitive substring match on the name, prefix matches first."""
+        """Case-insensitive substring match on the name, prefix matches first;
+        variables with debug information before bare symbols."""
         text = text.strip().lower()
+
+        def rank(v: Variable):
+            return (v.file.startswith('(symbol'), len(v.name), v.name.lower())
         if not text:
-            return sorted(self.variables.values(), key=lambda v: v.name.lower())[:limit]
+            return sorted(self.variables.values(),
+                          key=lambda v: (v.file.startswith('(symbol'), v.name.lstrip('_').lower()))[:limit]
         pre, sub = [], []
         for v in self.variables.values():
             n = v.name.lower()
@@ -684,9 +691,57 @@ class SymbolTable:
                 pre.append(v)
             elif text in n:
                 sub.append(v)
-        pre.sort(key=lambda v: (len(v.name), v.name.lower()))
-        sub.sort(key=lambda v: (len(v.name), v.name.lower()))
+        pre.sort(key=rank)
+        sub.sort(key=rank)
         return (pre + sub)[:limit]
+
+    def _members(self) -> list[tuple[str, str]]:
+        """(lower-case member name, path) of struct members at any depth
+        (arrays of structs through element [0]), built on first use."""
+        idx = getattr(self, '_member_index', None)
+        if idx is not None:
+            return idx
+        idx = []
+        budget = 400_000
+        for v in self.variables.values():
+            stack = [(node_of(v), 0)]
+            while stack and budget > 0:
+                node, depth = stack.pop()
+                t = node.type
+                if depth >= 6:
+                    continue
+                if t.kind in ('struct', 'union', 'class'):
+                    for c in node.children():
+                        idx.append((c.name.lower(), c.path))
+                        budget -= 1
+                        if c.expandable:
+                            stack.append((c, depth + 1))
+                elif t.kind == 'array' and t.count and t.elem is not None and t.elem.is_aggregate:
+                    stack.append((node.children(0, 1)[0], depth + 1))
+        self._member_index = idx
+        return idx
+
+    def search_members(self, text: str, limit: int = 150) -> list[str]:
+        """Paths of struct members whose name contains `text`, prefix first."""
+        text = text.strip().lower()
+        if len(text) < 2:
+            return []
+        pre, sub = [], []
+        for name, path in self._members():
+            if name.startswith(text):
+                pre.append(path)
+            elif text in name:
+                sub.append(path)
+            if len(pre) >= limit:
+                break
+        pre.sort(key=len)
+        sub.sort(key=len)
+        return (pre + sub)[:limit]
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d.pop('_member_index', None)        # rebuilt on demand, not cached
+        return d
 
     def by_address(self, addr: int) -> Variable | None:
         for v in self.variables.values():

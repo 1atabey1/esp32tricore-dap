@@ -22,9 +22,9 @@ import numpy as np  # noqa: E402
 
 THEMES = {
     'light': {'bg': '#ffffff', 'fg': '#333333', 'grid': '#e3e3e3', 'gap': '#e53935',
-              'cursor': '#555555', 'spine': '#bbbbbb'},
+              'cursor': '#555555', 'spine': '#bbbbbb', 'marker': '#8e24aa'},
     'dark': {'bg': '#1e1f22', 'fg': '#d7d7d7', 'grid': '#34363b', 'gap': '#ef5350',
-             'cursor': '#bbbbbb', 'spine': '#55575c'},
+             'cursor': '#bbbbbb', 'spine': '#55575c', 'marker': '#ce93d8'},
 }
 
 
@@ -100,6 +100,8 @@ class FrameSpec:
     theme: str = 'light'
     scale: float = 1.0            # device pixel ratio
     ylog: bool = False
+    t_end: float | None = None    # data ends here: hold step values no further
+    marker: float | None = None   # reference time for delta measurements
 
 
 @dataclass
@@ -140,6 +142,7 @@ class SubplotRenderer:
         self._lines: list = []
         self._gap_art = None
         self._cursor_art = None
+        self._marker_art = None
         self.info: FrameInfo | None = None
 
     def _apply_theme(self, name: str) -> None:
@@ -174,10 +177,10 @@ class SubplotRenderer:
         for ln in self._lines:
             ln.remove()
         self._lines = []
-        for art in (self._gap_art, self._cursor_art):
+        for art in (self._gap_art, self._cursor_art, self._marker_art):
             if art is not None:
                 art.remove()
-        self._gap_art = self._cursor_art = None
+        self._gap_art = self._cursor_art = self._marker_art = None
 
         x0, x1 = spec.x0, spec.x1
         if not x1 > x0:
@@ -190,9 +193,10 @@ class SubplotRenderer:
             t, v = minmax_decimate(tr.t, tr.v, x0, x1, bins)
             if len(t) == 0:
                 continue
-            if spec.style == 'step' and t[-1] < x1 and np.isfinite(v[-1]):
-                # Hold the last value to the right edge of the view.
-                t = np.append(t, x1)
+            hold_to = x1 if spec.t_end is None else min(x1, spec.t_end)
+            if spec.style == 'step' and t[-1] < hold_to and np.isfinite(v[-1]):
+                # Hold the last value to the end of the data in view.
+                t = np.append(t, hold_to)
                 v = np.append(v, v[-1])
             finite = np.isfinite(v)
             if spec.style == 'points':
@@ -234,12 +238,14 @@ class SubplotRenderer:
                                           linestyles='dashed', transform=ax.get_xaxis_transform())
         if spec.cursor is not None and x0 <= spec.cursor <= x1:
             self._cursor_art = ax.axvline(spec.cursor, color=th['cursor'], lw=0.8)
+        if spec.marker is not None and x0 <= spec.marker <= x1:
+            self._marker_art = ax.axvline(spec.marker, color=th['marker'], lw=1.0, ls='--')
 
         if spec.ylim is not None:
             y0, y1 = spec.ylim
         elif math.isfinite(ymin):
             if ymax == ymin:
-                pad = abs(ymin) * 0.05 or 1.0
+                pad = max(abs(ymin) * 0.05, 0.5)
             else:
                 pad = (ymax - ymin) * 0.06
             y0, y1 = ymin - pad, ymax + pad

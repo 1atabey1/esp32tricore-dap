@@ -71,6 +71,15 @@ def parse_int(text: str, default: int | None = None) -> int | None:
         return default
 
 
+def short_path(path: str) -> str:
+    """'ns::Class::var.member[2]' -> 'var.member[2]' (the tooltip keeps the rest);
+    plain variables keep their qualified name."""
+    head, sep, tail = path.partition('.')
+    if not sep:
+        return path
+    return head.rsplit('::', 1)[-1] + sep + tail
+
+
 def normalized(t: np.ndarray, v: np.ndarray, x0: float, x1: float) -> np.ndarray:
     """v scaled so its visible range (plus the value held into the view) is 0..1."""
     i0 = max(int(np.searchsorted(t, x0)) - 1, 0)
@@ -105,6 +114,7 @@ class View:
         self.window = window
         self.follow = True
         self.cursor: float | None = None
+        self.marker: float | None = None     # reference for delta readouts
         self.version = 0
 
     def set(self, x0: float, x1: float) -> None:
@@ -139,52 +149,29 @@ class PlotCard:
         self.drag_x: float | None = None
         self.legend_values: dict[str, ft.Text] = {}
 
-        self.raw = ft.RawImage(fit=ft.BoxFit.FILL)
+        # In a stretched Row the image gets tight constraints, so FILL maps a frame
+        # onto exactly the plot box and its size is reported back.
+        self.raw = ft.RawImage(fit=ft.BoxFit.FILL, expand=True,
+                               on_size_change=self._on_size, size_change_interval=100)
         self.gesture = ft.GestureDetector(
-            content=self.raw, mouse_cursor=ft.MouseCursor.PRECISE,
+            content=ft.Row([self.raw], spacing=0,
+                           vertical_alignment=ft.CrossAxisAlignment.STRETCH),
+            mouse_cursor=ft.MouseCursor.PRECISE,
             drag_interval=16, hover_interval=30,
             on_scroll=self._on_scroll, on_pan_start=self._on_pan_start,
             on_pan_update=self._on_pan_update, on_pan_end=self._on_pan_end,
             on_hover=self._on_hover, on_exit=self._on_exit,
+            on_tap=self._on_tap, on_secondary_tap=lambda e: app.set_marker(None),
             on_double_tap=lambda e: app.fit_or_follow())
         self.legend = ft.Row(wrap=True, spacing=4, run_spacing=2, expand=True)
         self.empty_hint = ft.Text('Drop signals here, or use "Add to plot" in the Signals tab.',
                                   italic=True, size=12, color=ft.Colors.ON_SURFACE_VARIANT)
-        self.body = ft.Container(content=self.gesture, height=model.height,
-                                 on_size_change=self._on_size, size_change_interval=100)
-        menu = ft.PopupMenuButton(
-            icon=ft.Icons.MORE_VERT, tooltip='Plot options',
-            items=[
-                ft.PopupMenuItem(content='Step (sample and hold)', checked=model.style == 'step',
-                                 on_click=lambda e: self._style('step')),
-                ft.PopupMenuItem(content='Lines', checked=model.style == 'line',
-                                 on_click=lambda e: self._style('line')),
-                ft.PopupMenuItem(content='Points', checked=model.style == 'points',
-                                 on_click=lambda e: self._style('points')),
-                ft.PopupMenuItem(),
-                ft.PopupMenuItem(content='Normalize (each signal 0..1)', checked=model.normalize,
-                                 on_click=lambda e: self._toggle_normalize()),
-                ft.PopupMenuItem(content='Y range...', icon=ft.Icons.HEIGHT,
-                                 on_click=lambda e: self._ylim_dialog()),
-                ft.PopupMenuItem(content='One plot per signal', icon=ft.Icons.VIEW_AGENDA_OUTLINED,
-                                 on_click=lambda e: app.split_plot(model.id)),
-                ft.PopupMenuItem(content='Merge into the plot above', icon=ft.Icons.MERGE,
-                                 on_click=lambda e: app.merge_up(model.id)),
-                ft.PopupMenuItem(content='Taller', icon=ft.Icons.EXPAND,
-                                 on_click=lambda e: self._resize(+80)),
-                ft.PopupMenuItem(content='Shorter', icon=ft.Icons.COMPRESS,
-                                 on_click=lambda e: self._resize(-80)),
-                ft.PopupMenuItem(content='Move up', icon=ft.Icons.ARROW_UPWARD,
-                                 on_click=lambda e: app.move_plot(model.id, -1)),
-                ft.PopupMenuItem(content='Move down', icon=ft.Icons.ARROW_DOWNWARD,
-                                 on_click=lambda e: app.move_plot(model.id, +1)),
-                ft.PopupMenuItem(),
-                ft.PopupMenuItem(content='Remove plot', icon=ft.Icons.DELETE_OUTLINE,
-                                 on_click=lambda e: app.remove_plot(model.id)),
-            ])
-        self.header = ft.Row([self.legend, menu], vertical_alignment=ft.CrossAxisAlignment.START)
+        self.body = ft.Container(content=self.gesture, height=model.height)
+        self.menu = ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, tooltip='Plot options')
+        self.stats_row = ft.Row(wrap=True, spacing=14, run_spacing=0, visible=model.stats)
+        self.header = ft.Row([self.legend, self.menu], vertical_alignment=ft.CrossAxisAlignment.START)
         self.card = ft.Container(
-            content=ft.Column([self.header, self.body], spacing=0),
+            content=ft.Column([self.header, self.stats_row, self.body], spacing=0),
             padding=ft.Padding.only(left=8, right=4, top=4, bottom=4),
             border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT), border_radius=8)
         self.control = ft.DragTarget(group='signal', content=self.card,
@@ -192,9 +179,44 @@ class PlotCard:
                                      on_leave=self._on_leave)
         self.rebuild_legend()
 
+    def _menu_items(self) -> list:
+        app, model = self.app, self.model
+        return [
+            ft.PopupMenuItem(content='Step (sample and hold)', checked=model.style == 'step',
+                             on_click=lambda e: self._style('step')),
+            ft.PopupMenuItem(content='Lines', checked=model.style == 'line',
+                             on_click=lambda e: self._style('line')),
+            ft.PopupMenuItem(content='Points', checked=model.style == 'points',
+                             on_click=lambda e: self._style('points')),
+            ft.PopupMenuItem(),
+            ft.PopupMenuItem(content='Normalize (each signal 0..1)', checked=model.normalize,
+                             on_click=lambda e: self._toggle('normalize')),
+            ft.PopupMenuItem(content='Statistics of the view', checked=model.stats,
+                             on_click=lambda e: self._toggle('stats')),
+            ft.PopupMenuItem(content='Y range...', icon=ft.Icons.HEIGHT,
+                             on_click=lambda e: self._ylim_dialog()),
+            ft.PopupMenuItem(content='One plot per signal', icon=ft.Icons.VIEW_AGENDA_OUTLINED,
+                             on_click=lambda e: app.split_plot(model.id)),
+            ft.PopupMenuItem(content='Merge into the plot above', icon=ft.Icons.MERGE,
+                             on_click=lambda e: app.merge_up(model.id)),
+            ft.PopupMenuItem(content='Taller', icon=ft.Icons.EXPAND,
+                             on_click=lambda e: self._resize(+80)),
+            ft.PopupMenuItem(content='Shorter', icon=ft.Icons.COMPRESS,
+                             on_click=lambda e: self._resize(-80)),
+            ft.PopupMenuItem(content='Move up', icon=ft.Icons.ARROW_UPWARD,
+                             on_click=lambda e: app.move_plot(model.id, -1)),
+            ft.PopupMenuItem(content='Move down', icon=ft.Icons.ARROW_DOWNWARD,
+                             on_click=lambda e: app.move_plot(model.id, +1)),
+            ft.PopupMenuItem(),
+            ft.PopupMenuItem(content='Remove plot', icon=ft.Icons.DELETE_OUTLINE,
+                             on_click=lambda e: app.remove_plot(model.id)),
+        ]
+
     # legend ------------------------------------------------------------------
 
     def rebuild_legend(self) -> None:
+        self.menu.items = self._menu_items()
+        self.stats_row.visible = self.model.stats
         self.legend.controls.clear()
         self.legend_values.clear()
         ws = self.app.ws
@@ -266,12 +288,14 @@ class PlotCard:
                          tuple(self.model.ylim) if self.model.ylim else None,
                          list(store.gaps) if store is not None else [], app.view.cursor,
                          xlabel=bool(last) or len(app.plot_cards) == 1,
-                         theme=app.theme_name(), ylog=self.model.ylog)
+                         theme=app.theme_name(), scale=app.pixel_ratio(), ylog=self.model.ylog,
+                         t_end=store.t_end if store is not None else None,
+                         marker=app.view.marker)
 
     def key(self):
         app = self.app
         store = app.store()
-        return (app.view.version, app.view.cursor, self.size, self.model.style,
+        return (app.view.version, app.view.cursor, app.view.marker, self.size, self.model.style,
                 tuple(self.model.ylim or ()), self.model.ylog, self.model.normalize,
                 tuple(self.model.signals),
                 app.theme_name(), id(store), store.samples if store else 0,
@@ -353,6 +377,12 @@ class PlotCard:
     def _on_exit(self, e) -> None:
         self.app.set_cursor(None)
 
+    def _on_tap(self, e) -> None:
+        p = pos(e)
+        info = self.renderer.info
+        if p is not None and info is not None and info.left <= p[0] <= info.right:
+            self.app.set_marker(info.x_of(p[0]))
+
     def _on_will(self, e) -> None:
         self.card.border = ft.Border.all(2, ft.Colors.PRIMARY)
         self.card.update()
@@ -372,9 +402,35 @@ class PlotCard:
         self.model.style = style
         self.app.rebuild_plots()
 
-    def _toggle_normalize(self) -> None:
-        self.model.normalize = not self.model.normalize
+    def _toggle(self, attr: str) -> None:
+        setattr(self.model, attr, not getattr(self.model, attr))
         self.app.rebuild_plots()
+
+    def update_stats(self) -> None:
+        """Count, min, max, mean and typical interval of each signal in view."""
+        if not self.model.stats:
+            return
+        store = self.app.store()
+        x0, x1 = self.app.view.x0, self.app.view.x1
+        items = []
+        for sid in self.model.signals:
+            s = self.app.ws.signals.get(sid)
+            if s is None or store is None:
+                continue
+            t, v = store.snapshot(self.app.trace_id(s))
+            i0, i1 = int(np.searchsorted(t, x0)), int(np.searchsorted(t, x1, side='right'))
+            tt, vv = t[i0:i1], v[i0:i1]
+            fin = vv[np.isfinite(vv)]
+            parts = ['n %d' % len(tt)]
+            if len(fin) and not (s.kind == 'hits' or self.app.hits_mode()):
+                parts += ['min %s' % s.format(float(fin.min())), 'max %s' % s.format(float(fin.max())),
+                          'mean %.6g' % float(fin.mean())]
+            if len(tt) > 1:
+                parts.append('dt %s' % fmt_time(float(np.median(np.diff(tt)))))
+            items.append(ft.Row([ft.Container(width=8, height=8, bgcolor=s.color, border_radius=4),
+                                 ft.Text('  '.join(parts), size=11, style=MONO)],
+                                spacing=4, tight=True))
+        self.stats_row.controls = items
 
     def _resize(self, delta: int) -> None:
         self.model.height = int(max(100, min(900, self.model.height + delta)))
@@ -420,8 +476,8 @@ class App:
         self.page = page
         self.args = args
         self.settings = Settings.load()
-        if args.host:
-            self.settings.host = args.host
+        # --host applies to this run only; editing the field saves it.
+        self.host = args.host or self.settings.host
         self.ws = Workspace()
         self.table: elfsyms.SymbolTable | None = None
         self.session: LiveSession | FileSession | None = None
@@ -436,8 +492,10 @@ class App:
         self._search_task: asyncio.Task | None = None
         self.expanded: set[str] = set()
         self.shown: dict[str, int] = {}     # path -> children shown
-        self.search_results: list[elfsyms.Variable] = []
+        self.search_results: list[elfsyms.Node] = []
+        self.member_results: list[elfsyms.Node] = []
         self.closed = False
+        self._auto_stopping = False
 
     # -- small helpers ---------------------------------------------------------
 
@@ -466,6 +524,15 @@ class App:
                 return 'hits:%d' % j
         return s.id
 
+    def pixel_ratio(self) -> float:
+        """Device pixels per logical pixel (frames render at physical resolution,
+        capped to keep frames small)."""
+        try:
+            r = float(self.page.media.device_pixel_ratio or 1.0)
+        except (AttributeError, TypeError, ValueError):
+            r = 1.0
+        return max(1.0, min(r, 2.0))
+
     def theme_name(self) -> str:
         return 'dark' if self.page.theme_mode == ft.ThemeMode.DARK else 'light'
 
@@ -484,7 +551,9 @@ class App:
                     await r
             except Exception as ex:
                 traceback.print_exc()
-                self.toast('%s: %s' % (type(ex).__name__, ex), error=True)
+                known = (RuntimeError, ProbeError, ValueError, OSError)
+                self.toast(str(ex) if isinstance(ex, known) and str(ex) else
+                           '%s: %s' % (type(ex).__name__, ex), error=True)
             try:
                 self.page.update()
             except Exception:
@@ -528,7 +597,7 @@ class App:
         self._layout(page.width or 1280)
 
     def _build_topbar(self) -> None:
-        self.host_field = ft.TextField(value=self.settings.host, width=190, dense=True,
+        self.host_field = ft.TextField(value=self.host, width=190, dense=True,
                                        label='Probe', text_size=13,
                                        on_submit=self.guard(self._host_changed),
                                        on_blur=self.guard(self._host_changed))
@@ -536,6 +605,8 @@ class App:
                                       bgcolor=ft.Colors.OUTLINE, tooltip='probe not checked yet')
         self.probe_text = ft.Text('', size=12, color=ft.Colors.ON_SURFACE_VARIANT)
         btn = lambda icon, tip, fn: ft.IconButton(icon, tooltip=tip, on_click=self.guard(fn))
+        self.open_menu = ft.PopupMenuButton(icon=ft.Icons.FOLDER_OPEN, tooltip='Open a capture file')
+        self._refresh_recent()
         self.topbar = ft.Container(
             content=ft.Row([
                 btn(ft.Icons.MENU, 'Show or hide the side panel', self._toggle_side),
@@ -545,7 +616,7 @@ class App:
                 self.host_field, self.probe_dot, self.probe_text,
                 ft.Container(expand=True),
                 btn(ft.Icons.MEMORY, 'Open an ELF (symbols)', self.pick_elf),
-                btn(ft.Icons.FOLDER_OPEN, 'Open a capture file', self.pick_capture),
+                self.open_menu,
                 btn(ft.Icons.SAVE_OUTLINED, 'Save the workspace (signals, plots, settings)',
                     self.save_workspace),
                 btn(ft.Icons.FILE_OPEN_OUTLINED, 'Load a workspace', self.load_workspace),
@@ -593,17 +664,38 @@ class App:
 
         async def later():
             await asyncio.sleep(0.25)
-            self._do_search(self.search.value or '')
+            text = self.search.value or ''
+            if self.table is None:
+                return
+            # The member index is built on the first search: off the UI loop.
+            vars_, members = await asyncio.to_thread(self._search, text)
+            if (self.search.value or '') != text:
+                return                       # typed on meanwhile
+            self._show_search(vars_, members)
             self.tree.update()
         self._search_task = self.page.run_task(later)
+
+    def _search(self, text: str):
+        vars_ = self.table.search(text, limit=300)
+        members = []
+        if text.strip():
+            for p in self.table.search_members(text, limit=150):
+                n = elfsyms.resolve_path(self.table.variables, p)
+                if n is not None:
+                    members.append(n)
+        return vars_, members
+
+    def _show_search(self, vars_, members) -> None:
+        self.search_results = [elfsyms.node_of(v) for v in vars_]
+        self.member_results = members
+        self.expanded.clear()
+        self.shown.clear()
+        self._render_tree()
 
     def _do_search(self, text: str) -> None:
         if self.table is None:
             return
-        self.search_results = self.table.search(text, limit=400)
-        self.expanded.clear()
-        self.shown.clear()
-        self._render_tree()
+        self._show_search(self.table.search(text, limit=300), [])
 
     def _render_tree(self) -> None:
         rows = []
@@ -612,14 +704,20 @@ class App:
                                              'variables by name.\nOr add a raw address below.',
                                              size=12, color=ft.Colors.ON_SURFACE_VARIANT),
                                      padding=10))
-        elif not self.search_results:
+        elif not self.search_results and not self.member_results:
             rows.append(ft.Container(ft.Text('No match.', size=12, italic=True), padding=10))
         else:
-            for v in self.search_results:
-                self._tree_rows(elfsyms.node_of(v), 0, rows)
-            if len(self.search_results) >= 400:
-                rows.append(ft.Container(ft.Text('Showing the first 400; refine the search.',
-                                                 size=11, italic=True), padding=6))
+            for n in self.search_results:
+                self._tree_rows(n, 0, rows)
+            if len(self.search_results) >= 300:
+                rows.append(ft.Container(ft.Text('Showing the first 300 variables; refine the '
+                                                 'search.', size=11, italic=True), padding=6))
+            if self.member_results:
+                rows.append(ft.Container(ft.Text('Members', size=12, weight=ft.FontWeight.W_600,
+                                                 color=ft.Colors.PRIMARY),
+                                         padding=ft.Padding.only(left=8, top=8, bottom=2)))
+                for n in self.member_results:
+                    self._tree_rows(n, 0, rows)
         self.tree.controls = rows
 
     def _tree_rows(self, node: elfsyms.Node, depth: int, rows: list) -> None:
@@ -631,7 +729,7 @@ class App:
             width=28, height=28, style=ft.ButtonStyle(padding=0),
             on_click=self.guard(lambda e, n=node: self._toggle_node(n))) if exp else \
             ft.Container(width=28)
-        name = ft.Text(node.name if depth else node.path, size=13,
+        name = ft.Text(node.name if depth else short_path(node.path), size=13,
                        weight=ft.FontWeight.W_600 if depth == 0 else None,
                        color=ft.Colors.PRIMARY if plotted else None, no_wrap=True,
                        overflow=ft.TextOverflow.ELLIPSIS, expand=True,
@@ -808,6 +906,10 @@ class App:
                                     dense=True, expand=True, text_size=13,
                                     on_blur=self.guard(self._dir_changed),
                                     on_submit=self.guard(self._dir_changed))
+        self.cap_duration = ft.TextField(label='Stop after (s, 0 = manual)', dense=True, width=190,
+                                         text_size=13, value='%g' % self.ws.capture.duration,
+                                         on_blur=self.guard(self._cap_changed),
+                                         on_submit=self.guard(self._cap_changed))
         self.cap_history = ft.TextField(label='Keep (s)', value='%g' % self.settings.history_s,
                                         dense=True, width=90, text_size=13,
                                         on_blur=self.guard(self._dir_changed))
@@ -836,6 +938,7 @@ class App:
                 ft.Row([self.cap_dir,
                         ft.IconButton(ft.Icons.FOLDER_OUTLINED, tooltip='Choose the folder',
                                       on_click=self.guard(self._pick_dir)), self.cap_history]),
+                self.cap_duration,
                 ft.Row([self.cap_start], alignment=ft.MainAxisAlignment.CENTER),
                 self.stats_view,
             ], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True),
@@ -853,6 +956,10 @@ class App:
         c.dap_div = parse_int(self.cap_div.value, 0)
         c.wide = bool(self.cap_wide.value)
         c.masters = bool(self.cap_masters.value)
+        try:
+            c.duration = max(0.0, float(self.cap_duration.value or 0))
+        except ValueError:
+            c.duration = 0.0
         self.cap_cpu.disabled = c.source == 'lmu0'
         self.cap_payload.disabled = c.mode == 'compact'
         self._render_plan()
@@ -995,6 +1102,8 @@ class App:
             self.side.visible = self.side_visible
             self.main.visible = True
         self.narrow = narrow
+        self.probe_text.visible = width >= 1100
+        self.host_field.width = 150 if width < 700 else 190
 
     def _estimate_plot_width(self) -> None:
         width = self.page.width or 1280
@@ -1102,6 +1211,18 @@ class App:
         self.tabs.selected_index = 0
         self.toast('Loaded %d variables from %s' % (len(table.variables), os.path.basename(path)))
 
+    def _refresh_recent(self) -> None:
+        items = [ft.PopupMenuItem(content='Open a capture file...', icon=ft.Icons.FOLDER_OPEN,
+                                  on_click=self.guard(self.pick_capture))]
+        recent = [p for p in self.settings.recent_captures if os.path.exists(p)]
+        if recent:
+            items.append(ft.PopupMenuItem())
+            for p in recent[:8]:
+                items.append(ft.PopupMenuItem(
+                    content=os.path.basename(p), icon=ft.Icons.HISTORY,
+                    on_click=self.guard(lambda e, p=p: self.open_capture(p))))
+        self.open_menu.items = items
+
     async def pick_capture(self, e=None) -> None:
         path = await self._pick_path('Open a capture', ['mcds', 'dtrp'])
         if path:
@@ -1133,6 +1254,7 @@ class App:
         self.busy_text = ''
         self.settings.add_recent(path)
         self.settings.save()
+        self._refresh_recent()
         self.view.follow = False
         self.follow_sw.value = False
         self.fit()
@@ -1141,6 +1263,57 @@ class App:
         self.toast('%s: %d paragraphs, %d events%s' % (
             os.path.basename(path), fs.stats.records, fs.pipe.log.n,
             ', %d gaps' % st.gaps if st.gaps else ''))
+        await self._offer_traced(fs)
+
+    async def _offer_traced(self, fs: FileSession) -> None:
+        """Variables the capture has accesses to but the workspace does not show:
+        offer them (ticked) in a dialog."""
+        if self.table is None or fs.config.get('mode') == 'compact':
+            return
+        accessed = await asyncio.to_thread(fs.pipe.log.addresses)
+        if not accessed:
+            return
+        spans = sorted((a, a + n) for a, n in accessed)
+        starts = np.array([a for a, _ in spans], dtype=np.int64)
+        ends = np.maximum.accumulate(np.array([b for _, b in spans], dtype=np.int64))
+
+        def touched(lo: int, hi: int) -> bool:
+            """Some access overlaps [lo, hi)."""
+            i = int(np.searchsorted(starts, hi)) - 1     # last access starting before hi
+            return i >= 0 and ends[i] > lo
+        cands = []
+        slots = [(parse_int(s.get('addr'), 0), int(s.get('size', 0)))
+                 for s in fs.config.get('slots', []) if s.get('enabled')]
+        for v in self.table.variables.values():
+            if not any(v.addr < lo + n and lo < v.addr + max(v.type.size, 1) for lo, n in slots):
+                continue
+            for leaf in elfsyms.node_of(v).leaves(256):
+                if leaf.path in self.ws.signals:
+                    continue
+                if touched(leaf.addr, leaf.addr + leaf.size):
+                    cands.append(leaf)
+            if len(cands) >= 64:
+                break
+        if not cands:
+            return
+        boxes = [ft.Checkbox(label='%s  (%s)' % (short_path(n.path), n.type_name()), value=True,
+                             data=n) for n in cands]
+
+        def add(e):
+            self.page.pop_dialog()
+            chosen = [b.data for b in boxes if b.value]
+            for n in chosen:
+                self.ws.add_signal(leaf_signal(n), -1)
+            if chosen:
+                self.selection_changed()
+            self.page.update()
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text('More traced variables'),
+            content=ft.Container(ft.Column(
+                [ft.Text('This capture also has accesses to:', size=13)] + boxes,
+                scroll=ft.ScrollMode.AUTO, tight=True), width=480, height=min(420, 60 + 36 * len(boxes))),
+            actions=[ft.TextButton('Not now', on_click=lambda e: self.page.pop_dialog()),
+                     ft.FilledButton('Add', on_click=add)]))
 
     @staticmethod
     def _peek_config(path: str) -> tuple[dict, int]:
@@ -1179,7 +1352,7 @@ class App:
                     if v.addr < lo + n and lo < v.addr + max(v.type.size, 1):
                         for leaf in elfsyms.node_of(v).leaves(64):
                             if lo <= leaf.addr < lo + n and added < 12:
-                                self.ws.add_signal(leaf_signal(leaf), -1 if added == 0 else None)
+                                self.ws.add_signal(leaf_signal(leaf), -1)   # own scale each
                                 added += 1
             if not added:
                 size = n if n in (1, 2, 4) else 4
@@ -1238,6 +1411,7 @@ class App:
         self.cap_source.value, self.cap_cpu.value, self.cap_mode.value = c.source, str(c.cpu), c.mode
         self.cap_access.value, self.cap_payload.value, self.cap_ts.value = c.access, c.payload, c.timestamps
         self.cap_div.value, self.cap_wide.value, self.cap_masters.value = str(c.dap_div), c.wide, c.masters
+        self.cap_duration.value = '%g' % c.duration
 
     async def _pick_dir(self, e=None) -> None:
         if self.page.web:
@@ -1403,7 +1577,25 @@ class App:
         if x == self.view.cursor:
             return
         self.view.cursor = x
-        self.cursor_text.value = fmt_time(x) if x is not None else ''
+        self._cursor_readout()
+
+    def set_marker(self, x: float | None) -> None:
+        """Click a plot: a reference line; the readout then shows the delta to it.
+        Right-click removes it."""
+        self.view.marker = x
+        self._cursor_readout()
+
+    def _cursor_readout(self) -> None:
+        x, m = self.view.cursor, self.view.marker
+        parts = []
+        if x is not None:
+            parts.append('t %s' % fmt_time(x))
+        if m is not None:
+            parts.append('marker %s' % fmt_time(m))
+            if x is not None:
+                d = x - m
+                parts.append('dt %s (%.6g Hz)' % (fmt_time(d), 1 / abs(d)) if d else 'dt 0')
+        self.cursor_text.value = '   '.join(parts)
 
     def fit(self) -> None:
         store = self.store()
@@ -1449,14 +1641,15 @@ class App:
 
     def _host_changed(self, e) -> None:
         host = (self.host_field.value or '').strip()
-        if host and host != self.settings.host:
+        if host and host != self.host:
+            self.host = host
             self.settings.host = host
             self.settings.save()
             self.probe_ok = None
             self.last_status_poll = 0
 
     def probe(self) -> Probe:
-        return Probe(self.settings.host, self.settings.auth)
+        return Probe(self.host, self.settings.auth)
 
     async def _poll_probe(self) -> None:
         try:
@@ -1501,6 +1694,7 @@ class App:
             self._update_start_buttons()
             raise RuntimeError(str(ex)) from None
         self.session = sess
+        self._auto_stopping = False
         self.mode = 'live'
         self.busy_text = ''
         self.view.follow = True
@@ -1527,6 +1721,7 @@ class App:
         self.fit()
         self.settings.add_recent(sess.out_path)
         self.settings.save()
+        self._refresh_recent()
         msg = 'Stopped. %s in %s' % (fmt_bytes(sess.stats.bytes), sess.out_path)
         if sess.error:
             self.toast('%s (%s)' % (msg, sess.error), error=True)
@@ -1612,6 +1807,11 @@ class App:
                 if self.mode == 'live' and store is not None and self.view.follow:
                     end = store.t_end
                     self.view.set(end - self.view.window, end + self.view.window * 0.02)
+                if self.mode == 'live' and isinstance(self.session, LiveSession) and \
+                        self.ws.capture.duration > 0 and not self._auto_stopping and \
+                        t_start - self.session.stats.started >= self.ws.capture.duration:
+                    self._auto_stopping = True
+                    self.page.run_task(self.guard(self.start_stop))
                 if self.mode == 'live' and store is not None and t_start - last_trim > 2.0:
                     last_trim = t_start
                     await asyncio.to_thread(store.trim, self.settings.history_s)
@@ -1620,6 +1820,7 @@ class App:
                     last_legend = t_start
                     for c in self.plot_cards:
                         c.update_values(self.view.cursor)
+                        c.update_stats()
                     self._update_status()
                     if t_start - self.last_status_poll > (5.0 if self.probe_ok else 3.0) \
                             and self.mode not in ('live', 'starting', 'stopping'):

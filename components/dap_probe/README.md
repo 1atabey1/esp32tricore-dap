@@ -112,11 +112,34 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
 - Start: OCDS/EECTRC, MCDS reset, MUX_TC_RC then MUX, TROFF, actions, events, comparators,
   FIFO ring (BOT 0, TOP 1FFF, PRE 1FE0, WARN 0), TRAM filled with FFFFFFFF, TRON, CLR.
   Stop: SET (flush), drain incl. the last partial paragraph, MCDS reset.
-- Drain: core 0, prio 12, busy-poll (FreeRTOS tick is 10 ms; the 8 kB TRAM fills in ~5 ms);
-  keeps 3 paragraphs margin to the writer, re-checks FIFONOW after each read (torn → dropped, flagged).
+- Drain: core 0, prio 12, busy-poll (FreeRTOS tick is 10 ms; the 8 kB TRAM fills in ~2.5 ms at
+  full rate); keeps 3 paragraphs margin to the writer. Paragraphs are read as one chain of block
+  reads, each followed by a one-word FIFONOW read (torn → dropped, flagged).
   1 MB PSRAM ring → `/ws/trace` (core 1, 16 kB frames). WiFi/lwIP pinned to core 1.
-- Measured: lossless 850 kB/s for 5 s over WiFi. TRAM reads slow down under heavy trace writes
-  (spec: SRI reads are delayed while MCDS writes), so ~1.6 MB/s offered loses most paragraphs (flagged).
+- Sessions run the DAP wide at 24 MHz (`"wide"`/`"dap_div"` in the config; narrow if P21.7 is
+  driven). The start snapshot of the watched ranges is in `GET /api/mcds/config` (`"snapshot"`).
+- Measured: the drain sustains ~2.7 MB/s of trace data against a source writing 5-6 MB/s
+  (paragraph reads 318 µs/kB while tracing vs 257 µs/kB idle - the trace RAM itself is not the
+  limit, the DAP is). Lower offered rates are lossless.
+
+## Fabric link (dap_phy_fpga.c, fpga/dap_master)
+
+- SPI at 40 MHz (GPIO matrix limit on these pins); register-level transfers: the 64-byte CPU
+  buffer for short ones, GDMA (the driver's idle channels, LL calls from IRAM) above 96 bytes.
+  7-byte register read 5.4 µs, 1 kB FIFO read 214 µs (4.7 MB/s).
+- Block reads chain: a CTRL start written while the sequencer is busy is queued (LEVEL high byte
+  bit 4) and taken on idle, so blocks run back to back while the host drains. With the reply FIFO
+  full the fabric pauses between parcels (DAP0 stopped, DAP1 released) instead of overrunning;
+  CTRL bit 2 aborts such a block.
+- Wide mode calibrates its capture taps at the session's clock against a pattern written narrow
+  into the trace RAM; taps chosen at one divider are wrong at another (24 MHz returned corrupt
+  data with div-5 taps). Block writes are refused in wide mode (parcels arrive corrupted).
+- 1 kB block reads: narrow 24 MHz 2.3 MB/s, wide 24 MHz 3.65-3.9 MB/s chained, data verified
+  (`/api/dap_bench?div=0&wide=1&chain=16`).
+- A 48 MHz DAP clock is within the TC38x's limits (160 MHz) but not this fabric's: device-to-host
+  data is only guaranteed valid for 8-10 ns per bit with no fixed position, which needs sub-5 ns
+  sampling; the 48 MHz UP5K fabric samples in 20.8 ns steps (10.4 ns with DDR inputs), and it
+  closes timing at 50 MHz with little margin. The link (4.7 MB/s) would cap the gain at ~20%.
 
 ## Known limits
 

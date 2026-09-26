@@ -105,6 +105,7 @@ class CaptureOptions:
     masters: bool = False
     dap_div: int = 0                  # 0: 24 MHz
     wide: bool = True
+    duration: float = 0.0             # stop a live trace after this many seconds (0: manual)
     filters: list = field(default_factory=lambda: [SlotFilter(), SlotFilter()])
 
     def to_json(self) -> dict:
@@ -133,6 +134,7 @@ class SubplotModel:
     height: int = 220
     ylog: bool = False
     normalize: bool = False                          # each signal scaled to 0..1 in view
+    stats: bool = False                              # statistics row under the legend
 
 
 class Workspace:
@@ -319,7 +321,8 @@ class Workspace:
             sp = SubplotModel(int(pd.get('id', ws._next_plot)),
                               [i for i in pd.get('signals', []) if i in ws.signals],
                               pd.get('style', 'step'), pd.get('ylim'), int(pd.get('height', 220)),
-                              bool(pd.get('ylog', False)), bool(pd.get('normalize', False)))
+                              bool(pd.get('ylog', False)), bool(pd.get('normalize', False)),
+                              bool(pd.get('stats', False)))
             ws.subplots.append(sp)
             ws._next_plot = max(ws._next_plot, sp.id + 1)
         return ws, missing

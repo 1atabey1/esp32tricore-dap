@@ -124,7 +124,12 @@ uv run mcds-trace decode run.mcds --csv events.csv --elf app.elf
 ```
 
 The decode summary always states losses: gaps (probe lapped / ring full), ERR (target FIFO overflow).
-Lossless up to ~850 kB/s of trace; heavier loads lose (flagged) paragraphs.
+The probe drains ~2.7 MB/s of trace (wide DAP at 24 MHz, the default; narrow when P21.7 is driven by
+the application); sources writing faster lose (flagged) paragraphs.
+
+**Application:** `uv run mcds-trace-ui` (desktop, or `--web`) picks variables from the ELF by name -
+struct members, array elements, bitfields - plans the two watch ranges, traces and plots live, and
+opens captures offline. See `tools/mcds_trace/README.md`.
 Addresses are compared as the source sees them (cached 0x8…/0x9… ≠ uncached 0xA…/0xB…).
 
 ## 6. Bring-up diagnostics (CPU DAP path)
