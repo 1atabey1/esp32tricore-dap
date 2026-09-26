@@ -51,6 +51,20 @@ def fmt_time(t: float) -> str:
     return '%.1f ns' % (t * 1e9)
 
 
+def overlay_box(info, x) -> tuple[float, float, float] | None:
+    """(left, top, height) of a vertical line at time x in a frame's axes, or
+    None when x is not in view.  Plain Python floats: control properties are
+    serialized, and numpy scalars (from sample times) are refused."""
+    if info is None or x is None:
+        return None
+    x, x0, x1 = float(x), float(info.x0), float(info.x1)
+    if not (x1 > x0 and x0 <= x <= x1):
+        return None
+    left = float(info.left) + (x - x0) / (x1 - x0) * (float(info.right) - float(info.left))
+    top = float(info.top)
+    return round(left - 0.5, 1), top, max(1.0, float(info.bottom) - top)
+
+
 def _read_bytes(path: str) -> bytes:
     with open(path, 'rb') as f:
         return f.read()
@@ -151,6 +165,7 @@ class View:
         self.version = 0
 
     def set(self, x0: float, x1: float) -> None:
+        x0, x1 = float(x0), float(x1)           # not numpy scalars (sample times)
         if not (math.isfinite(x0) and math.isfinite(x1)):
             return
         if x1 - x0 < 1e-9:
@@ -381,17 +396,14 @@ class PlotCard:
         colors = THEMES.get(app.theme_name(), THEMES['light'])
         for line, x, color in ((self.cursor_line, app.view.cursor, colors['cursor']),
                                (self.marker_line, app.view.marker, colors['marker'])):
-            vis = info is not None and x is not None and info.x0 <= x <= info.x1
-            state = (vis, round(info.left + (x - info.x0) / (info.x1 - info.x0)
-                                * (info.right - info.left), 1) if vis else None,
-                     info.top if vis else None, info.bottom if vis else None, color)
+            box = overlay_box(info, x)
+            state = (box, color)
             if self._overlay.get(id(line)) == state:
                 continue
             self._overlay[id(line)] = state
-            line.visible = vis
-            if vis:
-                line.left = state[1] - 0.5
-                line.top, line.height = info.top, max(1.0, info.bottom - info.top)
+            line.visible = box is not None
+            if box is not None:
+                line.left, line.top, line.height = box
                 line.bgcolor = color
             try:
                 line.update()
@@ -1804,6 +1816,7 @@ class App:
             pass
 
     def set_cursor(self, x: float | None) -> None:
+        x = None if x is None else float(x)
         if x == self.view.cursor:
             return
         self.view.cursor = x
@@ -1812,7 +1825,7 @@ class App:
     def set_marker(self, x: float | None) -> None:
         """Click a plot: a reference line; the readout then shows the delta to it.
         Right-click removes it."""
-        self.view.marker = x
+        self.view.marker = None if x is None else float(x)
         self._pointer_moved()
 
     def _pointer_moved(self) -> None:
