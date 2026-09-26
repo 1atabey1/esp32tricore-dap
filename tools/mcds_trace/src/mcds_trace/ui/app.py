@@ -73,11 +73,12 @@ def parse_int(text: str, default: int | None = None) -> int | None:
 
 def short_path(path: str) -> str:
     """'ns::Class::var.member[2]' -> 'var.member[2]' (the tooltip keeps the rest);
-    plain variables keep their qualified name."""
+    plain variables keep their qualified name.  std::array elements show as
+    plain indices."""
     head, sep, tail = path.partition('.')
     if not sep:
         return path
-    return head.rsplit('::', 1)[-1] + sep + tail
+    return (head.rsplit('::', 1)[-1] + sep + tail).replace('._M_elems[', '[')
 
 
 def normalized(t: np.ndarray, v: np.ndarray, x0: float, x1: float) -> np.ndarray:
@@ -496,6 +497,7 @@ class App:
         self.member_results: list[elfsyms.Node] = []
         self.closed = False
         self._auto_stopping = False
+        self.warned: set[str] = set()       # signals already reported as not traced
 
     # -- small helpers ---------------------------------------------------------
 
@@ -1145,7 +1147,9 @@ class App:
             'memory snapshot taken at start.\n\n'
             '**Navigate.** Mouse wheel over a plot zooms time around the pointer, dragging pans, '
             'double-click shows everything (or resumes following while live). Hover shows '
-            'values at that instant in the plot headers.\n\n'
+            'values at that instant in the plot headers. Click sets a marker (the toolbar shows '
+            'the time to it), right-click removes it. A plot\'s menu has statistics of the view, '
+            'normalize, and splitting or merging plots.\n\n'
             '**Offline.** Open a capture file (.mcds) to analyse it; change the selected '
             'signals at any time. Export PNG or CSV from the toolbar.\n\n'
             '**Keys.** F5 start/stop, Ctrl+O open capture, Ctrl+S save workspace.')
@@ -1249,6 +1253,7 @@ class App:
             self.progress = None
             raise RuntimeError('opening %s: %s' % (path, ex)) from None
         self.session = fs
+        self.warned.clear()
         self.mode = 'review'
         self.progress = None
         self.busy_text = ''
@@ -1467,7 +1472,9 @@ class App:
             self.toast('Enter an address, e.g. 0x5000220C', error=True)
             return
         size = parse_int(self.raw_size.value, 4)
-        self.ws.add_signal(raw_signal(a, size, signed=bool(self.raw_signed.value)))
+        empty = next((p for p in self.ws.subplots if not p.signals), None)
+        self.ws.add_signal(raw_signal(a, size, signed=bool(self.raw_signed.value)),
+                           empty.id if empty else -1)
         self.selection_changed()
 
     def remove_signal(self, sid: str) -> None:
@@ -1529,14 +1536,18 @@ class App:
         if sess is None or sess.pipe is None:
             return
         sigs = self._extract_signals(sess.config)
-        if isinstance(sess, LiveSession):
-            ranges = [(parse_int(s.get('addr'), 0), int(s.get('size', 0)))
-                      for s in sess.config.get('slots', []) if s.get('enabled')]
-            outside = [s.label for s in sigs if s.kind == 'value'
-                       and not any(lo <= s.addr < lo + n for lo, n in ranges)]
-            if outside:
-                self.toast('%s: not in this trace\'s watch ranges - restart to trace %s.'
-                           % (', '.join(outside[:3]), 'them' if len(outside) > 1 else 'it'))
+        # Signals the session did not watch (completely) will stay empty: say so once.
+        ranges = [(parse_int(s.get('addr'), 0), int(s.get('size', 0)))
+                  for s in sess.config.get('slots', []) if s.get('enabled')]
+        outside = [s for s in sigs if s.kind == 'value' and s.id not in self.warned
+                   and not any(lo <= s.addr and s.addr + s.size <= lo + n for lo, n in ranges)]
+        if outside:
+            self.warned.update(s.id for s in outside)
+            names = ', '.join(s.label for s in outside[:3])
+            self.toast(('%s: not in this trace\'s watch ranges - restart to trace %s.'
+                        if isinstance(sess, LiveSession) else
+                        '%s: outside the watch ranges of this capture (no data for %s).')
+                       % (names, 'them' if len(outside) > 1 else 'it'))
         self.busy_text = 'Re-extracting signals'
         await asyncio.to_thread(sess.pipe.reselect, sigs)
         self.busy_text = ''
@@ -1694,6 +1705,7 @@ class App:
             self._update_start_buttons()
             raise RuntimeError(str(ex)) from None
         self.session = sess
+        self.warned.clear()
         self._auto_stopping = False
         self.mode = 'live'
         self.busy_text = ''

@@ -313,7 +313,7 @@ class Workspace:
             if sig is None:
                 missing.append(sid)
                 continue
-            sig.color = sd.get('color', sig.color)
+            sig.color = sd.get('color') or ws.next_color()
             if sd.get('label'):
                 sig.label = sd['label']
             ws.signals[sig.id] = sig

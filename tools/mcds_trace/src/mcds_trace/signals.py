@@ -82,10 +82,11 @@ def hits_signal(slot: int, label: str) -> Signal:
 
 
 def _short(path: str) -> str:
-    """A compact label: drop leading namespaces, keep the member chain."""
+    """A compact label: drop leading namespaces, keep the member chain, and
+    show std::array elements as plain indices."""
     head, sep, tail = path.partition('.')
     head = head.rsplit('::', 1)[-1]
-    return head + sep + tail if sep else head
+    return (head + sep + tail if sep else head).replace('._M_elems[', '[')
 
 
 # -- storage ------------------------------------------------------------------

@@ -137,3 +137,17 @@ def test_decimation_keeps_extremes():
     assert np.all(np.diff(dt) >= 0)
     assert value_at(t, v, t[54321]) == 50.0
     assert math.isnan(value_at(t, v, -1.0))
+
+
+def test_labels_and_workspace_colors():
+    from mcds_trace.signals import _short
+    from mcds_trace.ui.model import Workspace
+    assert _short('(anonymous)::getApp::app.mModulatorMeans._M_elems[3]') == \
+        'app.mModulatorMeans[3]'
+    d = {'signals': [{'id': 'raw:0x70000000:4', 'addr': '0x70000000', 'size': 4},
+                     {'id': 'raw:0x70000004:4', 'addr': '0x70000004', 'size': 4},
+                     {'id': 'raw:0x70000008:4', 'addr': '0x70000008', 'size': 4,
+                      'color': '#123456'}]}
+    ws, missing = Workspace.from_json(d, None)
+    colors = [s.color for s in ws.signals.values()]
+    assert not missing and len(set(colors)) == 3 and colors[2] == '#123456'
