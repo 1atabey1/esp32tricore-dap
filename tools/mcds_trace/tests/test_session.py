@@ -64,6 +64,8 @@ def test_file_session_real_capture():
     before = len(t)
     fs.pipe.reselect([sig])
     assert len(fs.store.snapshot(sig.id)[0]) == before
+    assert fs.pipe.log.addresses()
+    fs.close()
 
 
 class FakeProbe(BaseHTTPRequestHandler):
@@ -128,16 +130,36 @@ def test_live_session_with_fake_probe(tmp_path, monkeypatch):
     sig = raw_signal(0x5000220C, 2)
     cfg = {'mode': 'full', 'slots': [{'enabled': True, 'addr': '0x5000220C', 'size': 2,
                                       'access': 'w'}, {'enabled': False}]}
-    ls = session.LiveSession(session.Probe(host), cfg, [sig], str(out))
+    ls = session.LiveSession(session.Probe(host), cfg, [sig], str(out), in_process=True)
     ls.start()
     time.sleep(0.6)
     ls.stop(timeout=10)
+    assert ls.pipe.log.addresses() == {}      # still answers after the stop
+    ls.close()
     srv.shutdown()
     assert FakeProbe.state.get('started') and FakeProbe.state.get('stopped')
     assert ls.stats.frames == 3 and ls.stats.records == 3 and ls.error is None
     config, stream = capfile.read_file(str(out))
     assert config['emu_hz'] == 100000000
     assert len(list(capfile.records(stream))) == 3
+
+
+def test_file_session_in_a_worker_process(tmp_path):
+    # The real (spawned) worker: a small synthetic capture.
+    from test_decode import _tsr_par
+    path = tmp_path / 'syn.mcds'
+    with open(path, 'wb') as f:
+        capfile.write_header(f, {'emu_hz': 1000, 'slots': []})
+        for i in range(5):
+            par = _tsr_par(1000 * i + 10, 1000 * i + 500).ljust(1024, bytes(1))
+            f.write(REC_HEADER.pack(REC_MAGIC, i, 0, len(par), capfile.FLAG_FINAL, 0) + par)
+    sig = raw_signal(0x70001234, 1)
+    fs = session.FileSession(str(path))
+    fs.load([sig])
+    t, v = fs.store.snapshot(sig.id)
+    assert len(t) == 10 and fs.stats.records == 5
+    assert fs.pipe.log.addresses() == {(0x70001234, 1): 10}
+    fs.close()
 
 
 def test_probe_errors_are_readable():
@@ -148,3 +170,5 @@ def test_probe_errors_are_readable():
     p = session.Probe('127.0.0.1:%d' % port, timeout=1)
     with pytest.raises(session.ProbeError):
         p.config()
+    with pytest.raises(session.ProbeError):
+        session.Probe('1.2.3.4:abc').config()

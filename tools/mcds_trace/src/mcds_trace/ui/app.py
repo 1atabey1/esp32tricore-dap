@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import csv
 import datetime
 import json
 import math
+import multiprocessing
 import os
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -41,7 +44,19 @@ def fmt_time(t: float) -> str:
         return '%.6f s' % t
     if a >= 1e-3:
         return '%.3f ms' % (t * 1e3)
-    return '%.1f us' % (t * 1e6)
+    if a >= 1e-6 or a == 0:
+        return '%.1f us' % (t * 1e6)
+    return '%.1f ns' % (t * 1e9)
+
+
+def close_dialog(dlg) -> None:
+    """Close this dialog (page.pop_dialog closes whatever is on top - a toast
+    shown meanwhile, say)."""
+    dlg.open = False
+    try:
+        dlg.update()
+    except (RuntimeError, AssertionError):
+        pass
 
 
 def fmt_window(w: float) -> str:
@@ -278,7 +293,7 @@ class PlotCard:
                 s = app.ws.signals.get(sid)
                 if s is None:
                     continue
-                t, v = store.snapshot(app.trace_id(s))
+                t, v = store.window(app.trace_id(s), app.view.x0, app.view.x1)
                 kind = 'hits' if (s.kind == 'hits' or app.hits_mode()) else 'value'
                 if self.model.normalize and kind == 'value' and len(v):
                     v = normalized(t, v, app.view.x0, app.view.x1)
@@ -303,20 +318,29 @@ class PlotCard:
                 len(store.gaps) if store else 0,
                 self.app.plot_cards[-1] is self if self.app.plot_cards else True)
 
-    async def refresh(self) -> None:
+    def schedule(self) -> None:
+        """Render a new frame in the background if anything changed.  Each
+        plot has at most one frame in flight, and a plot that cannot show one
+        (off screen, window hidden) holds up nothing else."""
         if self.rendering:
             return
         k = self.key()
         if k == self.last_key:
             return
         self.rendering = True
+        self.app.page.run_task(self._render, k)
+
+    async def _render(self, k) -> None:
         try:
             spec = self.spec()
             buf, w, h = await asyncio.to_thread(self.renderer.render, spec)
             await self.raw.render_rgba(w, h, buf)
             self.last_key = k
         except (TimeoutError, RuntimeError):
-            pass                          # not attached yet; next tick
+            pass                          # not attached or not visible yet; next tick
+        except Exception:
+            traceback.print_exc()
+            self.last_key = k             # do not retry a failing frame every tick
         finally:
             self.rendering = False
 
@@ -413,12 +437,21 @@ class PlotCard:
             return
         store = self.app.store()
         x0, x1 = self.app.view.x0, self.app.view.x1
-        items = []
-        for sid in self.model.signals:
-            s = self.app.ws.signals.get(sid)
-            if s is None or store is None:
+        sigs = [s for s in (self.app.ws.signals.get(sid) for sid in self.model.signals)
+                if s is not None]
+        layout = tuple((s.id, s.color) for s in sigs)
+        if layout != getattr(self, '_stats_layout', None):
+            # Controls only when the signals change; the texts are reused.
+            self._stats_layout = layout
+            self._stats_texts = [ft.Text('', size=11, style=MONO) for _ in sigs]
+            self.stats_row.controls = [
+                ft.Row([ft.Container(width=8, height=8, bgcolor=s.color, border_radius=4), txt],
+                       spacing=4, tight=True) for s, txt in zip(sigs, self._stats_texts)]
+        for s, txt in zip(sigs, self._stats_texts):
+            if store is None:
+                txt.value = 'n 0'
                 continue
-            t, v = store.snapshot(self.app.trace_id(s))
+            t, v = store.window(self.app.trace_id(s), x0, x1)
             i0, i1 = int(np.searchsorted(t, x0)), int(np.searchsorted(t, x1, side='right'))
             tt, vv = t[i0:i1], v[i0:i1]
             fin = vv[np.isfinite(vv)]
@@ -428,10 +461,15 @@ class PlotCard:
                           'mean %.6g' % float(fin.mean())]
             if len(tt) > 1:
                 parts.append('dt %s' % fmt_time(float(np.median(np.diff(tt)))))
-            items.append(ft.Row([ft.Container(width=8, height=8, bgcolor=s.color, border_radius=4),
-                                 ft.Text('  '.join(parts), size=11, style=MONO)],
-                                spacing=4, tight=True))
-        self.stats_row.controls = items
+            txt.value = '  '.join(parts)
+
+    def push_readouts(self) -> None:
+        """Send the legend values and statistics (not the whole page)."""
+        for ctl in (self.legend, self.stats_row):
+            try:
+                ctl.update()
+            except (RuntimeError, AssertionError):
+                pass                      # not on the page (yet)
 
     def _resize(self, delta: int) -> None:
         self.model.height = int(max(100, min(900, self.model.height + delta)))
@@ -446,28 +484,37 @@ class PlotCard:
         log = ft.Checkbox(label='Logarithmic', value=self.model.ylog)
 
         def apply(e):
-            try:
-                a, b = float(lo.value), float(hi.value)
-                self.model.ylim = [min(a, b), max(a, b)] if a != b else None
-            except ValueError:
+            if not (lo.value or '').strip() and not (hi.value or '').strip():
                 self.model.ylim = None
+            else:
+                try:
+                    a, b = float(lo.value), float(hi.value)
+                except (TypeError, ValueError):
+                    a = b = math.nan
+                if not (math.isfinite(a) and math.isfinite(b)) or a == b:
+                    lo.error = 'two different numbers' if not math.isfinite(a) or a == b else None
+                    hi.error = None if math.isfinite(b) and a != b else 'a number'
+                    dlg.update()
+                    return
+                self.model.ylim = [min(a, b), max(a, b)]
             self.model.ylog = bool(log.value)
-            self.app.page.pop_dialog()
+            close_dialog(dlg)
             self.last_key = None
 
         def auto(e):
             self.model.ylim = None
             self.model.ylog = bool(log.value)
-            self.app.page.pop_dialog()
+            close_dialog(dlg)
             self.last_key = None
 
-        self.app.page.show_dialog(ft.AlertDialog(
+        dlg = ft.AlertDialog(
             title=ft.Text('Y range'),
             content=ft.Column([ft.Row([lo, hi]), log,
                                ft.Text('Leave empty for automatic scaling.', size=12)],
                               tight=True),
             actions=[ft.TextButton('Automatic', on_click=auto),
-                     ft.FilledButton('Apply', on_click=apply)]))
+                     ft.FilledButton('Apply', on_click=apply)])
+        self.app.page.show_dialog(dlg)
 
 
 # -- the application ------------------------------------------------------------
@@ -498,6 +545,8 @@ class App:
         self.closed = False
         self._auto_stopping = False
         self.warned: set[str] = set()       # signals already reported as not traced
+        self._pending: LiveSession | None = None    # a session still starting
+        self._leaf_counts: dict[tuple, int] = {}      # tree rows: numeric members inside
 
     # -- small helpers ---------------------------------------------------------
 
@@ -745,7 +794,10 @@ class App:
                                 tooltip='Add to the plot' if not plotted else 'Already selected',
                                 on_click=self.guard(lambda e, n=node: self.add_leaf(n)))
         else:
-            count = sum(1 for _ in node.leaves(1025))
+            key = (node.path, node.addr, id(node.type))
+            count = self._leaf_counts.get(key)
+            if count is None:
+                count = self._leaf_counts[key] = sum(1 for _ in node.leaves(1025))
             add = ft.IconButton(ft.Icons.PLAYLIST_ADD, icon_size=18, width=30, height=30,
                                 style=ft.ButtonStyle(padding=0),
                                 tooltip='Add all %s%d numeric members' % ('1024+ ' if count > 1024 else '', min(count, 1024))
@@ -864,12 +916,13 @@ class App:
 
         def ok(e):
             s.label = (field.value or s.label).strip()[:60] or s.label
-            self.page.pop_dialog()
+            close_dialog(dlg)
             self.selection_changed(retrace=False)
             self.page.update()
         field.on_submit = ok
-        self.page.show_dialog(ft.AlertDialog(title=ft.Text('Signal name'), content=field,
-                                             actions=[ft.FilledButton('OK', on_click=ok)]))
+        dlg = ft.AlertDialog(title=ft.Text('Signal name'), content=field,
+                             actions=[ft.FilledButton('OK', on_click=ok)])
+        self.page.show_dialog(dlg)
 
     # capture panel -------------------------------------------------------------
 
@@ -1153,10 +1206,11 @@ class App:
             '**Offline.** Open a capture file (.mcds) to analyse it; change the selected '
             'signals at any time. Export PNG or CSV from the toolbar.\n\n'
             '**Keys.** F5 start/stop, Ctrl+O open capture, Ctrl+S save workspace.')
-        self.page.show_dialog(ft.AlertDialog(
+        dlg = ft.AlertDialog(
             title=ft.Text('How to use MCDS Trace'),
             content=ft.Container(ft.Markdown(text), width=560),
-            actions=[ft.TextButton('Close', on_click=lambda e: self.page.pop_dialog())]))
+            actions=[ft.TextButton('Close', on_click=lambda e: close_dialog(dlg))])
+        self.page.show_dialog(dlg)
 
     # -- files -----------------------------------------------------------------
 
@@ -1199,21 +1253,38 @@ class App:
             self.elf_text.value = 'No ELF loaded'
             raise RuntimeError('reading %s: %s' % (path, ex)) from None
         self.table = table
+        self._leaf_counts.clear()
         self.settings.last_elf = path
         self.settings.save()
         self.elf_progress.visible = False
         self.elf_text.value = '%s  (%d variables)' % (os.path.basename(path), len(table.variables))
         self.elf_text.tooltip = path
         self.search.disabled = False
-        # Signals from a workspace loaded before the ELF: re-resolve them.
+        # Every ELF signal again: a workspace loaded before the ELF has only
+        # addresses, and a rebuilt ELF may have moved variables.
+        gone, moved = [], 0
         for sid, s in list(self.ws.signals.items()):
-            if s.node is None and not sid.startswith(('raw:', 'hits:')):
-                node = elfsyms.resolve_path(table.variables, sid)
-                if node is not None:
-                    s.node, s.addr, s.size = node, node.addr, node.size
+            if sid.startswith(('raw:', 'hits:')):
+                continue
+            node = elfsyms.resolve_path(table.variables, sid)
+            if node is None or not node.is_leaf:
+                gone.append(s.label)
+                continue
+            if (node.addr, node.size) != (s.addr, s.size):
+                moved += 1
+            s.node, s.addr, s.size = node, node.addr, node.size
         self._do_search(self.search.value or '')
         self.tabs.selected_index = 0
-        self.toast('Loaded %d variables from %s' % (len(table.variables), os.path.basename(path)))
+        msg = 'Loaded %d variables from %s' % (len(table.variables), os.path.basename(path))
+        if moved:
+            msg += '; %d signal(s) moved' % moved
+        if gone:
+            self.toast('%s; not in this ELF: %s%s' % (msg, ', '.join(gone[:3]),
+                                                     ' ...' if len(gone) > 3 else ''), error=True)
+        else:
+            self.toast(msg)
+        if moved or gone:
+            self.selection_changed()
 
     def _refresh_recent(self) -> None:
         items = [ft.PopupMenuItem(content='Open a capture file...', icon=ft.Icons.FOLDER_OPEN,
@@ -1236,6 +1307,10 @@ class App:
         if self.mode in ('live', 'starting', 'stopping'):
             self.toast('Stop the live trace first.', error=True)
             return
+        if self.mode == 'loading':
+            self.toast('Still loading the previous capture.', error=True)
+            return
+        before = self.mode
         self.mode = 'loading'
         self.busy_text = 'Loading %s' % os.path.basename(path)
         self.progress = 0.0
@@ -1249,10 +1324,15 @@ class App:
             await asyncio.to_thread(fs.load, self._extract_signals(config),
                                     lambda p: setattr(self, 'progress', p))
         except Exception as ex:
-            self.mode = 'idle'
+            self.mode = before
             self.progress = None
+            self.busy_text = ''
+            await asyncio.to_thread(fs.close)
             raise RuntimeError('opening %s: %s' % (path, ex)) from None
-        self.session = fs
+        if self.closed:
+            await asyncio.to_thread(fs.close)
+            return
+        self._replace_session(fs)
         self.warned.clear()
         self.mode = 'review'
         self.progress = None
@@ -1305,20 +1385,21 @@ class App:
                              data=n) for n in cands]
 
         def add(e):
-            self.page.pop_dialog()
+            close_dialog(dlg)
             chosen = [b.data for b in boxes if b.value]
             for n in chosen:
                 self.ws.add_signal(leaf_signal(n), -1)
             if chosen:
                 self.selection_changed()
             self.page.update()
-        self.page.show_dialog(ft.AlertDialog(
+        dlg = ft.AlertDialog(
             title=ft.Text('More traced variables'),
             content=ft.Container(ft.Column(
                 [ft.Text('This capture also has accesses to:', size=13)] + boxes,
                 scroll=ft.ScrollMode.AUTO, tight=True), width=480, height=min(420, 60 + 36 * len(boxes))),
-            actions=[ft.TextButton('Not now', on_click=lambda e: self.page.pop_dialog()),
-                     ft.FilledButton('Add', on_click=add)]))
+            actions=[ft.TextButton('Not now', on_click=lambda e: close_dialog(dlg)),
+                     ft.FilledButton('Add', on_click=add)])
+        self.page.show_dialog(dlg)
 
     @staticmethod
     def _peek_config(path: str) -> tuple[dict, int]:
@@ -1445,15 +1526,16 @@ class App:
         leaves = list(node.leaves(1025))
         if len(leaves) > 64:
             def go(e):
-                self.page.pop_dialog()
+                close_dialog(dlg)
                 self._add_leaves(leaves[:1024], node)
                 self.page.update()
-            self.page.show_dialog(ft.AlertDialog(
+            dlg = ft.AlertDialog(
                 title=ft.Text('Add %d signals?' % len(leaves)),
                 content=ft.Text('%s has %d numeric members. They go on one new plot.'
                                 % (node.path, len(leaves))),
-                actions=[ft.TextButton('Cancel', on_click=lambda e: self.page.pop_dialog()),
-                         ft.FilledButton('Add', on_click=go)]))
+                actions=[ft.TextButton('Cancel', on_click=lambda e: close_dialog(dlg)),
+                         ft.FilledButton('Add', on_click=go)])
+            self.page.show_dialog(dlg)
             return
         self._add_leaves(leaves, node)
 
@@ -1472,6 +1554,10 @@ class App:
             self.toast('Enter an address, e.g. 0x5000220C', error=True)
             return
         size = parse_int(self.raw_size.value, 4)
+        if size not in (1, 2, 4, 8) or a < 0 or a + size > 1 << 32:
+            self.toast('The address must lie in 0x00000000..0xFFFFFFFF (size 1, 2, 4 or 8)',
+                       error=True)
+            return
         empty = next((p for p in self.ws.subplots if not p.signals), None)
         self.ws.add_signal(raw_signal(a, size, signed=bool(self.raw_signed.value)),
                            empty.id if empty else -1)
@@ -1548,9 +1634,15 @@ class App:
                         if isinstance(sess, LiveSession) else
                         '%s: outside the watch ranges of this capture (no data for %s).')
                        % (names, 'them' if len(outside) > 1 else 'it'))
+        # The worker answers in order, so the newest selection is applied
+        # last; only its completion clears the status.
+        self._select_gen = gen = getattr(self, '_select_gen', 0) + 1
         self.busy_text = 'Re-extracting signals'
-        await asyncio.to_thread(sess.pipe.reselect, sigs)
-        self.busy_text = ''
+        try:
+            await asyncio.to_thread(sess.pipe.reselect, sigs)
+        finally:
+            if gen == self._select_gen:
+                self.busy_text = ''
         for c in self.plot_cards:
             c.last_key = None
 
@@ -1697,6 +1789,7 @@ class App:
         self.busy_text = 'Starting the trace (DAP calibration, memory snapshot)'
         self._update_start_buttons()
         self.page.update()
+        self._pending = sess                   # shutdown stops it even while starting
         try:
             await asyncio.to_thread(sess.start)
         except Exception as ex:
@@ -1704,7 +1797,12 @@ class App:
             self.busy_text = ''
             self._update_start_buttons()
             raise RuntimeError(str(ex)) from None
-        self.session = sess
+        finally:
+            self._pending = None
+        if self.closed:
+            await asyncio.to_thread(sess.close, 15)
+            return
+        self._replace_session(sess)
         self.warned.clear()
         self._auto_stopping = False
         self.mode = 'live'
@@ -1816,8 +1914,12 @@ class App:
 
     async def tick(self) -> None:
         """UI loop: view window, plot frames, legends, status (runs forever)."""
-        last_legend = 0.0
+        last_legend = last_full = 0.0
         last_trim = time.monotonic()
+        # MCDS_TRACE_PERF=1: frame times on stderr every 5 s.
+        perf = [] if os.environ.get('MCDS_TRACE_PERF') else None
+        phases: list[tuple] = []
+        perf_t = time.monotonic()
         while not self.closed:
             t_start = time.monotonic()
             try:
@@ -1833,7 +1935,10 @@ class App:
                 if self.mode == 'live' and store is not None and t_start - last_trim > 2.0:
                     last_trim = t_start
                     await asyncio.to_thread(store.trim, self.settings.history_s)
-                await asyncio.gather(*(c.refresh() for c in self.plot_cards))
+                t_a = time.monotonic()
+                for c in self.plot_cards:
+                    c.schedule()
+                t_b = time.monotonic()
                 if t_start - last_legend > 0.2:
                     last_legend = t_start
                     for c in self.plot_cards:
@@ -1844,10 +1949,40 @@ class App:
                             and self.mode not in ('live', 'starting', 'stopping'):
                         self.last_status_poll = t_start
                         self.page.run_task(self._poll_probe)
-                    self.page.update()
+                    t_c = time.monotonic()
+                    # Only what the loop changed; a whole-page diff costs tens
+                    # of milliseconds with a big symbol tree.  A full update
+                    # now and then catches anything else.
+                    if t_start - last_full > 2.0:
+                        last_full = t_start
+                        self.page.update()
+                    else:
+                        for c in self.plot_cards:
+                            c.push_readouts()
+                        for ctl in (self.statusbar, self.stats_view):
+                            try:
+                                ctl.update()
+                            except (RuntimeError, AssertionError):
+                                pass
+                    if perf is not None:
+                        phases.append((t_a - t_start, t_b - t_a, t_c - t_b,
+                                       time.monotonic() - t_c))
             except Exception:
                 traceback.print_exc()
             dt = time.monotonic() - t_start
+            if perf is not None:
+                perf.append(dt)
+                if t_start - perf_t >= 5.0:
+                    print('tick: %.1f frames/s, %.1f ms mean, %.1f ms max (%s)' % (
+                        len(perf) / (t_start - perf_t), 1e3 * sum(perf) / len(perf),
+                        1e3 * max(perf), self.mode), file=sys.stderr, flush=True)
+                    if phases:
+                        print('  phases ms: pre %.1f  plots %.1f  legend+stats %.1f  update %.1f'
+                              % tuple(1e3 * sum(p[i] for p in phases) / len(phases)
+                                      for i in range(4)), file=sys.stderr, flush=True)
+                        phases.clear()
+                    perf.clear()
+                    perf_t = t_start
             await asyncio.sleep(max(0.01, 1.0 / max(1, self.settings.fps) - dt))
 
     def _update_status(self) -> None:
@@ -1912,20 +2047,57 @@ class App:
             await self.guard(lambda e: self.open_capture(self.args.capture))()
         self.page.update()
 
-    def shutdown(self) -> None:
+    def _replace_session(self, new) -> None:
+        """Make `new` the session; the one before goes (its worker ends)."""
+        old, self.session = self.session, new
+        if old is not None and old is not new:
+            threading.Thread(target=_close_session, args=(old,), daemon=True).start()
+
+    def shutdown(self, wait: bool = True) -> None:
+        """The window or browser session closed: stop a live trace (the file
+        is kept complete), end the workers, save the settings."""
         if self.closed:
             return
         self.closed = True
-        sess = self.session
-        if isinstance(sess, LiveSession) and sess.running:
-            try:
-                sess.stop(timeout=10)
-            except Exception:
-                sess.abort()
+        try:
+            atexit.unregister(self.shutdown)
+        except Exception:
+            pass
+        sessions = [s for s in (self.session, self._pending) if s is not None]
+
+        def stop_all():
+            for sess in sessions:
+                if sess is self._pending:
+                    # Still starting: wait for it, then stop it.
+                    for _ in range(300):
+                        if sess.running or sess.error:
+                            break
+                        time.sleep(0.1)
+                _close_session(sess)
+
+        if wait:
+            stop_all()
+        else:
+            threading.Thread(target=stop_all, name='shutdown').start()
         self.settings.save()
 
 
+def _close_session(sess) -> None:
+    try:
+        if isinstance(sess, LiveSession):
+            sess.close(timeout=15)
+        else:
+            sess.close()
+    except Exception:
+        if isinstance(sess, LiveSession):
+            try:
+                sess.abort()
+            except Exception:
+                pass
+
+
 def main(argv=None) -> int:
+    multiprocessing.freeze_support()        # frozen builds start their workers through here
     p = argparse.ArgumentParser(prog='mcds-trace-ui', description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('capture', nargs='?', help='open this capture file')
@@ -1939,15 +2111,18 @@ def main(argv=None) -> int:
     p.add_argument('--bind', default=None, help='web interface to listen on (default: all)')
     args = p.parse_args(argv)
 
+    web = args.web or args.serve
+
     async def app_main(page: ft.Page):
         app = App(page, args)
-        page.on_disconnect = lambda e: app.shutdown()
-        page.on_close = lambda e: app.shutdown()
-        import atexit
-        atexit.register(app.shutdown)       # desktop: the window closed
+        # A browser reload or a network drop only disconnects: the session
+        # reconnects and carries on.  Closing ends it (and a live trace).
+        page.on_close = lambda e: app.shutdown(wait=False)
+        if not web:
+            atexit.register(app.shutdown)   # desktop: the window closed
         await app.start()
 
-    if args.web or args.serve:
+    if web:
         if args.serve:
             os.environ['BROWSER'] = 'true'      # webbrowser.open: a no-op command
         ft.run(app_main, view=ft.AppView.WEB_BROWSER, port=args.port, host=args.bind)

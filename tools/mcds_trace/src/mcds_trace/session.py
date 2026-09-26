@@ -4,15 +4,17 @@ Both decode the DTRP record stream and feed an Extractor.  Decoded events are
 kept in compact numpy columns (EventLog), so the selection of signals can be
 changed afterwards without decoding again.
 
-LiveSession runs three threads: the receiver writes every WebSocket frame to
-the capture file first (the file is always complete) and queues it; the
-decoder drains the queue - when it falls too far behind it skips ahead and
-marks a gap in the live view only; a poller reads the probe's drain counters.
+Both run their data path in a worker process (worker.py): it receives the
+stream and writes every frame to the capture file first (the file is always
+complete), decodes - when it falls too far behind it skips ahead and marks a
+gap in the live view only - and sends the samples here in batches.  The UI
+process keeps the samples and polls the probe's drain counters.
 """
 
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import queue
 import struct
@@ -21,13 +23,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import numpy as np
 
-from . import capfile
-from .capfile import REC_HEADER, REC_MAGIC, Record, write_header
-from .decode import KIND_CODE, KINDS, Decoder
-from .signals import Extractor, Signal, SignalStore
+from .capfile import REC_HEADER, REC_MAGIC, Record
+from .decode import KIND_CODE, KINDS, DecodeStats, Decoder
+from .signals import ExtractStats, Extractor, Signal, SignalStore
 
 _KIND_CODE = KIND_CODE
 
@@ -241,6 +243,8 @@ class Probe:
             raise ProbeError('%s: HTTP %d %s' % (path, e.code, body or e.reason)) from None
         except (urllib.error.URLError, OSError) as e:
             raise ProbeError('%s: %s' % (self.host, getattr(e, 'reason', e))) from None
+        except (ValueError, http.client.InvalidURL) as e:     # e.g. 'host:abc'
+            raise ProbeError('%r is not a valid probe address (%s)' % (self.host, e)) from None
 
     def status(self) -> str:
         return self._req('/api/dap_gdb/status', timeout=4).decode(errors='replace').strip()
@@ -258,149 +262,233 @@ class Probe:
         return self._req('/api/mcds/stop', timeout=60).decode(errors='replace').strip()
 
 
+# -- workers ------------------------------------------------------------------
+
+class _RemoteLog:
+    """The worker's event log, as far as the UI asks about it."""
+
+    def __init__(self, remote: '_Remote'):
+        self._remote = remote
+        self.n = 0
+        self.dropped = 0
+
+    def addresses(self) -> dict[tuple[int, int], int]:
+        return self._remote.request(('addresses',), 'addresses')[1]
+
+
+class _Remote:
+    """The UI side of a worker (see worker.py): samples land in a local
+    SignalStore; the decoder and extractor statistics mirror the worker's.
+    The attribute names follow _Pipeline, which the worker runs."""
+
+    def __init__(self, target, args: tuple, in_process: bool = False):
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')
+        here, there = ctx.Pipe()
+        if in_process:
+            self.proc = threading.Thread(target=target, args=(there,) + args, daemon=True,
+                                         name='trace-worker')
+        else:
+            self.proc = ctx.Process(target=target, args=(there,) + args, daemon=True,
+                                    name='mcds-trace-worker')
+        self.proc.start()
+        if not in_process:
+            there.close()                   # the child has its own copy
+        self.conn = here
+        self.store = SignalStore()
+        self.decoder = SimpleNamespace(stats=DecodeStats())
+        self.extractor = SimpleNamespace(stats=ExtractStats())
+        self.log = _RemoteLog(self)
+        self.records = 0
+        self.error: str | None = None
+        self.on_progress = None
+        self.on_stats = None
+        self.done = threading.Event()
+        self._send_lock = threading.Lock()
+        self._req_lock = threading.Lock()
+        self._control: queue.Queue = queue.Queue()
+        self._replies: queue.Queue = queue.Queue()
+        self._rx = threading.Thread(target=self._recv, name='trace-results', daemon=True)
+        self._rx.start()
+
+    # -- messages ------------------------------------------------------------
+
+    def _recv(self) -> None:
+        try:
+            while True:
+                try:
+                    msg = self.conn.recv()
+                except (EOFError, OSError):
+                    break
+                kind = msg[0]
+                if kind == 'batch':
+                    self._apply(self.store, *msg[1:5])
+                    self._stats(msg[5])
+                elif kind == 'store':
+                    store = SignalStore()
+                    self._apply(store, *msg[1:5])
+                    store.trimmed = self.store.trimmed
+                    self.store = store
+                    self._replies.put(('store', store))
+                elif kind == 'addresses':
+                    self._replies.put(msg)
+                elif kind == 'progress':
+                    if self.on_progress:
+                        self.on_progress(msg[1])
+                elif kind == 'done':            # the stream ended; requests still work
+                    self._stats(msg[1])
+                    self.error = self.error or msg[2]
+                    self.done.set()
+                else:                       # ready, config, loaded, error
+                    if kind == 'error':
+                        self.error = msg[1]
+                    elif kind == 'loaded':
+                        self._stats(msg[1])
+                    self._control.put(msg)
+        finally:
+            self.done.set()
+            self._control.put(('closed',))
+            self._replies.put(('closed',))
+
+    @staticmethod
+    def _apply(store: SignalStore, series: dict, gaps: list, t_end: float, samples: int) -> None:
+        with store.lock:
+            for sid, (t, v) in series.items():
+                store.get(sid).extend(t, v)
+            store.gaps.extend(gaps)
+            if t_end > store.t_end:
+                store.t_end = t_end
+            store.samples += samples
+
+    def _stats(self, d: dict) -> None:
+        self.decoder.stats = DecodeStats(**d['decode'])
+        self.extractor.stats = ExtractStats(**d['extract'])
+        self.records = d['records']
+        self.log.n, self.log.dropped = d['log_n'], d['log_dropped']
+        if self.on_stats:
+            self.on_stats(d)
+
+    def send(self, cmd: tuple) -> bool:
+        with self._send_lock:
+            try:
+                self.conn.send(cmd)
+                return True
+            except (OSError, ValueError, BrokenPipeError):
+                return False
+
+    def wait_control(self, kinds: tuple, timeout: float | None = None) -> tuple:
+        """The next control message of one of these kinds (or 'error'/'closed')."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                msg = self._control.get(timeout=left)
+            except queue.Empty:
+                return ('error', 'the worker did not answer in %.0f s' % timeout)
+            if msg[0] in kinds or msg[0] in ('error', 'closed'):
+                return msg
+
+    def request(self, cmd: tuple, reply: str, timeout: float = 600.0) -> tuple:
+        with self._req_lock:
+            if not self.send(cmd):
+                raise ProbeError('the trace worker has ended')
+            while True:
+                try:
+                    msg = self._replies.get(timeout=timeout)
+                except queue.Empty:
+                    raise ProbeError('the trace worker did not answer') from None
+                if msg[0] == 'closed':
+                    raise ProbeError(self.error or 'the trace worker has ended')
+                if msg[0] == reply:
+                    return msg
+
+    def reselect(self, signals: list[Signal]) -> SignalStore:
+        """Rebuild every series for a new selection from the worker's event log."""
+        return self.request(('select', signals), 'store')[1]
+
+    def close(self, timeout: float = 5.0) -> None:
+        self.send(('close',))
+        self.proc.join(timeout)
+        if self.proc.is_alive() and hasattr(self.proc, 'terminate'):
+            self.proc.terminate()
+            self.proc.join(2)
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
 # -- live ---------------------------------------------------------------------
 
 class LiveSession:
     MAX_BACKLOG = 8 << 20          # bytes queued before the live view skips ahead
+    LOG_LIMIT = 6_000_000          # events kept for re-selection (~35 bytes each)
 
-    def __init__(self, probe: Probe, config: dict, signals: list[Signal], out_path: str):
+    def __init__(self, probe: Probe, config: dict, signals: list[Signal], out_path: str,
+                 in_process: bool = False):
         self.probe = probe
         self.request = config
         self.signals = signals
         self.out_path = out_path
+        self.in_process = in_process
         self.stats = SessionStats()
-        self.error: str | None = None
+        self._error: str | None = None
         self.config: dict = {}
-        self.pipe: _Pipeline | None = None
-        self._q: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
-        self._rx_done = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self._ws = None
-        self._file = None
+        self.pipe: _Remote | None = None
         self.running = False
-        self.lock = threading.Lock()
+        self._poller: threading.Thread | None = None
+
+    @property
+    def error(self) -> str | None:
+        return self._error or (self.pipe.error if self.pipe else None)
+
+    @error.setter
+    def error(self, value: str | None) -> None:
+        self._error = value
 
     @property
     def store(self) -> SignalStore | None:
         return self.pipe.store if self.pipe else None
 
     def start(self) -> None:
-        import websocket
+        from . import worker
         applied = self.probe.post_config(self.request)
         reply = self.probe.start()
         if not reply.startswith('started'):
             raise ProbeError('the probe did not start the trace: %s' % reply)
-        self.config = self.probe.config()
-        self.config.setdefault('slots', applied.get('slots', []))
-        self._file = open(self.out_path, 'wb')
-        write_header(self._file, self.config)
-        # ~35 bytes per event: 6 M events keep a re-selection cheap to hold.
-        self.pipe = _Pipeline(self.config, self.signals, log_limit=6_000_000)
-        hdr = {'Authorization': 'Basic ' + base64.b64encode(self.probe.auth.encode()).decode()}
         try:
-            self._ws = websocket.create_connection('ws://%s/ws/trace' % self.probe.host,
-                                                   header=hdr, timeout=1)
-        except Exception as e:
-            self._file.close()
+            self.config = self.probe.config()
+            self.config.setdefault('slots', applied.get('slots', []))
+            self.pipe = _Remote(worker.live_main,
+                                (self.probe.host, self.probe.auth, self.out_path, self.config,
+                                 self.signals, self.LOG_LIMIT, self.MAX_BACKLOG),
+                                self.in_process)
+            self.pipe.on_stats = self._on_stats
+            msg = self.pipe.wait_control(('ready',), timeout=30)
+            if msg[0] != 'ready':
+                raise ProbeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+        except Exception:
+            # Nothing records this trace: do not leave the probe running it.
             try:
                 self.probe.stop()
             except ProbeError:
                 pass
-            raise ProbeError('trace stream: %s' % e) from None
+            if self.pipe is not None:
+                self.pipe.close(timeout=2)
+            raise
         self.stats.started = time.monotonic()
         self.running = True
-        for fn, name in ((self._rx, 'trace-rx'), (self._decode, 'trace-decode'),
-                         (self._poll, 'trace-poll')):
-            t = threading.Thread(target=fn, name=name, daemon=True)
-            t.start()
-            self._threads.append(t)
+        self._poller = threading.Thread(target=self._poll, name='trace-poll', daemon=True)
+        self._poller.start()
 
-    def _rx(self) -> None:
-        import websocket
+    def _on_stats(self, d: dict) -> None:
         st = self.stats
-        idle_since = None
-        last = time.monotonic()
-        window = 0
-        try:
-            while True:
-                if self._stop.is_set():
-                    if idle_since is None:
-                        idle_since = time.monotonic()
-                    elif time.monotonic() - idle_since > 1.5:
-                        break               # the stream has gone quiet after stop
-                try:
-                    frame = self._ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    frame = None
-                except (websocket.WebSocketConnectionClosedException, OSError):
-                    if not self._stop.is_set():
-                        self.error = 'the probe closed the trace stream'
-                    break
-                now = time.monotonic()
-                if frame and not isinstance(frame, str):
-                    self._file.write(frame)
-                    st.bytes += len(frame)
-                    st.frames += 1
-                    window += len(frame)
-                    st.backlog += len(frame)
-                    self._q.put(frame)
-                    idle_since = None if not self._stop.is_set() else now
-                if now - last >= 0.5:
-                    st.rate = 0.6 * st.rate + 0.4 * window / (now - last)
-                    window = 0
-                    last = now
-        except Exception as e:                           # keep the file consistent
-            self.error = 'receiver: %s' % e
-        finally:
-            try:
-                self._file.flush()
-            except (OSError, ValueError):
-                pass
-            self._rx_done.set()
-            self._q.put(None)
-
-    def _decode(self) -> None:
-        rs = RecordStream()
-        st = self.stats
-        pipe = self.pipe
-        skip_gap = False
-        try:
-            while True:
-                item = self._q.get()
-                if item is None:
-                    break
-                st.backlog -= len(item)
-                if st.backlog > self.MAX_BACKLOG:
-                    # Behind: drop what is queued from the live view (the file
-                    # has it) and restart the decoder at the next record.
-                    dropped = 0
-                    while True:
-                        try:
-                            nxt = self._q.get_nowait()
-                        except queue.Empty:
-                            break
-                        if nxt is None:
-                            self._q.put(None)
-                            break
-                        st.backlog -= len(nxt)
-                        dropped += len(nxt)
-                    st.decode_skipped += dropped // 1048
-                    rs = RecordStream()
-                    skip_gap = True
-                    continue
-                recs = rs.feed(item)
-                if recs:
-                    for r in recs:
-                        st.probe_lost += r.lost
-                    pipe.records_in(recs, forced_gap=skip_gap)
-                    skip_gap = False
-                    st.records = pipe.records
-        except Exception as e:
-            self.error = 'decoder: %s' % e
+        st.bytes, st.frames, st.records = d['bytes'], d['frames'], d['records']
+        st.probe_lost, st.decode_skipped = d['probe_lost'], d['decode_skipped']
+        st.backlog, st.rate = d['backlog'], d['rate']
 
     def _poll(self) -> None:
-        while not self._rx_done.wait(1.0):
+        while self.pipe is not None and not self.pipe.done.wait(1.0):
             try:
                 cfg = self.probe.config()
                 self.stats.probe = cfg.get('stats', {})
@@ -411,40 +499,39 @@ class LiveSession:
         """Stop the trace on the probe, collect the tail, close everything."""
         if not self.running:
             return
-        self._stop.set()
         try:
             self.probe.stop()
         except ProbeError as e:
-            self.error = self.error or str(e)
-        self._rx_done.wait(timeout)
-        for t in self._threads:
-            t.join(timeout=10)
-        try:
-            self._ws.close()
-        except Exception:
-            pass
-        try:
-            self._file.close()
-        except (OSError, ValueError):
-            pass
+            self._error = self._error or str(e)
+        self.pipe.send(('stop',))
+        if not self.pipe.done.wait(timeout):
+            self._error = self._error or 'the trace worker did not finish'
         self.running = False
+        # The worker stays for re-selections until close().
 
     def abort(self) -> None:
         """Close without collecting the tail (the app is exiting)."""
-        self._stop.set()
-        try:
-            self._ws.close()
-        except Exception:
-            pass
+        if self.pipe is not None:
+            self.pipe.send(('abort',))
+            self.pipe.close(timeout=3)
+        self.running = False
+
+    def close(self, timeout: float = 90.0) -> None:
+        """End the session and its worker (stopping the trace if it runs)."""
+        if self.running:
+            self.stop(timeout)
+        if self.pipe is not None:
+            self.pipe.close()
 
 
 # -- offline ------------------------------------------------------------------
 
 class FileSession:
-    def __init__(self, path: str):
+    def __init__(self, path: str, in_process: bool = False):
         self.path = path
+        self.in_process = in_process
         self.config: dict = {}
-        self.pipe: _Pipeline | None = None
+        self.pipe: _Remote | None = None
         self.stats = SessionStats()
 
     @property
@@ -452,18 +539,23 @@ class FileSession:
         return self.pipe.store if self.pipe else None
 
     def load(self, signals: list[Signal], progress=None) -> None:
-        config, stream = capfile.read_file(self.path)
-        self.config = config
-        self.pipe = _Pipeline(config, signals)
-        recs = list(capfile.records(stream))
-        n = len(recs)
-        legacy = not any(r.final for r in recs)   # files from before the FINAL flag
-        for i in range(0, n, 64):
-            batch = recs[i:i + 64]
-            for r in batch:
-                self.stats.probe_lost += r.lost
-            self.pipe.records_in(batch, last_is_final=legacy and i + 64 >= n)
-            if progress:
-                progress(min(1.0, (i + 64) / max(1, n)))
-        self.stats.records = n
-        self.stats.bytes = len(stream)
+        from . import worker
+        self.pipe = _Remote(worker.file_main, (self.path, signals), self.in_process)
+        self.pipe.on_progress = progress
+        msg = self.pipe.wait_control(('config',), timeout=300)
+        if msg[0] != 'config':
+            self.close()
+            raise RuntimeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+        self.config = msg[1]
+        msg = self.pipe.wait_control(('loaded',))
+        if msg[0] != 'loaded':
+            self.close()
+            raise RuntimeError(msg[1] if len(msg) > 1 else 'the trace worker ended')
+        st = msg[1]
+        self.stats.records = st['records']
+        self.stats.bytes = st['bytes']
+        self.stats.probe_lost = st['probe_lost']
+
+    def close(self) -> None:
+        if self.pipe is not None:
+            self.pipe.close()

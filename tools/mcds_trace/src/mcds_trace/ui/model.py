@@ -252,7 +252,10 @@ class Workspace:
         slots = plan.slots(c.access, names)
         for j, s in enumerate(slots):
             f = c.filters[j] if j < len(c.filters) else SlotFilter()
-            if s.get('enabled') and f.enabled:
+            # Only where the Capture tab offers it: a slot of one signal, in
+            # full mode.  A filter left from another layout must not act.
+            single = j < len(plan.signals) and len(plan.signals[j]) == 1
+            if s.get('enabled') and f.enabled and single and c.mode == 'full':
                 s['value'] = {'enabled': True, 'lo': '0x%X' % (f.lo & 0xFFFFFFFF),
                               'hi': '0x%X' % (f.hi & 0xFFFFFFFF), 'mask': '0x%X' % f.mask,
                               'signed': f.signed}
@@ -310,6 +313,14 @@ class Workspace:
                 node = elfsyms.resolve_path(table.variables, sid)
                 if node is not None and node.is_leaf:
                     sig = leaf_signal(node)
+            elif sd.get('addr') is not None and sd.get('size'):
+                # No ELF yet: keep it by its saved address (plain unsigned
+                # until an ELF resolves it again).
+                try:
+                    sig = Signal(sid, sd.get('label') or sid, int(str(sd['addr']), 0),
+                                 int(sd['size']))
+                except (TypeError, ValueError):
+                    sig = None
             if sig is None:
                 missing.append(sid)
                 continue

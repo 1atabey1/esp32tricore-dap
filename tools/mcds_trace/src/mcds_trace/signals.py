@@ -201,6 +201,18 @@ class SignalStore:
             t, v = s.view()
             return t.copy(), v.copy()
 
+    def window(self, sid: str, x0: float, x1: float) -> tuple[np.ndarray, np.ndarray]:
+        """Copies of the samples in [x0, x1] plus one on each side (a step plot
+        holds the one before; lines run to the one after)."""
+        with self.lock:
+            s = self.series.get(sid)
+            if s is None:
+                return np.empty(0), np.empty(0)
+            t, v = s.view()
+            i0 = max(int(np.searchsorted(t, x0, side='left')) - 1, 0)
+            i1 = min(int(np.searchsorted(t, x1, side='right')) + 1, len(t))
+            return t[i0:i1].copy(), v[i0:i1].copy()
+
     def span(self) -> tuple[float, float]:
         with self.lock:
             lo = min((s._t[0] for s in self.series.values() if s.n), default=0.0)

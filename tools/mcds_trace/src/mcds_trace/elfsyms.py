@@ -126,16 +126,23 @@ class Node:
         return out
 
     def leaves(self, max_leaves: int = 100000) -> Iterator['Node']:
-        """Every traceable leaf below this node, depth first."""
-        stack = [self]
+        """Every traceable leaf below this node, depth first.  Children are
+        made a chunk at a time, so a huge array costs only what is taken."""
+        stack = [iter((self,))]
         n = 0
         while stack and n < max_leaves:
-            node = stack.pop()
-            if node.is_leaf:
+            node = next(stack[-1], None)
+            if node is None:
+                stack.pop()
+            elif node.is_leaf:
                 n += 1
                 yield node
             elif node.expandable:
-                stack.extend(reversed(node.children()))
+                stack.append(node._iter_children())
+
+    def _iter_children(self, chunk: int = 256) -> Iterator['Node']:
+        for start in range(0, self.child_count(), chunk):
+            yield from self.children(start, chunk)
 
 
 def node_of(var: Variable) -> Node:
