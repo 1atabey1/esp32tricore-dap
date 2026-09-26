@@ -23,7 +23,8 @@ extern "C" {
 #define DAP_TRACE_MAGIC 0x50525444u   /* "DTRP" */
 
 enum {
-    DAP_TRACE_FLAG_GAP = 1u << 0,     /* paragraphs were lost before this one */
+    DAP_TRACE_FLAG_GAP   = 1u << 0,   /* paragraphs were lost before this one */
+    DAP_TRACE_FLAG_FINAL = 1u << 1,   /* the last paragraph of a session (may be partial) */
 };
 
 typedef struct {

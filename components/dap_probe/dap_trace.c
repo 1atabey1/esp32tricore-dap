@@ -9,7 +9,6 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "DAP_TRACE";
@@ -46,11 +45,17 @@ static const char *TAG = "DAP_TRACE";
 /* FIFOOVRCNT only feeds a statistic; read it every n-th poll. */
 #define TRACE_OVRCNT_EVERY  16u
 
+/*
+ * Single producer (the drain task, core 0), single consumer (the stream sender,
+ * core 1): each index is written by one side only and published with release
+ * semantics after the copy, so neither side ever waits for the other.  A lock
+ * here stalled the drain whenever WiFi preempted the sender inside its copy,
+ * long enough for the writer to lap the 8 kB TRAM.
+ */
 static uint8_t          *s_ring;
 static size_t            s_ring_bytes;
-static size_t            s_ring_head;      /* next write */
-static size_t            s_ring_tail;      /* next read */
-static SemaphoreHandle_t s_lock;
+static size_t            s_ring_head;      /* next write; the drain's */
+static size_t            s_ring_tail;      /* next read; the sender's */
 
 static bool     s_running;
 static uint32_t s_bot, s_top;              /* FIFO bounds, byte offsets */
@@ -66,9 +71,9 @@ static void trace_task(void *arg);
 
 static size_t ring_used(void)
 {
-    return (s_ring_head >= s_ring_tail)
-         ? (s_ring_head - s_ring_tail)
-         : (TRACE_RING_BYTES - s_ring_tail + s_ring_head);
+    const size_t head = __atomic_load_n(&s_ring_head, __ATOMIC_ACQUIRE);
+    const size_t tail = __atomic_load_n(&s_ring_tail, __ATOMIC_ACQUIRE);
+    return (head >= tail) ? (head - tail) : (TRACE_RING_BYTES - tail + head);
 }
 
 static size_t ring_free(void)
@@ -77,38 +82,48 @@ static size_t ring_free(void)
     return TRACE_RING_BYTES - 1u - ring_used();
 }
 
-static void ring_put(const uint8_t *src, size_t len)
+/* Producer side only; the caller has checked ring_free(). */
+static void ring_put(size_t *head, const uint8_t *src, size_t len)
 {
-    const size_t first = (len < TRACE_RING_BYTES - s_ring_head)
-                       ? len : TRACE_RING_BYTES - s_ring_head;
-    memcpy(s_ring + s_ring_head, src, first);
+    const size_t first = (len < TRACE_RING_BYTES - *head) ? len : TRACE_RING_BYTES - *head;
+    memcpy(s_ring + *head, src, first);
     memcpy(s_ring, src + first, len - first);
-    s_ring_head = (s_ring_head + len) % TRACE_RING_BYTES;
+    *head = (*head + len) % TRACE_RING_BYTES;
 }
 
 /* Publish one paragraph, or drop it whole (and count it) if the ring is full. */
+static void publish_flags(uint32_t par_index, const uint32_t *words, uint32_t lost,
+                          uint16_t extra);
+
 static void publish(uint32_t par_index, const uint32_t *words, uint32_t lost)
+{
+    publish_flags(par_index, words, lost, 0);
+}
+
+static void publish_flags(uint32_t par_index, const uint32_t *words, uint32_t lost,
+                          uint16_t extra)
 {
     const dap_trace_record_t hdr = {
         .magic       = DAP_TRACE_MAGIC,
         .seq         = s_seq++,
         .tram_offset = s_bot + par_index * TRACE_PARAGRAPH,
         .length      = (uint16_t)TRACE_PARAGRAPH,
-        .flags       = (uint16_t)(lost ? DAP_TRACE_FLAG_GAP : 0u),
+        .flags       = (uint16_t)((lost ? DAP_TRACE_FLAG_GAP : 0u) | extra),
         .lost        = lost,
     };
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     if (ring_free() >= sizeof(hdr) + TRACE_PARAGRAPH) {
-        ring_put((const uint8_t *)&hdr, sizeof(hdr));
-        ring_put((const uint8_t *)words, TRACE_PARAGRAPH);
+        size_t head = s_ring_head;
+        ring_put(&head, (const uint8_t *)&hdr, sizeof(hdr));
+        ring_put(&head, (const uint8_t *)words, TRACE_PARAGRAPH);
+        /* The record becomes visible to the sender whole, after its bytes. */
+        __atomic_store_n(&s_ring_head, head, __ATOMIC_RELEASE);
         s_stats.paragraphs++;
         s_stats.bytes += TRACE_PARAGRAPH;
     } else {
         s_stats.queue_dropped += TRACE_PARAGRAPH;
     }
     s_stats.queue_free = (uint32_t)ring_free();
-    xSemaphoreGive(s_lock);
 }
 
 /* dap_trace_start() without the drain task, so the self-test can poll from its
@@ -145,12 +160,6 @@ static esp_err_t trace_begin(void)
         }
         if (s_ring == NULL) {
             ESP_LOGE(TAG, "no room for a %u byte ring", (unsigned)s_ring_bytes);
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
-        if (s_lock == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -232,7 +241,8 @@ esp_err_t dap_trace_finish(void)
                             TRACE_WORDS_PER_PAR) != ESP_OK) {
         return ESP_ERR_TIMEOUT;
     }
-    publish(par, words, 0);
+    /* The one paragraph that may end early: <endoftrace> after the last message. */
+    publish_flags(par, words, 0, DAP_TRACE_FLAG_FINAL);
     s_stats.running = false;
     return ESP_OK;
 }
@@ -291,6 +301,12 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
      * right after each paragraph tells whether the writer tore it. */
     const uint32_t to_read = available;
     const uint32_t margin  = total_par - available;
+    /* How far the writer moved since `now`, accumulated from each FIFONOW
+     * read: one step between two reads is well under a lap, so the modulo is
+     * unambiguous there, but not over a whole pass (a fast source laps the
+     * 8 kB in about as long as a pass takes). */
+    uint32_t moved = 0;
+    uint32_t prev_par = now_par;
     uint32_t i = 0;
     if (to_read) {
         s_stats.passes++;
@@ -323,7 +339,8 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
 
             /* Torn if the writer reached this paragraph while it was read. */
             const uint32_t w_par = (((w & TRACE_PTR_MASK) - s_bot) % s_span) / TRACE_PARAGRAPH;
-            const uint32_t moved = (w_par + total_par - now_par) % total_par;
+            moved += (w_par + total_par - prev_par) % total_par;
+            prev_par = w_par;
             if (moved >= margin + i) {
                 const uint32_t n = to_read - i;
                 lost += n;
@@ -391,19 +408,18 @@ size_t dap_trace_read(uint8_t *out, size_t max)
 {
     size_t n = 0;
 
-    if (s_ring == NULL || s_lock == NULL) {
+    if (s_ring == NULL) {
         return 0;
     }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     const size_t used = ring_used();
+    const size_t tail = s_ring_tail;
     n = (used < max) ? used : max;
-    const size_t first = (n < TRACE_RING_BYTES - s_ring_tail)
-                       ? n : TRACE_RING_BYTES - s_ring_tail;
-    memcpy(out, s_ring + s_ring_tail, first);
+    const size_t first = (n < TRACE_RING_BYTES - tail) ? n : TRACE_RING_BYTES - tail;
+    memcpy(out, s_ring + tail, first);
     memcpy(out + first, s_ring, n - first);
-    s_ring_tail = (s_ring_tail + n) % TRACE_RING_BYTES;
+    /* Hand the space back only after the bytes are out. */
+    __atomic_store_n(&s_ring_tail, (tail + n) % TRACE_RING_BYTES, __ATOMIC_RELEASE);
     s_stats.queue_free = (uint32_t)ring_free();
-    xSemaphoreGive(s_lock);
     return n;
 }
 
