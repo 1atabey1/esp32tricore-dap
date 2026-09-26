@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TriCore data trace</title>
+<style>
+  :root {
+    --bg:#11141a; --panel:#191d26; --line:#272d3a; --ink:#e6e9ef;
+    --dim:#8b93a7; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb454; --bad:#ff5f56;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui, sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; font-weight:600; }
+  header a { color:var(--dim); text-decoration:none; font-size:13px; }
+  header a:hover { color:var(--accent); }
+  main { padding:20px; max-width:900px; }
+  h2 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px;
+       margin:22px 0 8px; font-weight:600; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:9px;
+          padding:12px 14px; margin-bottom:12px; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px; }
+  label { display:flex; flex-direction:column; gap:3px; color:var(--dim); font-size:12px; }
+  label.inline { flex-direction:row; align-items:center; gap:6px; color:var(--ink); font-size:13px; }
+  input, select { background:var(--bg); color:var(--ink); border:1px solid var(--line);
+                  border-radius:6px; padding:6px 8px; font:13px var(--mono); }
+  input.addr { width:130px; } input.num { width:110px; } input.name { width:150px; font-family:inherit; }
+  button { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+           border-radius:7px; padding:8px 15px; font-size:14px; cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.4; cursor:default; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#08121f; font-weight:600; }
+  button.stop { border-color:var(--bad); color:var(--bad); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; }
+  .cell { background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:9px 12px; }
+  .cell .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .cell .v { font-family:var(--mono); font-size:16px; margin-top:2px; }
+  .v.ok { color:var(--ok); } .v.warn { color:var(--warn); } .v.bad { color:var(--bad); }
+  #log { font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; color:var(--dim);
+         background:var(--panel); border:1px solid var(--line); border-radius:9px;
+         padding:11px 13px; max-height:200px; overflow:auto; }
+  .note { color:var(--dim); font-size:12.5px; max-width:75ch; }
+  .valbox { display:none; } .valbox.on { display:flex; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TriCore data trace</h1>
+  <span id="state" style="font-family:var(--mono);font-size:12px;color:var(--dim)">idle</span>
+  <a href="/">&larr; probe</a>
+  <a href="/trace.html">raw trace</a>
+</header>
+<main>
+  <h2>Source and mode</h2>
+  <div class="card">
+    <div class="row">
+      <label>Observe
+        <select id="source">
+          <option value="cpu">CPU pipeline (loads/stores it executes)</option>
+          <option value="memslave">CPU memory slave (DSPR/PSPR/DLMU, any master)</option>
+          <option value="lmu0">LMU0 slave</option>
+        </select></label>
+      <label>CPU
+        <select id="cpu"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
+      <label>Trace
+        <select id="mode">
+          <option value="full">Full trace (DTU: address/value of every access)</option>
+          <option value="compact">Compact watchpoint timestamping (WTU)</option>
+        </select></label>
+    </div>
+    <div class="row">
+      <label id="payload-l">Full trace records
+        <select id="payload">
+          <option value="addr_data">address + value</option>
+          <option value="data">value only</option>
+          <option value="addr">address only</option>
+        </select></label>
+      <label>Timestamps
+        <select id="timestamps">
+          <option value="hit">per hit (TSR, emulation clock)</option>
+          <option value="ticks">ticks (every cycle, heavy)</option>
+          <option value="none">none (one per 1 kB paragraph)</option>
+        </select></label>
+      <label>DAP clock
+        <select id="dap_div">
+          <option value="0">24 MHz</option><option value="1">12 MHz</option>
+          <option value="2">8 MHz</option><option value="5">4 MHz</option>
+        </select></label>
+      <label class="inline"><input type="checkbox" id="masters"> bus master in addresses</label>
+    </div>
+  </div>
+
+  <h2>Watched memory</h2>
+  <div id="slots"></div>
+  <p class="note">Two slots (one DTU comparator set each). A slot watches <i>size</i> bytes from
+    <i>address</i> as the selected source sees it; watch a whole struct with a larger size and the
+    decoder separates the variables by address. Cached (0x8…/0x9…) and uncached (0xA…/0xB…) aliases
+    are different addresses. The value filter compares the variable's value, after the mask,
+    against [low, high].</p>
+
+  <h2>Capture</h2>
+  <div class="row">
+    <button id="start" class="primary">Start → save to file…</button>
+    <button id="stop" class="stop" disabled>Stop</button>
+  </div>
+  <div class="grid">
+    <div class="cell"><div class="k">Received</div><div class="v" id="s-bytes">0</div></div>
+    <div class="cell"><div class="k">Rate</div><div class="v" id="s-rate">–</div></div>
+    <div class="cell"><div class="k">Paragraphs</div><div class="v" id="s-par">0</div></div>
+    <div class="cell"><div class="k">Lost</div><div class="v" id="s-lost">0</div></div>
+    <div class="cell"><div class="k">Overruns</div><div class="v" id="s-ovr">0</div></div>
+    <div class="cell"><div class="k">Emulation clock</div><div class="v" id="s-clk">–</div></div>
+  </div>
+  <h2>Log</h2>
+  <div id="log"></div>
+  <p class="note">Decode offline: <code>uv run mcds-trace decode FILE --plot</code>
+    (tools/mcds_trace). The file holds the configuration as a JSON header followed by the raw
+    TRAM paragraphs.</p>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const log = msg => { const l = $('log'); l.textContent += msg + '\n'; l.scrollTop = l.scrollHeight; };
+
+function slotHtml(j) {
+  return `<div class="card" id="slot${j}">
+    <div class="row">
+      <label class="inline"><input type="checkbox" id="en${j}" ${j === 0 ? 'checked' : ''}> slot ${j}</label>
+      <label>Name<input class="name" id="name${j}" placeholder="var${j}"></label>
+      <label>Address<input class="addr" id="addr${j}" placeholder="0x70001000"></label>
+      <label>Size (bytes)<input class="num" id="size${j}" value="4"></label>
+      <label>Access
+        <select id="acc${j}"><option value="w">write</option><option value="r">read</option>
+          <option value="rw">read + write</option></select></label>
+      <label class="inline"><input type="checkbox" id="ven${j}"> value filter</label>
+    </div>
+    <div class="row valbox" id="vbox${j}">
+      <label>Low<input class="num" id="vlo${j}" value="0"></label>
+      <label>High<input class="num" id="vhi${j}" value="0xFFFFFFFF"></label>
+      <label>Mask<input class="num" id="vmask${j}" value="0xFFFFFFFF"></label>
+      <label class="inline"><input type="checkbox" id="vsgn${j}"> signed</label>
+    </div></div>`;
+}
+$('slots').innerHTML = slotHtml(0) + slotHtml(1);
+for (const j of [0, 1]) {
+  $('ven' + j).onchange = () => $('vbox' + j).classList.toggle('on', $('ven' + j).checked);
+}
+$('mode').onchange = () => { $('payload-l').style.opacity = $('mode').value === 'full' ? 1 : .4; };
+
+function config() {
+  const slots = [0, 1].map(j => ({
+    enabled: $('en' + j).checked,
+    name: $('name' + j).value || ('var' + j),
+    addr: $('addr' + j).value.trim(),
+    size: parseInt($('size' + j).value, 0) || 4,
+    access: $('acc' + j).value,
+    value: { enabled: $('ven' + j).checked, lo: $('vlo' + j).value, hi: $('vhi' + j).value,
+             mask: $('vmask' + j).value, signed: $('vsgn' + j).checked },
+  }));
+  return { source: $('source').value, cpu: +$('cpu').value, mode: $('mode').value,
+           payload: $('payload').value, timestamps: $('timestamps').value,
+           masters: $('masters').checked, dap_div: +$('dap_div').value, slots };
+}
+
+function applyConfig(c) {
+  for (const k of ['source', 'mode', 'payload', 'timestamps']) if (c[k]) $(k).value = c[k];
+  if ('cpu' in c) $('cpu').value = c.cpu;
+  if ('dap_div' in c) $('dap_div').value = c.dap_div;
+  $('masters').checked = !!c.masters;
+  (c.slots || []).forEach((s, j) => {
+    $('en' + j).checked = s.enabled; $('name' + j).value = s.name || '';
+    $('addr' + j).value = s.addr || ''; $('size' + j).value = s.size;
+    $('acc' + j).value = s.access || 'w';
+    const v = s.value || {};
+    $('ven' + j).checked = !!v.enabled; $('vbox' + j).classList.toggle('on', !!v.enabled);
+    if (v.lo) $('vlo' + j).value = v.lo; if (v.hi) $('vhi' + j).value = v.hi;
+    if (v.mask) $('vmask' + j).value = v.mask; $('vsgn' + j).checked = !!v.signed;
+  });
+  $('mode').onchange();
+}
+
+let ws = null, writer = null, chunks = [], received = 0, t0 = 0, statTimer = null;
+
+async function openSink(name) {
+  if (window.showSaveFilePicker) {
+    const h = await showSaveFilePicker({ suggestedName: name,
+      types: [{ description: 'miniMCDS capture', accept: { 'application/octet-stream': ['.mcds'] } }] });
+    return await h.createWritable();
+  }
+  chunks = [];
+  return null;                                   // fall back to a download at the end
+}
+
+async function sinkWrite(buf) {
+  if (writer) await writer.write(buf); else chunks.push(buf);
+}
+
+function header(cfg) {
+  const json = new TextEncoder().encode(JSON.stringify(cfg));
+  const out = new Uint8Array(8 + 4 + json.length);
+  out.set(new TextEncoder().encode('MCDSCAP1'), 0);
+  new DataView(out.buffer).setUint32(8, json.length, true);
+  out.set(json, 12);
+  return out;
+}
+
+async function start() {
+  const cfg = config();
+  try {
+    // The picker needs the click's user activation: open it before any await.
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    writer = await openSink(`trace-${stamp}.mcds`);
+    const r = await fetch('/api/mcds/config', { method: 'POST', body: JSON.stringify(cfg) });
+    if (!r.ok) {
+      log('config rejected: ' + await r.text());
+      if (writer) await writer.close();
+      writer = null;
+      return;
+    }
+  } catch (e) { log('cancelled: ' + e.message); return; }
+
+  const r = await fetch('/api/mcds/start');
+  const txt = (await r.text()).trim();
+  log('start: ' + txt);
+  if (!r.ok) { if (writer) await writer.close(); writer = null; return; }
+
+  const applied = await (await fetch('/api/mcds/config')).json();
+  $('s-clk').textContent = applied.emu_hz ? (applied.emu_hz / 1e6).toFixed(2) + ' MHz' : '?';
+  await sinkWrite(header(applied));
+
+  received = 0; t0 = performance.now();
+  ws = new WebSocket(`ws://${location.host}/ws/trace`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = async ev => { received += ev.data.byteLength; await sinkWrite(new Uint8Array(ev.data)); };
+  ws.onclose = () => log('stream closed');
+  ws.onerror = () => log('websocket error');
+  $('start').disabled = true; $('stop').disabled = false;
+  $('state').textContent = 'tracing';
+  statTimer = setInterval(stats, 1000);
+}
+
+async function stop() {
+  $('stop').disabled = true;
+  log('stop: ' + (await (await fetch('/api/mcds/stop')).text()).trim());
+  // The probe's ring (up to 1 MB) is still in flight: wait until the stream is quiet.
+  for (let last = -1; last !== received; ) {
+    last = received;
+    await new Promise(res => setTimeout(res, 1500));
+  }
+  if (ws) ws.close();
+  clearInterval(statTimer);
+  await stats();
+  if (writer) { await writer.close(); log('file written'); }
+  else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(chunks));
+    a.download = 'trace.mcds'; a.click();
+    log('download started');
+  }
+  writer = null; ws = null;
+  $('start').disabled = false; $('state').textContent = 'idle';
+}
+
+async function stats() {
+  const secs = (performance.now() - t0) / 1000;
+  $('s-bytes').textContent = (received / 1024).toFixed(0) + ' kB';
+  $('s-rate').textContent = secs > 0 ? (received / 1024 / secs).toFixed(0) + ' kB/s' : '–';
+  try {
+    const t = await (await fetch('/api/dap_trace/stats', { cache: 'no-store' })).text();
+    const kv = Object.fromEntries(t.trim().split(/\s+/).map(p => p.split('=')));
+    $('s-par').textContent = kv.paragraphs;
+    $('s-lost').textContent = kv.lost; $('s-lost').className = 'v ' + (+kv.lost ? 'bad' : 'ok');
+    $('s-ovr').textContent = kv.overruns; $('s-ovr').className = 'v ' + (+kv.overruns ? 'warn' : 'ok');
+  } catch (e) { /* stats are best effort */ }
+}
+
+$('start').onclick = start;
+$('stop').onclick = stop;
+fetch('/api/mcds/config').then(r => r.json()).then(applyConfig).catch(() => {});
+</script>
+</body>
+</html>

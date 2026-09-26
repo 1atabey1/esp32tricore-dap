@@ -66,10 +66,8 @@
   </div>
 
   <p class="note">
-    Takes an Intel HEX &mdash; the <code>.hex</code> beside the ELF, not the ELF
-    itself. Only program flash is written; UCBs, boot headers and data flash in
-    the file are counted and skipped, because a bad write to any of those is not
-    recoverable from here. The target is left halted when it finishes.
+    Takes an Intel HEX (<code>.hex</code>). Only flashes PFLASH, no UCB or DFLASH.
+    Every flash is a full erase & write, not differential.
   </p>
 
   <div class="bar"><i id="bar"></i></div>
@@ -131,6 +129,7 @@ el("start").onclick = async () => {
 };
 
 let wasRunning = false;
+let lastState = "idle";
 
 async function poll() {
   let kv;
@@ -166,10 +165,15 @@ async function poll() {
   el("bar").style.width = num("total")
     ? Math.round(100 * num("done") / num("total")) + "%" : "0";
 
+  if (lastState != kv.phase) {
+    log("Now in state: " + kv.phase);
+    lastState = kv.phase;
+  }
+
   if (wasRunning && !running) {
     log(kv.phase + ": " + (kv.message || ""));
     if (kv.phase === "done") {
-      log("elapsed " + (num("ms") / 1000).toFixed(1) + " s; the target is halted");
+      log("elapsed " + (num("ms") / 1000).toFixed(1) + " s");
     }
     el("start").disabled = false;
   }

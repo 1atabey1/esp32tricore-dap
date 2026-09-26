@@ -1,19 +1,15 @@
 /*
- * DAP master top level: register map, sequencer, reply FIFO.
+ * DAP master top level: register map, sequencer, reply and write FIFOs.
  *
- * The reason this exists in fabric at all is the block read.  On the ESP32 the
- * cost of a 1 kB block is 256 parcels, each one a start-bit hunt and 32 clocks
- * driven by software; that path was measured at 453 kB/s and the limit was the
- * per-bit loop, not the wire.  Here the host writes a command, sets a parcel
- * count, and reads the answer back as one DMA burst - the fabric issues every
- * parcel itself and the host is not in the loop at all.
+ * The host writes a command and a parcel count; the fabric issues every parcel
+ * of a block read or write itself, and the data moves as one SPI burst.
  *
- * Register map.  Byte wide, because the SPI transport is byte wide, and
- * little-endian for multi-byte fields to match the host.
+ * Register map.  Byte wide, multi-byte fields little-endian.
  *
  *   0x00 STATUS   ro  0 busy, 1 done, 2 timed_out, 3 idle_high, 4 crc_ok,
- *                     5 fifo_empty, 6 fifo_full, 7 overrun
- *   0x01 CTRL     wo  0 start frame, 1 start block read, 2 abort,
+ *                     5 fifo_empty, 6 fifo_full, 7 overrun (aborted on a full FIFO)
+ *   0x01 CTRL     wo  0 start frame, 1 start block read (queued if busy),
+ *                     2 abort a block stalled on its FIFO (and drop a queued start),
  *                     3 clear reply fifo, 4 start block write,
  *                     5 clear write fifo
  *   0x02 DIV      rw  bit period = 2*(DIV+1) fabric clocks
@@ -29,39 +25,24 @@
  *                     3 raw frame (DATA is the whole frame, DBITS its length),
  *                     5 receive wide without driving DAP2
  *   0x0C LEAD     rw  idle clocks before each frame
- *   0x0D LEVEL    ro  16-bit bytes waiting in the FIFO, low byte first
+ *   0x0D LEVEL    ro  12-bit bytes waiting in the FIFO, low byte first;
+ *                     0x0E bit 4: a block start is queued (chaining)
  *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
  *   0x10 DATA     rw  64-bit frame payload, low byte first
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
  *   0x25 WAIT     ro  16-bit busy cycle count, low byte first
  *   0x27 ALIGN    ro  0 DAP2 carried the start bit too (wide mode alignment)
- *                     1/2 DAP2 seen low/high while we were transmitting,
- *                     3/4 DAP2 seen low/high while the target had the lines,
- *                     5/6 DAP1 seen low/high while the target had the lines
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
  *   0x43 WLEVEL   ro  16-bit bytes waiting in the write FIFO, low byte first
  *   0x48 WFIFO    wo  pushes one byte; does not auto-increment
- *
- * Everything the device turned out to be fussy about is a register rather than
- * a constant - DIV, TRAIL, MAXWAIT - because every one of those was settled on
- * hardware by sweeping it, and the next person will have to sweep them again
- * against a different target.
  */
 
 `default_nettype none
 
 module dap_top #(
     parameter integer FIFO_DEPTH  = 1088,  /* 1 kB block plus headroom */
-    /*
-     * Half a block.
-     *
-     * A whole one would be 1 kB, and it buys nothing: Q_WFETCH stalls when the
-     * FIFO is empty rather than failing, so the host refills mid-block exactly
-     * as it drains the reply FIFO mid-block in the other direction.  What the
-     * extra kilobyte does buy is memory pressure - two full FIFOs put this
-     * design's critical path into the reply FIFO's own address decode.
-     */
+    /* Half a block: Q_WFETCH stalls on empty, so the host refills mid-block. */
     parameter integer WFIFO_DEPTH = 512
 ) (
     input  wire clk,
@@ -77,8 +58,7 @@ module dap_top #(
     output wire dap0,
     inout  wire dap1,
     output reg  trst,
-    /* Bidirectional in wide mode and an input otherwise: a line the design is
-     * not using is better left undriven than held at a level. */
+    /* Driven only while sending a wide frame; an input otherwise. */
     inout  wire dap2
 );
     /* ------------------------------------------------------------------ */
@@ -97,45 +77,16 @@ module dap_top #(
     reg [63:0] r_data;
     reg        r_no_hunt = 1'b0;  /* FLAGS bit 1: keep the whole reply window */
     reg        r_wide    = 1'b0;  /* FLAGS bit 2: two bits per DAP0 clock */
-    /*
-     * FLAGS bit 3: DATA is the finished frame, not its payload.
-     *
-     * The wide framing rule is not documented anywhere this project can reach,
-     * and the reconstruction it was built from - per-field padding, covered by
-     * the CRC - is rejected by the device.  Rebuilding the bitstream for each
-     * guess is a twenty-minute loop; assembling candidate frames on the host is
-     * a one-second loop.  So the fabric stops having an opinion about framing
-     * and the host holds it instead.
-     */
+    /* FLAGS bit 3: DATA is the finished frame; the host does the framing. */
     reg        r_raw     = 1'b0;
     /*
-     * FLAGS bit 5: sample both lines, drive only DAP1.
-     *
-     * Looking at what DAP2 is doing must not mean driving it.  While the
-     * target has that pin configured as a push-pull output - which it does, by
-     * default, because in two-pin mode DAP2 is an ordinary port pin the
-     * application owns - a wide transmission from this end puts two drivers on
-     * one net through a 22 ohm series resistor.  That is about 150 mA, and
-     * sixty-four frames of it browned the board out into a boot loop.
-     *
-     * With this bit the receiver deinterleaves both lines and the transmitter
-     * stays narrow, so DAP2 is only ever read.  It is what the wiring probe
-     * uses, and it is safe against a target that has not yet handed the pin
-     * over.
+     * FLAGS bit 5: sample both lines, drive only DAP1.  Safe while the target
+     * still drives DAP2 as a port pin; driving it then would short two outputs.
      */
     reg        r_rx_wide = 1'b0;
     /*
-     * Per-line capture tap, in fabric clocks back from the sample instant.
-     *
-     * Wide mode needs this and narrow mode does not: the silicon does not
-     * guarantee DAP1 and DAP2 leave the pads together, and at a divider of 0 a
-     * bit period is two fabric clocks, so a skew of one clock between the lines
-     * is half a bit.  A tap per line lets the host sweep the two independently
-     * and keep whichever pair reads sync's 0xAAAAAAAA back correctly - which is
-     * a measurement, not a guess about the board.
-     *
-     * Zero on both is the narrow-mode behaviour exactly, so this costs nothing
-     * until it is used.
+     * Per-line capture tap, in fabric clocks, for wide mode where DAP1 and DAP2
+     * may be skewed.  Zero on both is the narrow-mode behaviour.
      */
     reg [1:0]  r_skew1   = 2'd0;
     reg [1:0]  r_skew2   = 2'd0;
@@ -147,16 +98,7 @@ module dap_top #(
     /* Wide mode only: did the reply's start bit appear on DAP2 as well. */
     reg        s_aligned;
 
-
-    /*
-     * "The sequencer is running", as a flip-flop rather than a compare.
-     *
-     * STATUS bit 0 was `q != Q_IDLE` written inline, which puts a three-bit
-     * compare on the input of the read mux - and that mux is the design's
-     * critical path now that the frame engines are not.  One cycle stale is
-     * harmless: the host reads this over SPI, which is slower than the fabric
-     * by more than an order of magnitude.
-     */
+    /* Registered busy flag, kept off the read mux's critical path. */
     reg        s_busy;
 
     /* ------------------------------------------------------------------ */
@@ -168,10 +110,7 @@ module dap_top #(
     wire       reg_we, reg_re, reg_consume;
     reg        reg_re_d, reg_re_d2, reg_re_d3;
     reg  [7:0] reg_rdata;
-    /* First pipeline stage of the read: each address group's byte, plus which
-     * group the address is in.  The control group's sixteen bytes are the one
-     * mux too deep to build in a single cycle, so it arrives as two halves and
-     * is chosen from in the second stage. */
+    /* Read pipeline: per-group bytes, the control group split in two halves. */
     reg  [7:0] q_ctrl_lo, q_ctrl_hi;
     reg  [7:0] q_ctrl, q_dat, q_rep, q_fifo;
     reg  [7:0] q_dat_d, q_rep_d, q_fifo_d;
@@ -195,14 +134,11 @@ module dap_top #(
     reg [7:0]  fifo_mem [0:FIFO_DEPTH-1];
     reg [11:0] fifo_wr, fifo_rd;
     reg [11:0] fifo_count;
-    /*
-     * Registered rather than compared combinationally.  A 12-bit magnitude
-     * compare against the depth sits in the middle of the sequencer's decisions
-     * and is the sort of thing that quietly sets the whole design's clock
-     * ceiling; a flip-flop updated alongside the counter costs nothing.
-     */
+    /* Registered flags, updated alongside the counter. */
     reg        fifo_empty = 1'b1;
     reg        fifo_full  = 1'b0;
+    /* Space for a whole parcel with a cycle of slack (the sequencer's gate). */
+    reg        fifo_room  = 1'b1;
 
     reg        fifo_push;
     reg [7:0]  fifo_din;
@@ -212,20 +148,7 @@ module dap_top #(
     /* Write FIFO                                                          */
     /* ------------------------------------------------------------------ */
 
-    /*
-     * The other direction, and the reason flashing is worth doing from here.
-     *
-     * client_blockwrite streams 32-bit parcels to the device, each acknowledged
-     * with a single start bit - about six DAP0 clocks of overhead per word.
-     * Driven a word at a time from the host that is two register-file round
-     * trips per word, and 700 kB of firmware is 179 200 words, so the host
-     * overhead is the whole cost.  With the words in a FIFO the fabric issues
-     * every parcel itself and the host only has to keep the FIFO fed, which is
-     * one long SPI burst - the mirror image of what the reply FIFO does for a
-     * block read.
-     *
-     * One block is 256 words, so 1 kB holds a whole one.
-     */
+    /* Words for a block write, streamed out by the sequencer as parcels. */
     reg [7:0]  wfifo_mem [0:WFIFO_DEPTH-1];
     reg [11:0] wfifo_wr, wfifo_rd;
     reg [11:0] wfifo_count;
@@ -238,23 +161,8 @@ module dap_top #(
     wire       wfifo_push = reg_we && (reg_addr == 7'h48) && !wfifo_full;
 
     /*
-     * Popped combinationally, for the same reason the reply FIFO is.
-     *
-     * wfifo_head is a register loaded from wfifo_mem[wfifo_rd], so it trails the
-     * read pointer by a cycle.  A *registered* pop adds a second cycle before
-     * the pointer even moves, and then one idle cycle is not enough for the
-     * head to catch up - the fetch reads the same byte twice and the word goes
-     * out shifted by a byte, which is exactly what the first version of this
-     * did.  Driven from the state directly, the pointer moves at the end of the
-     * cycle the byte is taken in and one idle cycle is right again.
-     */
-    /*
-     * "Take a byte now", as one three-input term.
-     *
-     * Both the pop and the idle flag are this same condition, and writing it
-     * once means the flag's next state is a single AND rather than a chain
-     * through the state decode, the FIFO's empty flag and the mode - which is
-     * what it was, and it was the critical path.
+     * Pop combinationally from the state.  wfifo_head trails wfifo_rd by one
+     * cycle, so a byte may be taken at most every other cycle.
      */
     wire       wfetch_go = (q == Q_WFETCH) && !wfetch_wait && !wfifo_empty;
     wire       wfifo_pop = wfetch_go;
@@ -298,20 +206,8 @@ module dap_top #(
     end
 
     /*
-     * Popped the moment the byte is shifted out, combinationally rather than a
-     * cycle later.
-     *
-     * The read of the *next* byte is pipelined and latches two cycles after
-     * the fetch, so a pop that took an extra cycle to register would leave the
-     * old head in place when that latch happened and send the same byte twice.
-     * The address does not auto-increment at the port, so reg_addr still reads
-     * 0x40 here.
-     */
-    /*
-     * The port-address test is registered.  Comparing reg_addr here put a
-     * seven-bit compare in front of the FIFO's read address, and the address
-     * does not move during a drain anyway - it is the one register that does
-     * not auto-increment, so a cycle-old answer is the same answer.
+     * Reply FIFO pops as the byte is shifted out.  The port test is registered;
+     * 0x40 does not auto-increment, so a cycle-old answer is the same answer.
      */
     reg        at_port;
     always @(posedge clk) begin
@@ -321,24 +217,8 @@ module dap_top #(
     wire       fifo_pop = reg_consume && at_port;
 
     /*
-     * The byte at the read pointer, kept in a register.
-     *
-     * The FIFO port read used to be a memory lookup inside the register
-     * decode - so a host read of 0x40 was a RAM access, the empty-flag mux and
-     * the whole address decoder in one clock, and that became the critical
-     * path once the enable chains and the payload mux were dealt with.  Read
-     * ahead every cycle instead and the decode sees a flip-flop.
-     *
-     * Re-read unconditionally rather than only when the pointer moves: a push
-     * into an empty FIFO changes the byte under a stationary read pointer, and
-     * an update conditioned on the pointer would miss it.
-     */
-    /*
-     * The incremented read pointer is carried in a register rather than
-     * computed here.  As an inline `fifo_rd + 1` it is a twelve-bit carry
-     * chain sitting in front of the FIFO's read address, and that chain became
-     * the critical path; maintained alongside the pointer it costs twelve
-     * flip-flops and leaves a plain two-way mux.
+     * The byte at the read pointer, re-read every cycle so a push into an empty
+     * FIFO is seen.  fifo_rd_p1 keeps the increment out of the read address path.
      */
     reg  [11:0] fifo_rd_p1;
     wire [11:0] fifo_rd_next = (fifo_pop && !fifo_empty) ? fifo_rd_p1 : fifo_rd;
@@ -349,6 +229,7 @@ module dap_top #(
     end
 
     always @(posedge clk) begin
+        fifo_room <= (fifo_count < FIFO_DEPTH - 8);
         if (rst || fifo_clear) begin
             fifo_wr    <= 12'd0;
             fifo_rd    <= 12'd0;
@@ -398,59 +279,29 @@ module dap_top #(
     reg [6:0]   rx_bits;
     reg         rx_expect_crc;
 
-    /* dap1 is bidirectional: driven while either engine claims it, released to
-     * the target otherwise.  One of the two is always idle, so the mux is safe
-     * rather than a race. */
+    /* dap1 is driven while either engine claims it; only one is ever busy. */
     wire dap1_in;
-    wire drive    = tx_busy ? tx_oe : rx_oe;
+    /*
+     * Between the parcels of a block the device keeps driving DAP1, and with
+     * flow control that gap can last; the receiver's idle "take the line
+     * back" must not fight it there.
+     */
+    wire block_gap = is_block && (q == Q_PARCEL || q == Q_STORE);
+    wire drive    = tx_busy ? tx_oe : (rx_oe && !block_gap);
     wire dap1_out = tx_dap1;
 
     assign dap1 = drive ? dap1_out : 1'bz;
 
     /*
-     * Synchronise the target's data before looking at it.
-     *
-     * DAP1 is driven by the target against its own clock domain - our DAP0
-     * paces it, but the pad still changes asynchronously to this fabric clock -
-     * so sampling the pad combinationally is a metastability hazard as well as
-     * a long route: place and route put that path across the whole chip and it
-     * set the design's clock ceiling on its own.
-     *
-     * The cost is two fabric clocks of delay on the sample point, about 42 ns
-     * at 48 MHz, against a bit period of 500 ns at the default divider.  That
-     * is inside the window where the target holds the bit, so it moves where we
-     * look rather than what we see.
-     */
-    /*
-     * Two stages of synchroniser and two more of adjustable delay.
-     *
-     * The first two are the metastability guard and are not optional.  The
-     * extra taps are the per-line capture calibration: r_skew names how many
-     * further clocks back the bit is taken from, so 0 is exactly what narrow
-     * mode always did and 1..3 walk the sample later into the bit.  Delaying
-     * the *sample* rather than advancing the clock is what keeps this out of
-     * the timing path - it is a shift register and a four-way mux on one bit,
-     * nowhere near the frame engines.
+     * Input synchronisers plus per-line capture tap.  Tap 0 is two clocks of
+     * delay (narrow-mode timing); taps 1..3 sample one clock later each.  The
+     * tap mux is registered to keep it off the start-bit hunt path.
      */
     reg [3:0] dap1_sync, dap2_sync;
     reg       dap1_tap,  dap2_tap;
     always @(posedge clk) begin
         dap1_sync <= {dap1_sync[2:0], dap1};
         dap2_sync <= {dap2_sync[2:0], dap2};
-        /*
-         * The tap choice is registered, not wired into the sample.
-         *
-         * As a plain mux on dap1_in it sat in front of the receiver's
-         * start-bit hunt, and that four-way choice on one bit became the
-         * design's critical path - about two megahertz of it.  Here it feeds
-         * nothing but a flip-flop's D input and has a whole clock to settle.
-         *
-         * Counting from dap1_sync[0] rather than [1] is what keeps tap 0
-         * identical to the two-flop synchroniser this replaced: one stage in
-         * the shift register plus this register is the same two clocks of
-         * delay narrow mode was tuned against.  Taps 1 to 3 walk the sample
-         * one clock later each.
-         */
         dap1_tap  <= dap1_sync[r_skew1];
         dap2_tap  <= dap2_sync[r_skew2];
     end
@@ -458,28 +309,15 @@ module dap_top #(
     wire   dap2_in = dap2_tap;
 
     assign dap0    = tx_busy ? tx_dap0 : rx_dap0;
-    /* DAP2 is an output only while a wide frame is being sent; the reply comes
-     * back on it and every other moment leaves it to the target. */
+    /* DAP2 is driven only while a wide frame is being sent. */
     assign dap2    = (tx_busy && tx_oe2) ? tx_dap2 : 1'bz;
 
     /*
-     * A block-write parcel is a start bit and thirty-two data bits, and nothing
-     * else: no CMD, no LEN, no CRC6 unless the command asked for per-parcel
-     * ones.  That is exactly what the raw-frame path already sends, so the
-     * sequencer borrows it rather than growing a second serialiser.
-     *
-     * And it borrows the frame registers too rather than muxing into the
-     * transmitter.  A mux there is sixty-three bits wide on the data alone,
-     * feeding the load path of every field register, and it cost about four
-     * megahertz.  The sequencer owns DATA, DBITS and the raw flag for the
-     * duration of a block instead - which does mean a block write leaves them
-     * holding the last parcel, so the host sets up the next command from
-     * scratch.  It does that anyway.
+     * A block-write parcel is a start bit and 32 data bits, sent through the
+     * raw-frame path.  The sequencer assembles it straight into DATA, so a block
+     * write leaves DATA, DBITS and FLAGS holding the last parcel.
      */
     wire        tx_parcel = (q == Q_WPARCEL);
-    /* Six bits and one bit: these cost nothing.  It is the sixty-three-bit
-     * data mux that cost four megahertz, and the parcel is assembled straight
-     * into DATA instead - see the register block. */
     wire [5:0]  tx_dbits  = tx_parcel ? 6'd33 : r_dbits;
 
     dap_frame_tx #(.DIV_WIDTH(8)) u_tx (
@@ -492,13 +330,17 @@ module dap_top #(
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
     );
 
+    /* Registered: the OR otherwise lands on the receiver's start path. */
+    reg rx_wide_any = 1'b0;
+    always @(posedge clk) rx_wide_any <= r_wide | r_rx_wide;
+
     dap_frame_rx #(.DIV_WIDTH(8)) u_rx (
         .clk (clk), .rst (rst), .div (r_div),
         .start (rx_start), .reply_bits (rx_bits),
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
-        .wide (r_wide | r_rx_wide),
+        .wide (rx_wide_any),
         .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
@@ -517,43 +359,47 @@ module dap_top #(
                      Q_PARCEL  = 4'd3,
                      Q_STORE   = 4'd4,
                      Q_DONE    = 4'd5,
-                     /* client_blockwrite: the command frame's acknowledge,
-                      * then a parcel and its acknowledge per word. */
+                     /* Block write: command ack, then parcel + ack per word. */
                      Q_WACK    = 4'd6,
                      Q_WFETCH  = 4'd7,
                      Q_WPARCEL = 4'd8;
 
-    reg [3:0] q;
+    /* One-hot: the state decode sits on the sequencer's critical paths. */
+    (* fsm_encoding = "one-hot" *) reg [3:0] q;
     reg       is_block;
     reg       is_bwrite;
     reg [8:0] parcels_left;
     reg [1:0] store_byte;
     reg [31:0] store_word;
 
-    /* How many bytes of the word being streamed have been taken from the
-     * write FIFO; the word itself is assembled in DATA. */
+    /* Bytes of the current block-write word taken from the write FIFO. */
     reg [1:0]  wbyte;
     reg        wfetch_wait;
-    /*
-     * "That was the last parcel", as a flip-flop.
-     *
-     * Written inline as `parcels_left == 0` it is a nine-bit compare ANDed with
-     * the mode flag and the receiver's timeout, and all of that lands in the
-     * clock enable of the status flags - which is the same shape of mistake the
-     * receiver's at_limit and the transmitter's nbits_last already have notes
-     * about, and it cost this design nine megahertz.  Updated alongside the
-     * counter, the enable is one bit again.
-     */
+    /* Registered "last parcel" flag, updated alongside the counter. */
     reg        wlast;
 
-    reg start_frame_req, start_block_req, start_bwrite_req;
+    reg start_frame_req, start_bwrite_req;
+    /* CTRL bit 2: leave a block stalled on a full reply or empty write FIFO. */
+    reg abort_req = 1'b0;
+
+    /*
+     * A block-read start written while the sequencer is busy is held and
+     * taken the moment it goes idle, so the host can queue the next block
+     * (frame registers loaded after this one began) and blocks run back to
+     * back with the FIFO drained continuously.  A failed block drops it.
+     */
+    reg  r_block_pend = 1'b0;
+    /* The host never mixes a queued block with another start. */
+    wire block_take   = (q == Q_IDLE) && r_block_pend;
+    wire block_cancel = (q == Q_DONE) && (s_timed_out || s_overrun);
 
     always @(posedge clk) begin
         tx_start    <= 1'b0;
         rx_start    <= 1'b0;
         fifo_push   <= 1'b0;
         wfetch_wait <= 1'b0;
-        s_busy      <= (q != Q_IDLE);
+        /* Busy through the idle cycle between chained blocks. */
+        s_busy      <= (q != Q_IDLE) || r_block_pend;
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -563,23 +409,15 @@ module dap_top #(
         end else begin
             case (q)
                 Q_IDLE: begin
-                    if (start_frame_req || start_block_req || start_bwrite_req) begin
-                        is_block      <= start_block_req;
+                    if (start_frame_req || r_block_pend || start_bwrite_req) begin
+                        is_block      <= r_block_pend;
                         is_bwrite     <= start_bwrite_req;
                         parcels_left  <= {1'b0, r_parcels} + 9'd1;
                         /* At least one parcel always follows the command. */
                         wlast         <= 1'b0;
-                        /*
-                         * Only s_done is cleared here.  The three reply flags
-                         * moved to Q_TX: clearing them from the start request
-                         * put that request in the clock enable of every one of
-                         * them, and the chain from start_frame_req through the
-                         * state decode to those enables was the design's
-                         * critical path.  They are set by the receive and read
-                         * after it, so clearing them as the receive begins is
-                         * the same guarantee one state later.
-                         */
+                        /* The reply flags are cleared in Q_TX. */
                         s_done        <= 1'b0;
+                        s_overrun     <= 1'b0;
                         tx_start      <= 1'b1;
                         q             <= Q_TX;
                     end
@@ -592,15 +430,9 @@ module dap_top #(
                         s_crc_ok      <= 1'b0;
                         s_aligned     <= 1'b0;
                         /*
-                         * A block read answers with parcels rather than one
-                         * reply: 32 bits each, and a CRC only on the last.
-                         */
-                        /*
-                         * Three shapes of answer.  A plain frame replies with
-                         * r_rbits and a CRC; a block read answers with parcels
-                         * of 32 bits and a CRC only on the last; a block write
-                         * is acknowledged with a bare start bit, both for the
-                         * command and for every parcel after it.
+                         * Plain frame: r_rbits and a CRC.  Block read: 32-bit
+                         * parcels, CRC on the last only.  Block write: a bare
+                         * start bit per command and per parcel.
                          */
                         rx_bits       <= is_bwrite ? 7'd0
                                        : is_block  ? 7'd32 : r_rbits;
@@ -614,27 +446,12 @@ module dap_top #(
                 end
 
                 /*
-                 * The acknowledge for the command frame and for every parcel.
-                 *
-                 * A timeout here ends the block.  The device stops acknowledging
-                 * when it has stopped listening, and streaming the rest of the
-                 * words into a device that is not taking them writes whatever
-                 * IOADDR happens to hold - which is the one failure worth
-                 * refusing to continue through.
+                 * Acknowledge for the command and every parcel.  A timeout ends
+                 * the block: the device has stopped listening.
                  */
                 Q_WACK: begin
                     if (rx_done) begin
-                        /*
-                         * Written on every acknowledge, not only the last.
-                         *
-                         * Gating these on "and it was the final parcel" reads
-                         * better and puts the parcel counter and the mode flag
-                         * into their clock enables, which is where this design
-                         * keeps losing its clock - see the receiver's at_limit.
-                         * Rewritten each time, the last acknowledge leaves
-                         * exactly the same values behind and the enable is one
-                         * state decode and rx_done.
-                         */
+                        /* Written on every ack; the last one leaves the result. */
                         s_wait      <= rx_wait;
                         s_timed_out <= rx_timed_out;
                         s_crc_ok    <= ~rx_timed_out;
@@ -649,35 +466,15 @@ module dap_top #(
                 end
 
                 /*
-                 * Four bytes out of the FIFO make one parcel.
-                 *
-                 * Stalling here rather than failing is deliberate: the host
-                 * fills the FIFO in bursts while the wire drains it, exactly as
-                 * the reply FIFO works in the other direction, so an empty FIFO
-                 * usually means the next burst is still arriving.  The device's
-                 * own MAXWAIT timeout is what catches a host that has stopped
-                 * altogether.
+                 * Four FIFO bytes make one parcel, one byte every other cycle.
+                 * An empty FIFO stalls rather than fails; the device's MAXWAIT
+                 * catches a host that has stopped.
                  */
                 Q_WFETCH: begin
-                    /*
-                     * A byte every other cycle, because the FIFO's head is a
-                     * register.
-                     *
-                     * wfifo_head is loaded from wfifo_mem[wfifo_rd] on the same
-                     * edge that a pop advances wfifo_rd, so it still shows the
-                     * byte that was just taken for one cycle afterwards.
-                     * Popping every cycle therefore reads the first byte four
-                     * times.  This is the same one-ahead trap the reply FIFO
-                     * already has a note about, arrived at from the other
-                     * direction.
-                     *
-                     * Stalling on an empty FIFO rather than failing is
-                     * deliberate: the host refills while the wire drains, so an
-                     * empty FIFO usually means the next burst is still on its
-                     * way.  The device's own MAXWAIT is what catches a host that
-                     * has stopped altogether.
-                     */
-                    if (wfetch_go) begin
+                    if (abort_req) begin
+                        s_timed_out <= 1'b1;
+                        q           <= Q_DONE;
+                    end else if (wfetch_go) begin
                         wfetch_wait <= 1'b1;
                         if (wbyte == 2'd3) begin
                             tx_start <= 1'b1;
@@ -718,12 +515,7 @@ module dap_top #(
                         store_byte  <= 2'd0;
                         s_wait      <= rx_wait;
                         s_crc       <= rx_crc;
-                        /*
-                         * A parcel that timed out ends the block there.  Going
-                         * on would push whatever the wire happened to read into
-                         * the FIFO behind good data, and the host has no way to
-                         * tell the two apart once they are bytes in a buffer.
-                         */
+                        /* A timed-out parcel ends the block; no junk in the FIFO. */
                         if (rx_timed_out) begin
                             s_timed_out <= 1'b1;
                             q           <= Q_DONE;
@@ -734,13 +526,19 @@ module dap_top #(
                     end
                 end
 
+                /*
+                 * Flow control: a word is stored only with room for it (the
+                 * flag is a cycle old, hence the margin).  Waiting here stops
+                 * DAP0 between parcels, which pauses the device; the host
+                 * catches up and the block resumes.  An abort gives up.
+                 */
                 Q_STORE: begin
-                    if (fifo_full) begin
-                        /* Nobody is draining. Say so rather than lose bytes
-                         * quietly - a short block the host knows about beats a
-                         * full one with a hole in it. */
-                        s_overrun <= 1'b1;
-                        q         <= Q_DONE;
+                    if (store_byte == 2'd0 && !fifo_room) begin
+                        if (abort_req) begin
+                            s_overrun   <= 1'b1;
+                            s_timed_out <= 1'b1;
+                            q           <= Q_DONE;
+                        end
                     end else begin
                         fifo_push <= 1'b1;
                         fifo_din  <= store_word[7:0];
@@ -776,20 +574,19 @@ module dap_top #(
 
     always @(posedge clk) begin
         start_frame_req <= 1'b0;
-        start_block_req <= 1'b0;
         start_bwrite_req <= 1'b0;
-        /*
-         * Defaulted here, with the only code that sets it.
-         *
-         * It used to default to zero in the sequencer and be set here, which
-         * is two always blocks driving one register - and yosys resolves that
-         * by picking one, so CTRL bit 3 was tying fifo_clear to a constant and
-         * clearing the FIFO did nothing at all.  Silent, because a block read
-         * drains the FIFO completely anyway, so nothing had yet depended on
-         * the clear actually happening.
-         */
+        /* Driven only from this block; two drivers get resolved to one by yosys. */
         fifo_clear      <= 1'b0;
         wfifo_clear     <= 1'b0;
+
+        abort_req <= !rst && reg_we && reg_addr == 7'h01 && reg_wdata[2];
+
+        if (rst || block_take || block_cancel || abort_req) begin
+            r_block_pend <= 1'b0;
+        end
+        if (!rst && reg_we && reg_addr == 7'h01 && reg_wdata[1]) begin
+            r_block_pend <= 1'b1;
+        end
 
         if (rst) begin
             trst      <= 1'b1;         /* released; asserting it resets the target */
@@ -801,15 +598,8 @@ module dap_top #(
             r_skew2   <= 2'd0;
         end else begin
             /*
-             * A block-write parcel is assembled here rather than in the
-             * sequencer, because this is the block that owns DATA.  Driving one
-             * register from two always blocks is how CTRL bit 3 ended up tied
-             * to a constant once already - yosys resolves it by picking one.
-             *
-             * Bit 0 is the start bit and bits 32:1 the word, which is the order
-             * the raw path puts them on the wire.  A host write in the same
-             * cycle would win, which cannot happen: the host is not setting up
-             * a frame while the fabric is streaming one.
+             * Block-write parcel assembly, here because this block owns DATA.
+             * Bit 0 is the start bit, bits 32:1 the word.
              */
             if (wfetch_go) begin
                 r_data <= {31'd0, wfifo_head, r_data[32:9], 1'b1};
@@ -819,7 +609,6 @@ module dap_top #(
                 case (reg_addr)
                     7'h01: begin
                         start_frame_req <= reg_wdata[0];
-                        start_block_req <= reg_wdata[1];
                         start_bwrite_req <= reg_wdata[4];
                         if (reg_wdata[3]) fifo_clear <= 1'b1;
                         if (reg_wdata[5]) wfifo_clear <= 1'b1;
@@ -858,29 +647,9 @@ module dap_top #(
             end
 
             /*
-             * Three cycles to answer a fetch, and the decode split in two so
-             * those cycles are worth having.
-             *
-             * Adding a pipeline register after the mux would change nothing:
-             * the path from reg_addr through a five-level mux is still one
-             * clock as far as place and route is concerned, and there is no
-             * multicycle constraint to tell it otherwise.  The mux itself has
-             * to be cut, so the group values are registered first (a short mux
-             * on the low address bits) and the choice between them second.
-             *
-             * Four cycles now, not three.  Three was already needed because
-             * the FIFO's head register updates a cycle after the pop, so the
-             * group stage needs one more to catch it - otherwise a drain sends
-             * each byte twice.  The fourth is the control group's sixteen-way
-             * byte mux, which is four LUT levels of routing in one clock and
-             * became the design's critical path once the frame engines were
-             * dealt with and the DAP2 pad tightened the placement.  Split into
-             * two eight-way muxes and a choice between them a cycle later, it
-             * is half that.
-             *
-             * The budget is unchanged: the dummy byte a read sends is eight
-             * SPI clocks, sixteen fabric clocks at the fastest link rate this
-             * board runs, so four is still a quarter of it.
+             * Four-cycle read pipeline, well inside the SPI dummy byte:
+             * stage 1 registers each group's byte (control group as two halves),
+             * stage 2 picks the control half, stage 3 picks the group.
              */
             q_ctrl_lo <= rd_ctrl_lo;
             q_ctrl_hi <= rd_ctrl_hi;
@@ -891,8 +660,6 @@ module dap_top #(
             q_grp    <= reg_addr[6:4];
             q_port   <= (reg_addr[6:4] == 3'h4);
 
-            /* Second stage: pick the control half, and carry everything else
-             * along so the four groups still arrive together. */
             q_ctrl   <= q_hi ? q_ctrl_hi : q_ctrl_lo;
             q_dat_d  <= q_dat;
             q_rep_d  <= q_rep;
@@ -912,16 +679,7 @@ module dap_top #(
         end
     end
 
-    /*
-     * The read mux, grouped by address range rather than written as one case
-     * over all seven address bits.
-     *
-     * Yosys builds the flat version into a six-level LUT chain, and with
-     * everything else on the critical path dealt with that decode was the
-     * design's limit at about 43 MHz - short of the 48 the oscillator can
-     * give.  Split into three small muxes on the low bits and one choice
-     * between them on the high bits, it is three levels for the same result.
-     */
+    /* Read mux, grouped by address range to keep the LUT depth short. */
     reg [7:0] rd_ctrl_lo, rd_ctrl_hi, rd_dat, rd_rep;
 
     always @(*) begin
@@ -944,24 +702,12 @@ module dap_top #(
                                 r_raw, r_wide, r_no_hunt, ~trst};
             3'h4: rd_ctrl_hi = {2'd0, r_lead};
             3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
-            /*
-             * How many bytes are waiting.  This is what lets the host drain
-             * while the block is still arriving instead of after it: the wire
-             * takes about 2 ms for a 1 kB block and the drain about 1.6 ms,
-             * and run one after the other that is most of the cost of a block.
-             */
-            3'h3: rd_ctrl_hi = {4'd0, r_raw, r_wide, r_no_hunt, ~trst};
+            /* LEVEL: reply FIFO fill, so the host can drain during a block. */
             3'h5: rd_ctrl_hi = fifo_count[7:0];
-            default: rd_ctrl_hi = {4'd0, fifo_count[11:8]};   /* 0x0E */
+            /* 0x0E: LEVEL high nibble, and a block start still queued. */
+            default: rd_ctrl_hi = {3'd0, r_block_pend, fifo_count[11:8]};
         endcase
 
-        /*
-         * DATA reads back.  Without this the host cannot tell a payload that
-         * failed to reach the fabric from one the device simply ignored: the
-         * frame is well formed either way and the only symptom is silence.
-         * Every other writable register was already readable and this one
-         * being write-only was an oversight - it cost a session.
-         */
         case (reg_addr[2:0])
             3'd0: rd_dat = r_data[7:0];
             3'd1: rd_dat = r_data[15:8];
@@ -981,38 +727,17 @@ module dap_top #(
             3'd4: rd_rep = {2'd0, s_crc};
             3'd5: rd_rep = s_wait[7:0];
             3'd6: rd_rep = s_wait[15:8];
-            /*
-             * 0x27 LINES, in the slot the reply group already spends on a
-             * default - so reading it costs no extra mux level.
-             *
-             * Where these are read from is not cosmetic: they come from the
-             * receiver's end of the chip, and decoding them in the control
-             * group or in LEVEL's high byte was measured at 46.7 and 48.5 MHz
-             * respectively, against 50.4 here - and at 48.5 the block-read
-             * drain, which polls LEVEL thousands of times per block, started
-             * losing bytes.
-             */
+            /* 0x27 ALIGN.  Decoded here, not in the control group, for timing. */
             default: rd_rep = {7'd0, s_aligned};
         endcase
     end
 
-    /*
-     * The FIFO port, and the scan word beside it.
-     *
-     * This group is the right home for something read rarely: its mux is two
-     * entries wide, where the control group's is sixteen and putting anything
-     * extra there has cost this design several megahertz more than once.
-     */
+    /* FIFO port group: reply FIFO data and write FIFO level. */
     reg [7:0] rd_fifo;
 
     always @(*) begin
         case (reg_addr[3:0])
-            /*
-             * How many bytes are waiting, so the host can keep the write FIFO
-             * fed without overrunning it.  The count rather than the free space:
-             * the subtraction is one twelve-bit adder in the middle of the read
-             * mux, and the host knows the depth perfectly well.
-             */
+            /* WLEVEL: bytes waiting in the write FIFO (the host knows the depth). */
             4'h3:    rd_fifo = wfifo_count[7:0];
             4'h4:    rd_fifo = {4'd0, wfifo_count[11:8]};
             default: rd_fifo = fifo_empty ? 8'h00 : fifo_head;

@@ -1,12 +1,6 @@
 /*
- * The whole master, driven over SPI the way the ESP32 will drive it, against a
- * fake target.
- *
- * The block read is the case that matters.  It is the reason for putting any
- * of this in fabric: on the host each parcel costs a start-bit hunt and 32
- * software-driven clocks, and the win here is that the host writes a command,
- * says how many parcels, and reads the whole answer back as one burst.  So the
- * test drives it exactly that way and checks the bytes come out in order.
+ * The whole master, driven over SPI the way the ESP32 drives it, against a
+ * fake target: single frames, a payload frame, block read and block write.
  */
 
 `timescale 1ns / 1ps
@@ -14,21 +8,11 @@
 
 module tb_dap_top;
 
-    /*
-     * 50 MHz, near the 48 the hardware runs at, because the timing this bench
-     * is now asked to prove is measured in fabric clocks against a round trip
-     * that does not scale with them.
-     */
+    /* 50 MHz, near the 48 MHz hardware clock. */
     reg clk = 1'b0;
     always #10 clk = ~clk;
 
-    /*
-     * What the target's reply costs to get back: FPGA output driver, PCB, the
-     * TC38x pad, and the FPGA input. The guide puts it at 6-12 ns; 8 is the
-     * middle of that. Without it the bench samples an ideal wire and says
-     * nothing about whether the capture point has any margin - which is the
-     * whole question at the highest bit rates.
-     */
+    /* Reply round trip (driver, PCB, TC38x pad, input): 6-12 ns, 8 modelled. */
     localparam TARGET_DELAY = 8;
 
     reg rst = 1'b1;
@@ -80,8 +64,8 @@ module tb_dap_top;
         end
     endtask
 
-    /* A read sends a dummy byte after the header, while the register file
-     * fetches - see the note in spi_slave.v on why that byte exists. */
+    /* A read sends a dummy byte after the header while the register file
+     * fetches. */
     task rd;
         input  [6:0] addr;
         output [7:0] val;
@@ -94,14 +78,7 @@ module tb_dap_top;
         end
     endtask
 
-    /*
-     * Bursts, which is how the host actually writes.
-     *
-     * Every wr/rd above is one address and one byte, and the host does not do
-     * that: it sets the eight DATA bytes in a single select, and CMD, LEN,
-     * DBITS and RBITS in another.  The single-byte form passing says nothing
-     * about the burst form, and the burst form is what carries the payload.
-     */
+    /* Multi-byte bursts, as the host writes DATA and CMD..RBITS. */
     reg [7:0] burst [0:15];
     integer   bi;
 
@@ -128,11 +105,7 @@ module tb_dap_top;
         end
     endtask
 
-    /*
-     * What actually went out on the wire, sampled where the target samples it.
-     * Only while the transmitter is driving, so the receiver's own clocks do
-     * not run into the capture.
-     */
+    /* What went out on the wire, sampled at DAP0 rising, transmitter only. */
     reg [95:0] sent;
     integer    sent_bits;
     reg        dap0_d;
@@ -189,13 +162,8 @@ module tb_dap_top;
         end
     endtask
 
-    /*
-     * A bare acknowledge: one busy cycle, then the start bit and nothing else.
-     *
-     * This is what the device answers a client_blockwrite command frame and
-     * every parcel after it with - six DAP0 clocks of overhead per word, which
-     * is the whole reason the command exists.
-     */
+    /* A bare acknowledge: one busy cycle, then the start bit.  The device
+     * answers a client_blockwrite frame and each parcel with one. */
     task send_ack;
         begin
             drive_bit(1'b0);
@@ -204,14 +172,8 @@ module tb_dap_top;
         end
     endtask
 
-    /*
-     * Every parcel the transmitter sent, captured off the wire.
-     *
-     * Sampled where the device samples, and only while the transmitter is
-     * driving, so the receiver's own acknowledge clocks stay out of it.  A
-     * parcel is a start bit and thirty-two data bits; the start bit is dropped
-     * here and the word kept, which is what the checks want to compare.
-     */
+    /* Every parcel the transmitter sent (start bit + 32 data bits), captured
+     * off the wire; the start bit is dropped and the word kept. */
     reg [31:0] parcel_seen [0:7];
     integer    parcels_seen;
     reg [5:0]  parcel_bit;
@@ -223,8 +185,7 @@ module tb_dap_top;
             parcels_seen <= 0;
             parcel_bit   <= 6'd0;
             in_parcel    <= 1'b0;
-        /* Only while a *parcel* is going out.  The command frame has a start
-         * bit too, and counting it as a parcel makes every value wrong. */
+        /* Parcels only; the command frame's start bit must not count. */
         end else if (dap0 && !dap0_d && dut.tx_parcel && capture_parcels) begin
             if (!in_parcel) begin
                 if (dap1) begin          /* the start bit */
@@ -263,6 +224,10 @@ module tb_dap_top;
 
     reg [7:0] b0, b1, b2, b3;
     integer   p;
+    reg       stall_seen;
+    reg [31:0] fc_words [0:19];
+    integer   fc_bad, fc_got, fc_n, fc_i;
+    reg [7:0] c0, c1, c2, c3;          /* the drain thread's own bytes */
 
     initial begin
         $dumpfile("tb_dap_top.vcd");
@@ -272,8 +237,7 @@ module tb_dap_top;
         rst = 1'b0;
         repeat (4) @(posedge clk);
 
-        /* DIV 5 for the bulk of the run, an ordinary middle setting.  The
-         * lowest legal divider gets its own case at the end. */
+        /* DIV 5 for most of the run; DIV 0 and 1 are tested at the end. */
         wr(7'h02, 8'd5);       /* DIV: 12 fabric clocks per bit */
         wr(7'h07, 8'd1);       /* TRAIL */
         wr(7'h08, 8'd64);      /* MAXWAIT low */
@@ -307,24 +271,10 @@ module tb_dap_top;
         check("reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
 
         /*
-         * ---- a frame that carries a payload, written the way the host
-         * writes it ----
+         * ---- a payload frame through the register file: client_set(1) ----
          *
-         * On hardware every frame with a DATA field drew no reply while sync
-         * and the block read worked, and nothing here could have caught that:
-         * both cases above leave DBITS at zero, so the DATA register and the
-         * serialiser's payload path were never exercised through the register
-         * file at all.
-         *
-         * client_set(1) is the first frame that fails on the bench, and its
-         * wire word is 0x1B10F9 over 22 bits - from the C frame builder, which
-         * is itself checked against the documented vectors.  So this compares
-         * two independent implementations rather than the RTL against itself.
-         *
-         * LEN 3 with three data bits, which is what dap_probe_client_set
-         * actually sends.  A round LEN 4 is a different frame and produces a
-         * different, equally valid-looking vector - checking against that one
-         * proves nothing about the frame the bench is failing on.
+         * LEN 3, three data bits, as dap_probe_client_set sends.  Expected
+         * wire word 0x1B10F9 over 22 bits, from the C frame builder.
          */
         $display("payload frame through the register file: client_set(1)");
 
@@ -398,18 +348,8 @@ module tb_dap_top;
         check("block did not overrun", scratch[7], 1'b0);
         check("fifo has data", scratch[5], 1'b0);
 
-        /*
-         * Drain in two transactions, not one.
-         *
-         * The host drains a block in chunks while the rest of it is still
-         * arriving, so what matters is that a burst can stop and another can
-         * pick up where it left off.  A single burst cannot show that, and
-         * that is exactly what hid a byte going missing at every boundary: a
-         * read fetches one byte ahead, and the fetch at the end of a burst is
-         * for a byte the master never clocks.  Popping on that fetch threw it
-         * away - invisible in one burst, three bytes short of a 1 kB block in
-         * four.
-         */
+        /* Drain in two bursts: a read fetches one byte ahead, and the unused
+         * fetch at a burst's end must not pop the FIFO. */
         $display("draining the fifo in two bursts");
         ss = 1'b0; #HALF;
         spi_byte(8'h40, scratch);
@@ -437,26 +377,125 @@ module tb_dap_top;
         check("fifo now empty", scratch[5], 1'b1);
 
         /*
-         * ---- the lowest divider ----
+         * ---- two chained block reads ----
          *
-         * DIV 1 is a two-clock half period, which is the same length as the
-         * synchroniser on DAP1 - so this is the case the old sample point
-         * could not survive, and the one the host refused to allow because of
-         * it.  It has to be tested here rather than in tb_dap_rx: that bench
-         * drives dap1_in directly and never sees the synchroniser at all,
-         * which is why the limit went unnoticed in simulation and turned up as
-         * a rule in the host instead.
+         * The second start is written while the first block runs; the fabric
+         * holds it and starts the next block as soon as the first is done.
          */
+        $display("chained block reads: second start queued while busy");
+        wr(7'h01, 8'h08);      /* CTRL: clear the fifo */
+        wr(7'h0A, 8'd1);       /* PARCELS = 2 - 1 */
+
+        fork
+            begin
+                wr(7'h01, 8'h02);                  /* start block 1 */
+                wait (dut.q == 4'd3);              /* receiving its parcels */
+                wr(7'h01, 8'h02);                  /* queue block 2 */
+                rd(7'h0E, scratch);
+                check("start queued", scratch[4], 1'b1);
+            end
+            begin
+                for (p = 0; p < 4; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_parcel(32'hA0B0C000 + p, (p == 1) || (p == 3));
+                    target_drive = 1'b0;
+                    @(posedge clk);
+                    /* Between the blocks the master sends the next frame. */
+                    if (p == 1) wait (dut.u_rx.dat_oe == 1'b1);
+                end
+            end
+        join
+
+        scratch = 8'h01;
+        while (scratch[0]) rd(7'h00, scratch);  /* busy until both are done */
+        check("chain done", scratch[1], 1'b1);
+        check("chain not timed out", scratch[2], 1'b0);
+        rd(7'h0D, b0);
+        check("chain left 16 bytes", {24'd0, b0}, 32'd16);
+        rd(7'h0E, scratch);
+        check("nothing left queued", scratch[4], 1'b0);
+
+        ss = 1'b0; #HALF;
+        spi_byte(8'h40, scratch);
+        spi_byte(8'h00, scratch);              /* the dummy */
+        for (p = 0; p < 4; p = p + 1) begin
+            spi_byte(8'h00, b0);
+            spi_byte(8'h00, b1);
+            spi_byte(8'h00, b2);
+            spi_byte(8'h00, b3);
+            check("chained parcel", {b3, b2, b1, b0}, 32'hA0B0C000 + p);
+        end
+        #HALF; ss = 1'b1; #(HALF*4);
+
         /*
-         * ---- the fastest bit rate the clock generator can make ----
+         * ---- flow control ----
          *
-         * DIV 0 is a one-clock half period: DAP0 at half the fabric clock,
-         * one bit every two clocks.  Both ends of the bit are tight at that
-         * rate, and both were wrong before - the transmitter changed DAP1 a
-         * clock after the falling edge, leaving no setup at all, and the
-         * receiver had no instant inside the bit old enough to sample.  With
-         * an 8 ns round trip modelled, this passing is the claim that the
-         * data really is stable when the target latches it.
+         * 20 parcels into a 64-byte FIFO with nobody draining: the block must
+         * stall between parcels (DAP0 quiet, DAP1 released) and finish intact
+         * once the host drains.
+         */
+        $display("flow control: a block larger than the FIFO");
+        wr(7'h01, 8'h08);      /* CTRL: clear the fifo */
+        wr(7'h0A, 8'd19);      /* PARCELS = 20 - 1 */
+        stall_seen = 1'b0;
+
+        fork
+            wr(7'h01, 8'h02);
+            begin
+                for (p = 0; p < 20; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_parcel(32'hC0DE0000 + p, (p == 19));
+                    /* The device keeps the line through the gap. */
+                    @(posedge clk);
+                end
+                target_drive = 1'b0;
+            end
+            begin
+                /* Let it fill and stall before draining anything. */
+                wait (dut.q == 4'd4 && !dut.fifo_room);
+                repeat (200) @(posedge clk);
+                stall_seen = (dut.q == 4'd4) && !dut.dap0;
+                check("stall releases DAP1", {31'd0, dut.drive}, 32'd0);
+                /* Drain as the host does: only what LEVEL reports. */
+                fc_got = 0;
+                while (fc_got < 20) begin
+                    rd(7'h0D, c0);
+                    fc_n = c0 / 4;
+                    if (fc_n > 0) begin
+                        ss = 1'b0; #HALF;
+                        spi_byte(8'h40, scratch);
+                        spi_byte(8'h00, scratch);
+                        for (fc_i = 0; fc_i < fc_n; fc_i = fc_i + 1) begin
+                            spi_byte(8'h00, c0);
+                            spi_byte(8'h00, c1);
+                            spi_byte(8'h00, c2);
+                            spi_byte(8'h00, c3);
+                            fc_words[fc_got + fc_i] = {c3, c2, c1, c0};
+                        end
+                        #HALF; ss = 1'b1; #(HALF*4);
+                        fc_got = fc_got + fc_n;
+                    end
+                end
+            end
+        join
+
+        scratch = 8'h01;
+        while (scratch[0]) rd(7'h00, scratch);
+        check("flow-controlled block stalled", {31'd0, stall_seen}, 32'd1);
+        check("flow-controlled block not timed out", scratch[2], 1'b0);
+        check("flow-controlled block no overrun", scratch[7], 1'b0);
+        fc_bad = 0;
+        for (p = 0; p < 20; p = p + 1) if (fc_words[p] !== 32'hC0DE0000 + p) fc_bad = fc_bad + 1;
+        check("flow-controlled words intact", fc_bad, 32'd0);
+
+        /*
+         * ---- the fastest divider ----
+         *
+         * DIV 0: one-clock half period, one bit every two fabric clocks, with
+         * the round trip modelled.  Tested here, not in tb_dap_rx, because
+         * only this bench includes the DAP1 synchroniser.
          */
         $display("the fastest divider: sync at DIV 0");
         wr(7'h02, 8'd0);
@@ -484,9 +523,10 @@ module tb_dap_top;
         check("DIV 0 not timed out", scratch[2], 1'b0);
         rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
         check("DIV 0 reply", {b3, b2, b1, b0}, 32'hAAAAAAAA);
-        /* The frame it sent has to still be the right one at this rate. */
+        /* The sent frame must still be right at this rate. */
         check("DIV 0 sync word", (sent >> 2) & 96'h7FFFF, 32'h09FE1);
 
+        /* DIV 1: a two-clock half period, as long as the DAP1 synchroniser. */
         $display("the lowest divider: sync at DIV 1");
         wr(7'h02, 8'd1);
         wr(7'h03, 8'h10);      /* CMD  = sync */
@@ -525,14 +565,8 @@ module tb_dap_top;
         rd(7'h43, scratch);
         check("write fifo took 12 bytes", {24'd0, scratch}, 32'd12);
 
-        /*
-         * The host's order, not a convenient one.
-         *
-         * dap_phy_fpga_block_write() fills the FIFO, then writes DATA, then
-         * CMD/LEN/DBITS/RBITS as one burst, then PARCELS, then starts.  This
-         * test used to skip DATA entirely and set PARCELS first, which is the
-         * one sequence the firmware never issues.
-         */
+        /* dap_phy_fpga_block_write()'s order: FIFO, DATA, CMD..RBITS burst,
+         * PARCELS, start. */
         burst[0] = 8'h00; burst[1] = 8'h00; burst[2] = 8'h00; burst[3] = 8'h40;
         burst[4] = 8'h00; burst[5] = 8'h00; burst[6] = 8'h00; burst[7] = 8'h00;
         wr_burst(7'h10, 8);                    /* DATA, the command payload */
@@ -555,13 +589,8 @@ module tb_dap_top;
                     target_drive = 1'b1;
                     send_ack;
                     target_drive = 1'b0;
-                    /*
-                     * Wait for the line to come back before looking for the
-                     * next window.  Without this the same window is answered
-                     * twice - dat_oe is still low when the loop comes round -
-                     * and the device runs out of acknowledges before the words
-                     * run out, which looks exactly like the sequencer hanging.
-                     */
+                    /* Wait for the line to come back, or the same window is
+                     * answered twice. */
                     wait (dut.u_rx.dat_oe == 1'b1);
                 end
             end
@@ -585,6 +614,9 @@ module tb_dap_top;
 
     initial begin
         #20000000;
+        $display("  at timeout: q %0d, fifo %0d, room %0d, parcels_left %0d, rx state %0d, oe %0d",
+                 dut.q, dut.fifo_count, dut.fifo_room, dut.parcels_left, dut.u_rx.state,
+                 dut.u_rx.dat_oe);
         $display("FAILED (timeout)");
         $finish;
     end

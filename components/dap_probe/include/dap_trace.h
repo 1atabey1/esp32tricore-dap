@@ -1,26 +1,10 @@
 /*
- * Autonomous TRAM drain.
+ * Autonomous TRAM drain: the probe follows the trace FIFO write pointer and
+ * publishes complete 1 kB paragraphs without host round trips.
  *
- * This is the part that fixes the original problem.  A miniWiggler through
- * DAS/TAS reads target memory at about 38 kB/s, and draining an 8 kB trace
- * buffer over that ceiling with a host round trip per read is what forced the
- * application under test to publish at a twelfth of its natural rate.  Here the
- * probe follows the write pointer itself and empties whole paragraphs without
- * asking the host for anything, at the 453 kB/s the register-driven PHY
- * sustains.
- *
- * Two design points are not negotiable, because the decoder depends on them:
- *
- *   - Only *complete* paragraphs are published.  The TRAM is divided into 1 kB
- *     paragraphs; the one FIFONOW currently points into is still being written,
- *     so it is left alone until the pointer moves past it.
- *   - A lap is reported explicitly.  A TRAM lap produces no ERR message - those
- *     are for observation-unit FIFO overflows - so a drain that falls behind
- *     silently produces a stream that parses as valid and is wrong.  A gap
- *     record in the stream is something a decoder can act on: discard the
- *     paragraph containing FIFONOW, resume at the next boundary with both
- *     compression caches zeroed, which is safe precisely because each trace
- *     unit's first message in a paragraph is uncompressed.
+ * The paragraph FIFONOW points into is still being written and is skipped.  A
+ * TRAM lap raises no ERR message, so lost paragraphs are reported as a gap
+ * record; the decoder resumes at the next paragraph with its caches zeroed.
  */
 
 #pragma once
@@ -39,7 +23,8 @@ extern "C" {
 #define DAP_TRACE_MAGIC 0x50525444u   /* "DTRP" */
 
 enum {
-    DAP_TRACE_FLAG_GAP = 1u << 0,     /* paragraphs were lost before this one */
+    DAP_TRACE_FLAG_GAP   = 1u << 0,   /* paragraphs were lost before this one */
+    DAP_TRACE_FLAG_FINAL = 1u << 1,   /* the last paragraph of a session (may be partial) */
 };
 
 typedef struct {
@@ -63,57 +48,35 @@ typedef struct {
     uint32_t queue_free;     /* ring bytes still available */
     uint32_t queue_dropped;  /* payload bytes dropped because nobody was reading */
     uint32_t poll_us_max;    /* slowest drain pass, to size the poll interval */
+    uint32_t read_us;        /* time inside the chained paragraph reads */
+    uint32_t read_paragraphs;/* paragraphs those reads fetched (torn ones included) */
+    uint32_t passes;         /* drain passes that found paragraphs waiting */
 } dap_trace_stats_t;
 
-/*
- * Take over the trace FIFO and start draining.  Assumes an attached target
- * with OCDS enabled - dap_probe_enable_ocds() - and does not configure tracing
- * itself: the MCDS configuration is the host's 54-write list, and a drain that
- * invented its own would be measuring itself.
- */
+/* Start draining the trace FIFO.  Needs OCDS enabled and the miniMCDS
+ * configured (dap_mcds_start, or a host tool). */
 esp_err_t dap_trace_start(void);
 
-/* Stop draining.  The FIFO is left as it is, so a capture can be resumed. */
+/* Stop draining (waits for the drain task).  The FIFO is left as it is. */
 void dap_trace_stop(void);
 
-/*
- * One drain pass: read the write pointer, publish every paragraph that has
- * been completed since the last pass, and account for anything lost.  Safe to
- * call when stopped, in which case it does nothing.
- *
- * dap_trace_start() runs this in its own task, so callers normally do not.
- * Returns ESP_ERR_NOT_FOUND when there was nothing waiting, which is how the
- * task knows whether it can afford to sleep.
- */
+/* After tracing was flushed and the drain stopped: publish what is left,
+ * including the last, partial paragraph (it ends with <endoftrace>). */
+esp_err_t dap_trace_finish(void);
+
+/* One drain pass (normally run by the drain task).  No-op when stopped;
+ * ESP_ERR_NOT_FOUND when nothing was waiting. */
 esp_err_t dap_trace_poll(void);
 
-/*
- * Take up to `max` bytes of drained stream.  Returns what was copied, 0 when
- * there is nothing waiting.  Records are byte-aligned and self-describing, so a
- * reader may take them in arbitrary chunks.
- */
+/* Copy up to `max` bytes of drained stream; returns bytes copied.  Records are
+ * self-describing, so any chunking works. */
 size_t dap_trace_read(uint8_t *out, size_t max);
 
 void dap_trace_get_stats(dap_trace_stats_t *out);
 
-/*
- * Prove the drain works, without waiting for the target to emit trace.
- *
- * This backend only ever follows the trace FIFO's write pointer; nothing here
- * configures the miniMCDS to produce messages, so on a target that is not
- * tracing there is nothing to drain and "it ran and published nothing" is
- * indistinguishable from "it is broken".  This writes a known pattern into the
- * trace buffer, advances the write pointer over it, and checks that exactly
- * those bytes come back out of the ring in order.
- *
- * What it proves: paragraph detection, the wrap at the end of the buffer, the
- * gap accounting, the ring, and the read path the HTTP stream uses - every
- * part of this file.  What it does not prove: that the target's trace
- * messages are what the host thinks they are.  That needs a target that is
- * actually tracing, and is a separate question from whether the drain works.
- *
- * Returns ESP_OK only if every byte matched.  Leaves the drain stopped.
- */
+/* Write a known pattern into the TRAM, run the drain over it as if the write
+ * pointer had passed it, and check records and payload.  ESP_OK only if every
+ * byte matched; leaves the drain stopped. */
 esp_err_t dap_trace_selftest(void);
 
 #ifdef __cplusplus

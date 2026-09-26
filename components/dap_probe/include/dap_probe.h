@@ -1,16 +1,10 @@
 /*
- * DAP transactions and the bring-up checkpoint sequence.
- *
- * Every step here has a documented expected answer, which is the point: a
- * failure names itself instead of needing a bisect.  In order,
- *
+ * DAP transactions and the bring-up checkpoint sequence.  Expected answers:
  *   1. eight slow clocks, then `sync`  -> 0xAAAAAAAA
  *   2. `dapisc`                        -> the register echoed back
  *   3. `client_set(1)`                 -> start-bit acknowledge
  *   4. `client_read(IO_CLIENT_ID)`     -> 0x0260
  *   5. `client_write` address, then a 32-bit `client_read` -> target memory
- *
- * Checkpoint 4 reading 0x0260 is the moment the probe is real.
  */
 
 #pragma once
@@ -25,8 +19,7 @@
 extern "C" {
 #endif
 
-/* Raw result of one command-plus-reply exchange, kept verbose on purpose:
- * first contact is debugged from what the wire did, not from a status code. */
+/* Raw result of one command-plus-reply exchange. */
 typedef struct {
     uint64_t sent_word;      /* the frame as clocked out, first bit in bit 0 */
     size_t   sent_bits;
@@ -40,68 +33,37 @@ typedef struct {
 } dap_exchange_t;
 
 /*
- * Configure the DAP pins and park them in a state that is safe for an attached
- * target, without sending anything.
- *
- * The pin that matters is TRST: on this bench it goes to the target's reset,
- * and the target holds it high through a pull-up.  Left as an output at its
- * power-on level it sits *low*, which holds the target in reset - a TC38x then
- * stays powered but never runs its application.  Black Magic Probe's
- * platform_init() configures the same pin as an output and leaves it low, so
- * this has to run after the background tasks start, and it has to run whether
- * or not any DAP bring-up is enabled.
+ * Configure the DAP pins and park them safely for an attached target, sending
+ * nothing.  TRST drives the target's reset and must not be left low, so call
+ * this after the background tasks start, whether or not DAP bring-up is enabled.
  */
 esp_err_t dap_probe_park_idle(void);
 
 /* Bring the PHY up on this board's pins at `clock_hz` (0 for the 1 MHz default). */
 esp_err_t dap_probe_init(uint32_t clock_hz);
 
-/*
- * The hot-attach opener: eight clocks with the line idle high, then the `sync`
- * frame, then the reply window.  `out` is filled in even on failure.
- */
+/* Hot-attach opener: eight idle-high clocks, `sync`, reply window.  `out` is filled even on failure. */
 esp_err_t dap_probe_sync(dap_exchange_t *out);
 
 /* Sync with retries and a flush between them; the first attach often fails. */
 esp_err_t dap_probe_attach(dap_exchange_t *out, int attempts);
 
 /*
- * Write DAPISC and read back the updated value.  `cold` selects the 66-bit
- * initialisation telegram with the 0x4ABBAF53 signature, for the
- * Enabled-to-Active transition; otherwise the short LEN-16 form is used, which
- * is what an already-Active device accepts.
+ * Write DAPISC and read back the updated value.  `cold` sends the 66-bit
+ * initialisation telegram (signature 0x4ABBAF53) for Enabled-to-Active;
+ * otherwise the short LEN-16 form an Active device accepts.
  */
 esp_err_t dap_probe_dapisc(uint16_t value, bool cold, dap_exchange_t *out);
 
 /* Adopt the reply-wait window implied by a DAPISC value. */
 void dap_probe_note_dapisc(uint16_t dapisc);
 
-/* Read the DAPISC register.  Does not write it: see the plan on cold attach. */
-esp_err_t dap_probe_dapisc_read(dap_exchange_t *out);
-
-/* Select the Cerberus IOClient (client 1). */
+/* Select an IOClient (1 = Cerberus). */
 esp_err_t dap_probe_client_set(uint8_t client, dap_exchange_t *out);
 
 /* Issue a client_read of one IO instruction at the given size exponent. */
 esp_err_t dap_probe_client_read(uint8_t io_instruction, uint8_t size_exponent,
                                 size_t reply_bits, dap_exchange_t *out);
-
-/*
- * Run the whole checkpoint sequence and log each step with its expected value.
- * Returns ESP_OK only if every checkpoint matched.
- */
-/*
- * Replay the reference probe's pre-sync preamble, byte for byte.
- *
- * Taken from a USB capture of a miniWiggler attach: a 43-byte pattern that is
- * a pure period-12 repeat of 000011111100, then a 56-bit sequence, then a read
- * window.  The reference sends this at five clock rates before it sends sync,
- * and this project never did - which is the last structural difference between
- * a probe that completes an attach and one that gets a single answer to sync
- * and is then ignored.  0xAAAAAAAA is itself a training pattern, so answering
- * sync may only mean the device is in a training state rather than attached.
- */
-esp_err_t dap_probe_replay_preamble(void);
 
 /* The four bring-up frames back to back, with no host work between them. */
 esp_err_t dap_probe_attach_now(dap_exchange_t out[6]);
@@ -111,22 +73,14 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
                                  uint64_t data, size_t data_bits,
                                  dap_exchange_t *out);
 
-/*
- * Put the IOClient in read/write mode, so read instructions address the system
- * bus rather than COMDATA.  Required before any memory access.
- */
+/* Put the IOClient in read/write mode (bus access, not COMDATA); required before memory access. */
 esp_err_t dap_probe_set_rw_mode(bool supervisor);
 
-/*
- * Clocks to issue after a reply, with the target still driving.  Zero suits
- * the bit-banged backend, which issues one implicitly through its sampling
- * offset; the SPI backend has no such offset and needs the real number.
- */
 /* Dump raw reply bits instead of decoding, for diagnosis.  0 turns it off. */
 void   dap_probe_set_raw_window(size_t bits);
 
+/* Clocks to issue after a reply with the target still driving (0 for bit-bang). */
 void   dap_probe_set_trailer_bits(size_t n);
-size_t dap_probe_get_trailer_bits(void);
 
 /* Log an IOINFO value with its bits named. */
 void dap_probe_log_ioinfo(uint16_t v);
@@ -141,17 +95,25 @@ esp_err_t dap_probe_read32(uint32_t addr, uint32_t *value);
 esp_err_t dap_probe_write32(uint32_t addr, uint32_t value);
 
 /*
- * Enable OCDS: the four contiguous OEC.PAT pattern writes, a check that
- * OSTATE.OEN came up, then OCNTRL and CT.SETE.  Without this the whole
- * miniMCDS register space bus-errors.
+ * Enable OCDS: OEC.PAT pattern writes, check OSTATE.OEN, then OCNTRL and
+ * CT.SETE.  Without it the miniMCDS register space bus-errors.
  */
 esp_err_t dap_probe_enable_ocds(void);
 
-/*
- * Read `count` words (1..256) in one client_blockread telegram.  The device
- * loads IOADDR itself from the telegram and post-increments per word.
- */
+/* Read `count` words (1..256) in one client_blockread; the device post-increments IOADDR. */
 esp_err_t dap_probe_blockread(uint32_t addr, uint32_t *words, size_t count);
+
+/* One read of a dap_probe_blockread_many() batch. */
+typedef struct {
+    uint32_t addr;
+    uint16_t count;          /* words, 1..256 */
+} dap_block_req_t;
+
+/*
+ * Several block reads, results packed in request order.  Through the fabric
+ * they run back to back as one chain; otherwise one after another.
+ */
+esp_err_t dap_probe_blockread_many(const dap_block_req_t *reqs, size_t n, uint32_t *words);
 
 /* Block read throughput in kB/s, against the 38 kB/s baseline. */
 esp_err_t dap_probe_block_throughput(void);
@@ -159,86 +121,37 @@ esp_err_t dap_probe_block_throughput(void);
 /* Single-word read rate, and how far the bit-banged PHY carries. */
 esp_err_t dap_probe_rate_test(void);
 
-/* Does the reply trailer length explain the alternation? */
-esp_err_t dap_probe_trailer_sweep(void);
-
-/* How many consecutive syncs the device answers, and what recovers it. */
-esp_err_t dap_probe_sync_health(int attempts);
-
-/* Fresh sync then one candidate second frame, for each candidate. */
-esp_err_t dap_probe_second_frame_matrix(void);
-
+/* Run the checkpoint sequence, logging each step; ESP_OK only if all matched. */
 esp_err_t dap_probe_bringup_report(void);
 
-/*
- * Phase 1c: switch the clocking to GP-SPI, prove it on the same checkpoints
- * the bit-bang path passes, then measure both.  Reverts to bit-bang and
- * re-verifies it if any check fails.
- */
+/* Switch clocking to GP-SPI, verify and measure it; reverts to bit-bang on failure. */
 esp_err_t dap_probe_spi_bringup(void);
 
 /*
- * Bring the fabric DAP master up and prove the route: the register file
- * answers, sync comes back, and a block read matches what the CPU path reads
- * from the same address.  Leaves the backend on the CPU path either way.
+ * Attach through the fabric DAP master, check CLIENT_ID and miniMCDS ID, and
+ * measure block-read throughput.  `wide` adds wide mode, then returns to narrow.
  */
-esp_err_t dap_probe_fpga_route_check(void);
+esp_err_t dap_probe_fpga_route_check(bool wide);
+
+/* Single-word read as a one-parcel block read (fabric): for polling. */
+esp_err_t dap_probe_read32_fast(uint32_t addr, uint32_t *value);
+
+/* Time `n` block reads of `words` words at `addr` (fabric, divider `div`,
+ * optionally wide, `chain` blocks per chained batch) and describe where the
+ * time went in `out`. */
+esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
+                         int chain, int trail, int vreps, char *out, size_t outlen);
 
 /*
- * How far into the wide-mode sequence the route check should go, for bisecting
- * a step that wedges the target.  Zero, the default, runs all of it.
- */
-/* Which command code the dapisc telegram uses; negative restores the default.
- * Bring-up scaffolding, see the note in dap_fpga_route.c. */
-void dap_probe_fpga_dapisc_cmd(int cmd);
-
-void dap_probe_fpga_wide_stage(int stage);
-
-/* Which capture taps stage 6 should use, one pair per request. */
-void dap_probe_fpga_wide_taps(int tap1, int tap2);
-
-/* Trailing clocks to use for a wide run; negative leaves the setting alone. */
-void dap_probe_fpga_wide_trail(int trail);
-
-/*
- * The port mode to put the target's DAP2 pin (P21.7) into before wide mode.
- *
- * Must be an input encoding - bit 4 clear - because an output one leaves the
- * port driving the pad the interface needs, and two push-pull drivers across
- * the 22R network is what brings this board down.  Output modes are refused.
- */
-void dap_probe_fpga_dap2_mode(int pc);
-
-/*
- * Sweep the attach variables that are cheap to vary in software - bit rate,
- * how many idle clocks precede the first frame, whether TRST is pulsed, and
- * which LEN the sync frame carries - and report every combination that draws a
- * start bit out of the target.
- *
- * This exists because a silent target on the first attempt leaves a handful of
- * plausible causes, and trying them by hand is slower and less complete than
- * letting the probe try all of them in a few milliseconds.  Returns ESP_OK if
- * any combination answered.
+ * Sweep bit rate, idle clocks before the first frame, TRST pulse and sync LEN,
+ * reporting every combination that draws a start bit.  ESP_OK if any answered.
  */
 esp_err_t dap_probe_attach_sweep(void);
 
-/*
- * Send `sync` and clock a long raw window in, logging every bit.
- *
- * The upstream frame length is the one thing neither the documentation nor the
- * captures pinned down: the reference probe clocks 56 bits after sync while
- * this code clocks 38, and leaving a reply half-clocked would desynchronise
- * the device - which is exactly the symptom, sync answering and everything
- * after it going quiet.  Measuring beats guessing.
- */
+/* Send `sync` and log a raw reply window of `window_bits`. */
 esp_err_t dap_probe_dump_sync_reply(size_t window_bits);
 
-/*
- * Try each Port C pin that can be an output as the clock, with the data line
- * fixed on the one bidirectional pin, and report which one draws a reply.
- * Cheaper than asking someone to trace a cable, and it covers the case where
- * the wires are not where the documentation says.
- */
+/* Try each output-capable Port C pin as the clock and report which draws a reply. */
 esp_err_t dap_probe_clock_pin_search(void);
 
 #ifdef __cplusplus

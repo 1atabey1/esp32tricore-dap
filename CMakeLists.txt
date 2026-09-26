@@ -28,6 +28,10 @@ project(esp32jtag_firmware)
 idf_build_set_property(COMPILE_OPTIONS "-DPC_HOSTED=0" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-DENABLE_DEBUG=1" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=format" APPEND)
+# Larger GDB packets mean fewer acknowledged round trips over Wi-Fi, which is
+# what bounds GDB load (1024 B: 11 KB/s, 4096 B: 21 KB/s).  Half a packet lives
+# on the gdb_thread stack ('m' alloca, gdb_voutf); main.c sizes that stack.
+idf_build_set_property(COMPILE_OPTIONS "-DGDB_PACKET_BUFFER_SIZE=4096U" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-DMAIN_GIT_COMMIT=\"${MAIN_GIT_COMMIT}\"" APPEND)
 #   target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-const-variable -Wno-format -Wno-format-truncation -Wno-incompatible-pointer-types)
 
