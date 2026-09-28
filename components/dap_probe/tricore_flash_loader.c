@@ -11,6 +11,7 @@
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -48,10 +49,12 @@ static const uint8_t LOADER_BLOB[] = {
  * because a DMU status read from the core hangs it mid-operation.  The blob is
  * built with 4000, sized for the 100 MHz backup clock a DAS reset leaves; the
  * OCDS reset used here keeps the application's PLL, so 4000 is too short and
- * page 2 hits a busy DMU.  16000 covers 300 MHz.  It is patched into the blob
- * (MOV d4 at offset 96) rather than rebuilt, so the blob stays the reference's.
+ * page 2 hits a busy DMU.  12000 is the reference's ~200 us window at 300 MHz,
+ * the TC38x maximum (a page needs ~100 us); 16000 cost 7.3 s instead of 5.9 s
+ * for a 700 kB image.  It is patched into the blob (MOV d4 at offset 96)
+ * rather than rebuilt, so the blob stays the reference's.
  */
-#define PROGRAM_SETTLE     16000u
+#define PROGRAM_SETTLE     12000u
 #define SETTLE_MOV_OFFSET  96u
 #define SETTLE_MOV_WORD(c) ((4u << 28) | (((c) & 0xFFFFu) << 12) | 0x3Bu)
 
@@ -307,13 +310,20 @@ esp_err_t tricore_flash_run_loader(uint32_t cmd, uint32_t address,
         return fail("could not resume into the loader");
     }
 
-    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    const int64_t started = esp_timer_get_time();
+    const int64_t deadline = started + (int64_t)timeout_ms * 1000;
     uint32_t dbgsr = 0;
     while (esp_timer_get_time() < deadline) {
         if (tricore_dbgsr(0, &dbgsr) == ESP_OK && (dbgsr & 0x2u)) {
             break;
         }
-        vTaskDelay(1);
+        /* Short runs (a sector's checksum takes ~7 ms) are polled closely;
+         * a tick is 10 ms, which would double them. */
+        if (esp_timer_get_time() - started < 20000) {
+            esp_rom_delay_us(250);
+        } else {
+            vTaskDelay(1);
+        }
     }
     tricore_halt(0, HALT_LINE, 200);
     tricore_read_pc(0, &pc);

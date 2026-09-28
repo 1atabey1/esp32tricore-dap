@@ -9,7 +9,7 @@ idf_component_register(
          "dap_probe.c" "dap_probe_diag.c" "dap_probe_bringup.c"
          "dap_fpga_route.c" "dap_dapisc.c" "dap_wide.c" "dap_trace.c" "dap_mcds.c"
          "tricore.c" "tricore_regs.c" "tricore_bmp.c"
-         "tricore_flash.c" "tricore_flash_loader.c"
+         "tricore_flash.c" "tricore_flash_loader.c" "tricore_ucb.c"
     INCLUDE_DIRS "include"
     REQUIRES driver esp_driver_spi esp_hw_support esp_timer platform_include blackmagic_esp32
 )
