@@ -54,6 +54,8 @@ reload or a network drop only pauses drawing; a running trace carries on.
    **Value tables** (toolbar or *New table*) list signals compactly by name
    with their latest value, as `dec` (scaled, with unit), `hex` or `ascii`
    (both of the raw bits); click a value to give that row its own format.
+   Reviewing (a capture file, or a trace after Stop) the values are those at
+   the marker, or at the cursor while there is none; the header says which.
    Tables work without signals, like plots. Dragging between two tables
    moves a signal; dragging from a plot into a table or back copies it.
 3. **Trace live** - press **Start** (or F5). The trace hardware watches two

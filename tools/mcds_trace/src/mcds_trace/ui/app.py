@@ -637,13 +637,15 @@ class TableCard:
         self.values: dict[str, ft.Text] = {}
         self._dirty = False
         self.title = ft.Text('', size=12, weight=ft.FontWeight.W_500)
+        self.when = ft.Text('', size=11, style=MONO, color=ft.Colors.ON_SURFACE_VARIANT)
         self.fmt_row = ft.Row(spacing=2, tight=True)
         self.menu = ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, tooltip='Table options',
                                        icon_size=18)
         self.grid = ft.Row(wrap=True, spacing=6, run_spacing=4)
         self.header = ft.Row([ft.Icon(ft.Icons.TABLE_ROWS, size=16,
                                       color=ft.Colors.ON_SURFACE_VARIANT),
-                              self.title, self.fmt_row, ft.Container(expand=True), self.menu],
+                              self.title, self.fmt_row, self.when, ft.Container(expand=True),
+                              self.menu],
                              spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         self.card = ft.Container(
             content=ft.Column([self.header, self.grid], spacing=4),
@@ -739,18 +741,43 @@ class TableCard:
         self.last_key = None
         self._dirty = True
 
+    def shown_at(self) -> tuple[float | None, str]:
+        """The time the values are taken at, and how the header says it.  While
+        a trace streams: the latest.  Reviewing (a capture file, or a trace
+        after Stop): at the marker, else at the cursor, else the last."""
+        view = self.app.view
+        if self.app.mode == 'review':
+            if view.marker is not None:
+                return view.marker, 'at marker %s' % fmt_time(view.marker)
+            if view.cursor is not None:
+                return view.cursor, 'at cursor %s' % fmt_time(view.cursor)
+            return None, 'last values'
+        return None, 'latest'
+
     def update_values(self, at: float | None) -> None:
-        """The latest value of each signal (the table does not follow the cursor)."""
+        """Each signal's value at shown_at() (the `at` of the plot legends is
+        the cursor only; a table prefers the marker)."""
         store = self.app.store()
+        t_at, where = self.shown_at()
+        if self.when.value != where:
+            self.when.value = where
+            self._dirty = True
         for sid, txt in self.values.items():
             sig = self.app.ws.signals.get(sid)
             ser = store.series.get(self.app.trace_id(sig)) if store is not None and sig else None
             if ser is None or ser.n == 0:
                 text = '-'
             elif sig.kind == 'hits' or self.app.hits_mode():
-                text = '%d hits' % ser.n
+                n = ser.n
+                if t_at is not None:
+                    n = int(np.searchsorted(ser.view()[0], t_at, side='right'))
+                text = '%d hits' % n
             else:
-                text = sig.format_as(ser.last, self.fmt_of(sid))
+                v = ser.last
+                if t_at is not None:
+                    t, vv = ser.view()
+                    v = value_at(t, vv, t_at)
+                text = sig.format_as(v, self.fmt_of(sid))
             if txt.value != text:
                 txt.value = text
                 self._dirty = True
@@ -761,6 +788,7 @@ class TableCard:
         self._dirty = False
         try:
             self.grid.update()
+            self.when.update()
         except (RuntimeError, AssertionError):
             self._dirty = True            # not on the page (yet)
 
