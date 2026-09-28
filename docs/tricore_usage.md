@@ -28,12 +28,15 @@ CLI:
 
 ```sh
 curl -u admin:admin --data-binary @app.hex http://<board>/api/flash/upload   # "ok records=.. bytes=.."
-curl -u admin:admin -X POST http://<board>/api/flash/start                   # block writes (~15.5 s / 700 kB)
+curl -u admin:admin -X POST http://<board>/api/flash/start                   # changed sectors only
+curl -u admin:admin -X POST 'http://<board>/api/flash/start?full=1'          # every sector (~7 s / 700 kB)
 curl -u admin:admin -X POST 'http://<board>/api/flash/start?slow=1'          # word writes (fallback)
-curl -u admin:admin http://<board>/api/flash/status                          # phase=done verified=1 ...
+curl -u admin:admin http://<board>/api/flash/status                          # phase=done verified=1 skipped=..
 ```
 
 Only program flash is written (0xA0000000, or the cached alias 0x80000000); other records (UCB, DFLASH) are skipped.
+Sectors that already hold the image are skipped (0.7 s for an unchanged 700 kB image); GDB `load`
+does the same.
 
 ## 3. GDB
 

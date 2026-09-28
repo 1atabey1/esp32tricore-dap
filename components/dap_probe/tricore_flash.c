@@ -10,6 +10,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "dap_phy_fpga.h"
@@ -241,20 +242,73 @@ void tricore_flash_safe_shutdown(void)
     }
 }
 
-/* One sector per command: the device refuses an AA58 count above one. */
-static esp_err_t erase_sector(uint32_t address)
+/* Erase Logical Sector Range: `count` sectors from `address`, all inside one
+ * physical sector and at most ERASE_RUN_MAX of them (TC38x data sheet). */
+static esp_err_t erase_range(uint32_t address, uint32_t count)
 {
     const uint32_t command = command_address(address);
 
     if (clear_status() != ESP_OK ||
         cycle(CYCLE_AA50, command) != ESP_OK ||
-        cycle(CYCLE_AA58, 1) != ESP_OK ||
+        cycle(CYCLE_AA58, count) != ESP_OK ||
         cycle(CYCLE_AAA8, CMD_ERASE_SETUP) != ESP_OK ||
         cycle(CYCLE_AAA8, CMD_ERASE) != ESP_OK ||
         tricore_flash_wait_idle(command, 5000) != ESP_OK) {
         return ESP_FAIL;
     }
     return clear_status();
+}
+
+static esp_err_t erase_sector(uint32_t address)
+{
+    return erase_range(address, 1);
+}
+
+/*
+ * The data sheet allows up to 32 logical sectors (512 KB) per command inside
+ * one 1 MB physical sector, erased in about the time of one (tMERP = tERP =
+ * 0.5 s max).  The reference found counts above one refused with a sequence
+ * error on its device; a refusal is detected (SQER) and the rest of the run,
+ * and every run after it until reboot, goes one sector per command.
+ */
+#define ERASE_RUN_MAX     32u
+#define PHYSICAL_SECTOR   0x00100000u
+#define ERRSR_SQER        (1u << 1)
+
+static bool s_multi_erase = true;
+
+/* Erase sectors[0..n) (sorted, sector aligned), merging consecutive ones. */
+static esp_err_t erase_sectors(const uint32_t *sectors, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ) {
+        const int64_t t0 = esp_timer_get_time();
+        const uint32_t first = command_address(sectors[i]);
+        uint32_t run = 1;
+
+        while (s_multi_erase && i + run < n && run < ERASE_RUN_MAX &&
+               command_address(sectors[i + run]) == first + run * TRICORE_FLASH_SECTOR &&
+               (first & ~(PHYSICAL_SECTOR - 1u)) ==
+                   ((first + run * TRICORE_FLASH_SECTOR) & ~(PHYSICAL_SECTOR - 1u))) {
+            run++;
+        }
+        esp_err_t err = erase_range(sectors[i], run);
+        if (err != ESP_OK && run > 1 && (tricore_flash_status.errsr & ERRSR_SQER)) {
+            ESP_LOGW(TAG, "a %u-sector erase was refused (SQER); one sector per command "
+                          "from here on", (unsigned)run);
+            s_multi_erase = false;
+            tricore_flash_status.errsr = 0;
+            run = 1;
+            err = erase_sector(sectors[i]);
+        }
+        tricore_flash_status.erase_ms += (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        if (err != ESP_OK) {
+            return fail("erase of 0x%08" PRIX32 " failed, ERRSR 0x%08" PRIX32,
+                        sectors[i], tricore_flash_status.errsr);
+        }
+        tricore_flash_status.sectors_done += run;
+        i += run;
+    }
+    return ESP_OK;
 }
 
 /* 0x50 is program flash page mode; 0x5D would select data flash instead. */
@@ -276,18 +330,22 @@ static esp_err_t check_page_mode(void)
     return ESP_OK;
 }
 
-/* The CRC32 the stub computes: reflected 0xEDB88320, no table. */
-uint32_t tricore_flash_crc32(const uint8_t *data, uint32_t length)
+/* The CRC32 the stub computes: reflected 0xEDB88320, no table.  _update takes
+ * and returns the running (not inverted) value, starting at 0xFFFFFFFF. */
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t length)
 {
-    uint32_t crc = 0xFFFFFFFFu;
-
     for (uint32_t i = 0; i < length; i++) {
         crc ^= data[i];
         for (int bit = 0; bit < 8; bit++) {
             crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
         }
     }
-    return ~crc;
+    return crc;
+}
+
+uint32_t tricore_flash_crc32(const uint8_t *data, uint32_t length)
+{
+    return ~crc32_update(0xFFFFFFFFu, data, length);
 }
 
 /* -- stages --------------------------------------------------------------- */
@@ -487,22 +545,120 @@ esp_err_t tricore_flash_end(bool start_target)
     return err;
 }
 
-/* -- the whole-image path, for the web flasher ----------------------------- */
+/* -- differential ----------------------------------------------------------- */
 
-static esp_err_t write_locked(const tricore_flash_region_t *regions,
-                              size_t count)
+bool tricore_flash_differential = true;
+
+void tricore_flash_set_differential(bool enable)
+{
+    tricore_flash_differential = enable;
+}
+
+/*
+ * The target's CRC of [address, +length), without marking the session failed
+ * when the stub cannot read it: erased flash has no valid ECC and traps the
+ * stub, which is the case that needs programming anyway.  The timeout is
+ * scaled to what the stub needs (~0.4 us per byte), not to verify's.
+ */
+static bool target_crc_quiet(uint32_t address, uint32_t length, uint32_t *crc)
+{
+    const tricore_flash_phase_t phase = tricore_flash_status.phase;
+    char message[sizeof(tricore_flash_status.message)];
+    const uint32_t errsr = tricore_flash_status.errsr;
+
+    memcpy(message, tricore_flash_status.message, sizeof(message));
+    const esp_err_t err = tricore_flash_run_loader(LOADER_CMD_CHECKSUM, address, length,
+                                                   60u + length / 2000u, crc);
+    if (err != ESP_OK) {
+        tricore_flash_status.phase = phase;
+        memcpy(tricore_flash_status.message, message, sizeof(message));
+        tricore_flash_status.errsr = errsr;
+    }
+    return err == ESP_OK;
+}
+
+/*
+ * As tas-debug's select_changed: true if any byte this image programs into
+ * the sector differs from the target - only those bytes (with the page
+ * padding program adds at a region's end), never the rest of the sector,
+ * which is not ours to predict.  Skipping a sector leaves data outside the
+ * image alone; erasing it would destroy it, so a skip is never less safe.
+ */
+static bool sector_differs(uint32_t sector, const tricore_flash_region_t *regions,
+                           size_t count)
+{
+    static const uint8_t erased[TRICORE_FLASH_PAGE] = { 0 };   /* TRICORE_FLASH_ERASED */
+
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t start = regions[i].address, end = start + regions[i].length;
+        const uint32_t lo = (start > sector) ? start : sector;
+        const uint32_t hi = (end < sector + TRICORE_FLASH_SECTOR) ? end
+                                                                  : sector + TRICORE_FLASH_SECTOR;
+        if (lo >= hi) {
+            continue;
+        }
+        /* program pads the last page of a region with the erased value */
+        const uint32_t pad = (hi == end) ? ((TRICORE_FLASH_PAGE - (hi % TRICORE_FLASH_PAGE)) %
+                                            TRICORE_FLASH_PAGE) : 0u;
+        uint32_t expect = crc32_update(0xFFFFFFFFu, regions[i].data + (lo - start), hi - lo);
+        expect = ~crc32_update(expect, erased, pad);
+
+        uint32_t actual = 0;
+        if (!target_crc_quiet(tricore_flash_to_physical(lo), hi - lo + pad, &actual) ||
+            actual != expect) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Program the parts of a region that fall into the kept sectors. */
+static esp_err_t program_kept(const tricore_flash_region_t *r, const uint32_t *sectors,
+                              const bool *keep, uint32_t n)
+{
+    const uint32_t end = r->address + r->length;
+
+    for (uint32_t k = 0; k < n; ) {
+        if (!keep[k] || sectors[k] + TRICORE_FLASH_SECTOR <= r->address || sectors[k] >= end) {
+            k++;
+            continue;
+        }
+        /* a run of consecutive kept sectors */
+        uint32_t last = k;
+        while (last + 1 < n && keep[last + 1] &&
+               sectors[last + 1] == sectors[last] + TRICORE_FLASH_SECTOR &&
+               sectors[last + 1] < end) {
+            last++;
+        }
+        const uint32_t lo = (sectors[k] > r->address) ? sectors[k] : r->address;
+        const uint32_t top = sectors[last] + TRICORE_FLASH_SECTOR;
+        const uint32_t hi = (top < end) ? top : end;
+        if (tricore_flash_program(lo, r->data + (lo - r->address), hi - lo) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        k = last + 1;
+    }
+    return ESP_OK;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* -- the whole-image path, for the web flasher and GDB `load` ---------------- */
+
+/* Inside a session: erase and program what differs, then verify everything.
+ * Leaves the target halted; the caller ends the session. */
+esp_err_t tricore_flash_apply(const tricore_flash_region_t *regions, size_t count)
 {
     static uint32_t sectors[MAX_SECTORS];
+    static bool keep[MAX_SECTORS];
     uint32_t n = 0;
 
     if (regions == NULL || count == 0) {
         return ESP_ERR_INVALID_ARG;
-    }
-    if (tricore_flash_begin() != ESP_OK) {
-        return ESP_FAIL;
-    }
-    for (size_t i = 0; i < count; i++) {
-        tricore_flash_status.total_bytes += regions[i].length;
     }
 
     /* The sectors the regions touch, not the span between them. */
@@ -523,15 +679,58 @@ static esp_err_t write_locked(const tricore_flash_region_t *regions,
             }
         }
     }
-    tricore_flash_status.sectors = n;
-
-    esp_err_t err = ESP_OK;
-    for (uint32_t k = 0; k < n && err == ESP_OK; k++) {
-        err = tricore_flash_erase(sectors[k], TRICORE_FLASH_SECTOR);
+    qsort(sectors, n, sizeof(sectors[0]), cmp_u32);
+    for (uint32_t k = 0; k < n; k++) {
+        if (!is_program_flash(command_address(sectors[k]))) {
+            tricore_flash_safe_shutdown();
+            return fail("0x%08" PRIX32 " is not erasable program flash", sectors[k], 0);
+        }
     }
-    for (size_t i = 0; i < count && err == ESP_OK; i++) {
-        err = tricore_flash_program(regions[i].address, regions[i].data,
-                                    regions[i].length);
+
+    /* Differential: only sectors whose bytes differ are erased and written. */
+    uint32_t changed = 0;
+    if (tricore_flash_differential) {
+        tricore_flash_set_phase(TRICORE_FLASH_PREPARING, "comparing with the target");
+    }
+    const int64_t t_cmp = esp_timer_get_time();
+    for (uint32_t k = 0; k < n; k++) {
+        keep[k] = !tricore_flash_differential || sector_differs(sectors[k], regions, count);
+        changed += keep[k];
+    }
+    tricore_flash_status.compare_ms = (uint32_t)((esp_timer_get_time() - t_cmp) / 1000);
+    tricore_flash_status.sectors = changed;
+    tricore_flash_status.sectors_skipped = n - changed;
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t start = regions[i].address, end = start + regions[i].length;
+        for (uint32_t k = 0; k < n; k++) {
+            const uint32_t lo = (start > sectors[k]) ? start : sectors[k];
+            const uint32_t top = sectors[k] + TRICORE_FLASH_SECTOR;
+            const uint32_t hi = (end < top) ? end : top;
+            if (keep[k] && lo < hi) {
+                tricore_flash_status.total_bytes += hi - lo;
+            }
+        }
+    }
+    if (n - changed) {
+        ESP_LOGI(TAG, "differential: %" PRIu32 " of %" PRIu32 " sectors already match",
+                 n - changed, n);
+    }
+
+    /* Erase the changed ones (compacted, still sorted), then program them. */
+    static uint32_t erase_list[MAX_SECTORS];
+    uint32_t m = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (keep[k]) {
+            erase_list[m++] = sectors[k];
+        }
+    }
+    esp_err_t err = ESP_OK;
+    if (m) {
+        tricore_flash_set_phase(TRICORE_FLASH_ERASING, "erasing");
+        err = erase_sectors(erase_list, m);
+    }
+    for (size_t i = 0; i < count && err == ESP_OK && m; i++) {
+        err = program_kept(&regions[i], sectors, keep, n);
     }
     if (err != ESP_OK) {
         tricore_flash_safe_shutdown();
@@ -545,8 +744,23 @@ static esp_err_t write_locked(const tricore_flash_region_t *regions,
                                    regions[i].length);
     }
     tricore_flash_status.verified = (err == ESP_OK);
-    if (err != ESP_OK) {
-        return err;                 /* left halted, for inspection */
+    if (err == ESP_OK) {
+        tricore_flash_set_phase(TRICORE_FLASH_DONE, "programmed and verified");
+    }
+    return err;
+}
+
+static esp_err_t write_locked(const tricore_flash_region_t *regions,
+                              size_t count)
+{
+    if (regions == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (tricore_flash_begin() != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (tricore_flash_apply(regions, count) != ESP_OK) {
+        return ESP_FAIL;            /* left halted, for inspection */
     }
 
     tricore_flash_set_phase(TRICORE_FLASH_DONE, "starting the target");

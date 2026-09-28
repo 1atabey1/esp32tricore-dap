@@ -84,15 +84,27 @@ reports `busy`.
   program pages, safe shutdown, verify (CRC32 on target), reset, resume.
 - Loader blob byte-identical to tas-debug; `PROGRAM_SETTLE` patched 4000 -> 12000
   (the reference's ~200 us per page, at 300 MHz instead of the 100 MHz backup clock).
+- Differential, as tas-debug's `differential` mode: before erasing, the loader CRCs the
+  bytes the image programs into each sector (only those); matching sectors are neither
+  erased nor written. Unreadable (erased, no valid ECC) counts as changed. `?full=1`
+  on `/api/flash/start` programs everything.
+- Consecutive changed sectors are erased by one Erase Logical Sector Range command (up
+  to 32 sectors inside a 1 MB physical sector; tMERP = tERP = 0.5 s max). tas-debug saw
+  counts above one refused; this device accepts them. A refusal (SQER) falls back to one
+  sector per command until reboot.
 - Sessions run the DAP narrow at 24 MHz (the attach default is 4 MHz, restored after).
-  A 700 kB image takes 15.5 s: erase 8.8 s (199 ms per 16 KB sector), page programming
-  5.5 s, buffer transfers 0.8 s. Wide mode would not help: it cannot carry block writes,
-  and verification is a CRC on the target. `/api/flash/status` reports the split
-  (`erase_ms`, `write_ms`, `loader_ms`).
+  Wide mode would not help: it cannot carry block writes, and verification is a CRC on
+  the target.
+- A 700 kB image: 7.1 s in full (erase 0.4 s, page programming 5.5 s, buffer transfers
+  0.8 s); 0.7 s when unchanged, ~0.34 s more per changed sector. `/api/flash/status`
+  reports `compare_ms`, `erase_ms`, `write_ms`, `loader_ms` and `skipped`.
+- GDB `load` erases nothing on `vFlashErase`: the sectors BMP hands over (whole 16 KB,
+  padded with the erased value) are collected in PSRAM and applied on `vFlashDone` with
+  the same differential plan. An interrupted load leaves the flash as it was.
 - Block write loses its first parcel: after each block, drain IO_SUPERVISOR and rewrite word 0.
 - UCB range (0xAF000000) is mapped but writes are refused.
-- Sessions: `tricore_flash_begin` / `erase` / `program` / `end` (GDB `load`),
-  or `tricore_flash_write` (web, all-in-one).
+- Sessions: `tricore_flash_begin` / `apply` / `end` (GDB `load`), or `tricore_flash_write`
+  (web, all-in-one).
 
 ## GDB target
 

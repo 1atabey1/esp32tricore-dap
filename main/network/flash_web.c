@@ -307,14 +307,20 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* ?slow=1 forces word-at-a-time transfers instead of block writes. */
-    char query[32], val[8];
-    bool fast = true;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "slow", val, sizeof(val)) == ESP_OK) {
-        fast = (atoi(val) == 0);
+    /* ?slow=1 forces word-at-a-time transfers instead of block writes;
+     * ?full=1 erases and programs every sector, not only the changed ones. */
+    char query[48], val[8];
+    bool fast = true, full = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "slow", val, sizeof(val)) == ESP_OK) {
+            fast = (atoi(val) == 0);
+        }
+        if (httpd_query_key_value(query, "full", val, sizeof(val)) == ESP_OK) {
+            full = (atoi(val) != 0);
+        }
     }
     tricore_flash_set_blockwrite(fast);
+    tricore_flash_set_differential(!full);
 
     /* Own low-priority task, so the single httpd task keeps serving status. */
     if (xTaskCreate(flash_task, "tricore_flash", 8192, NULL, 4,
@@ -352,13 +358,14 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
     tricore_flash_get_status(&st);
     const int n = snprintf(line, sizeof(line),
         "phase=%s running=%d total=%" PRIu32 " done=%" PRIu32
-        " sectors=%" PRIu32 " sectors_done=%" PRIu32 " ms=%" PRIu32
+        " sectors=%" PRIu32 " sectors_done=%" PRIu32 " skipped=%" PRIu32 " ms=%" PRIu32
+        " compare_ms=%" PRIu32
         " erase_ms=%" PRIu32 " write_ms=%" PRIu32 " loader_ms=%" PRIu32
         " verified=%d errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
         " message=%s\n",
         phase_name(st.phase), s_flash_task ? 1 : 0, st.total_bytes,
-        st.done_bytes, st.sectors, st.sectors_done, st.elapsed_ms,
-        st.erase_ms, st.write_ms, st.loader_ms,
+        st.done_bytes, st.sectors, st.sectors_done, st.sectors_skipped, st.elapsed_ms,
+        st.compare_ms, st.erase_ms, st.write_ms, st.loader_ms,
         st.verified ? 1 : 0, st.errsr, s_image.bytes, st.message);
 
     httpd_resp_set_type(req, "text/plain");

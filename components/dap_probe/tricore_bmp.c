@@ -15,6 +15,7 @@
 #include "dap_phy.h"
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -319,38 +320,166 @@ static void forget_triggers(void) {
 
 /* -- flash: GDB `load` ----------------------------------------------------- */
 
-/* One load is one flasher session: begin on the first flash packet, end on
+/*
+ * One load is one flasher session: begin on the first flash packet, end on
  * vFlashDone.  Per-region prepare/done stay empty because BMP calls them again
- * between erase and write, which would reset the target twice. */
+ * between erase and write, which would reset the target twice.
+ *
+ * GDB erases before it sends data, so nothing is erased on vFlashErase: the
+ * erase requests and the written sectors (BMP hands over whole 16 KB sectors,
+ * padded with the erased value) are collected in PSRAM, and vFlashDone runs
+ * the web flasher's plan on them - sectors that already hold the data are
+ * skipped, the rest erased together and programmed, everything verified.
+ */
+#define LOAD_MAX_SECTORS 768u
+
+typedef struct {
+  uint32_t address;         /* physical, sector aligned */
+  uint8_t *data;            /* TRICORE_FLASH_SECTOR bytes, or NULL: erase only */
+} load_sector_t;
+
+static load_sector_t *s_load;
+static uint32_t s_load_n;
+
+static void load_reset(void) {
+  for (uint32_t i = 0; i < s_load_n; i++) {
+    free(s_load[i].data);
+  }
+  free(s_load);
+  s_load = NULL;
+  s_load_n = 0;
+}
+
+static load_sector_t *load_sector(uint32_t address) {
+  address = tricore_flash_to_physical(address) & ~(TRICORE_FLASH_SECTOR - 1u);
+  for (uint32_t i = 0; i < s_load_n; i++) {
+    if (s_load[i].address == address) {
+      return &s_load[i];
+    }
+  }
+  if (s_load == NULL) {
+    s_load = calloc(LOAD_MAX_SECTORS, sizeof(*s_load));
+  }
+  if (s_load == NULL || s_load_n == LOAD_MAX_SECTORS) {
+    return NULL;
+  }
+  s_load[s_load_n] = (load_sector_t){address, NULL};
+  return &s_load[s_load_n++];
+}
+
+static int cmp_sector(const void *a, const void *b) {
+  const uint32_t x = ((const load_sector_t *)a)->address;
+  const uint32_t y = ((const load_sector_t *)b)->address;
+  return (x > y) - (x < y);
+}
+
+/* The collected load: erase-only sectors as GDB asked, the rest as regions of
+ * consecutive sectors through tricore_flash_apply. */
+static bool load_apply(void) {
+  if (s_load_n == 0) {
+    return true;
+  }
+  qsort(s_load, s_load_n, sizeof(*s_load), cmp_sector);
+
+  tricore_flash_region_t *regions = calloc(s_load_n, sizeof(*regions));
+  uint8_t **runs = calloc(s_load_n, sizeof(*runs));
+  size_t count = 0;
+  bool ok = regions != NULL && runs != NULL;
+
+  for (uint32_t i = 0; ok && i < s_load_n; ) {
+    if (s_load[i].data == NULL) {           /* erased on request, nothing written */
+      ok = tricore_flash_erase(s_load[i].address, TRICORE_FLASH_SECTOR) == ESP_OK;
+      i++;
+      continue;
+    }
+    uint32_t j = i + 1;
+    while (j < s_load_n && s_load[j].data != NULL &&
+           s_load[j].address == s_load[j - 1].address + TRICORE_FLASH_SECTOR) {
+      j++;
+    }
+    const size_t len = (size_t)(j - i) * TRICORE_FLASH_SECTOR;
+    uint8_t *run = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (run == NULL) {
+      ESP_LOGE(TAG, "load: no memory for %u bytes", (unsigned)len);
+      ok = false;
+      break;
+    }
+    for (uint32_t k = i; k < j; k++) {
+      memcpy(run + (size_t)(k - i) * TRICORE_FLASH_SECTOR, s_load[k].data,
+             TRICORE_FLASH_SECTOR);
+      free(s_load[k].data);
+      s_load[k].data = NULL;
+    }
+    runs[count] = run;
+    regions[count] = (tricore_flash_region_t){s_load[i].address, (uint32_t)len, run};
+    count++;
+    i = j;
+  }
+  if (ok && count) {
+    tricore_flash_set_differential(true);
+    ok = tricore_flash_apply(regions, count) == ESP_OK;
+  }
+  for (size_t i = 0; runs != NULL && i < count; i++) {
+    free(runs[i]);
+  }
+  free(runs);
+  free(regions);
+  return ok;
+}
+
 static bool tricore_enter_flash_mode(target_s *target) {
   (void)target;
+  load_reset();
   return tricore_flash_begin() == ESP_OK;
 }
 
 static bool tricore_exit_flash_mode(target_s *target) {
   (void)target;
-  const bool ok = tricore_flash_end(false) == ESP_OK;
+  bool ok = load_apply();
+  load_reset();
+  ok &= tricore_flash_end(false) == ESP_OK;
   forget_triggers();
   return ok;
 }
 
 /* Undo a failed session, so the next `load` starts a fresh one. */
 static bool flash_failed(target_flash_s *flash) {
+  load_reset();
   tricore_flash_end(false);
   flash->t->flash_mode = false;
   return false;
 }
 
 static bool pflash_erase(target_flash_s *flash, target_addr_t addr, size_t len) {
-  return tricore_flash_erase((uint32_t)addr, (uint32_t)len) == ESP_OK
-             ? true : flash_failed(flash);
+  for (uint32_t at = (uint32_t)addr; at < (uint32_t)(addr + len); at += TRICORE_FLASH_SECTOR) {
+    if (load_sector(at) == NULL) {
+      ESP_LOGE(TAG, "load: more than %u sectors", (unsigned)LOAD_MAX_SECTORS);
+      return flash_failed(flash);
+    }
+  }
+  return true;
 }
 
 static bool pflash_write(target_flash_s *flash, target_addr_t dest,
                          const void *src, size_t len) {
-  return tricore_flash_program((uint32_t)dest, (const uint8_t *)src,
-                               (uint32_t)len) == ESP_OK
-             ? true : flash_failed(flash);
+  for (size_t off = 0; off < len; off += TRICORE_FLASH_SECTOR) {
+    load_sector_t *s = load_sector((uint32_t)(dest + off));
+    if (s == NULL) {
+      return flash_failed(flash);
+    }
+    if (s->data == NULL) {
+      s->data = heap_caps_malloc(TRICORE_FLASH_SECTOR, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (s->data == NULL) {
+        ESP_LOGE(TAG, "load: out of memory for the sector at 0x%08lX",
+                 (unsigned long)s->address);
+        return flash_failed(flash);
+      }
+      memset(s->data, TRICORE_FLASH_ERASED, TRICORE_FLASH_SECTOR);
+    }
+    const size_t n = (len - off < TRICORE_FLASH_SECTOR) ? len - off : TRICORE_FLASH_SECTOR;
+    memcpy(s->data, (const uint8_t *)src + off, n);
+  }
+  return true;
 }
 
 /* UCBs and data flash are never programmed from here, as in the reference:
@@ -462,8 +591,10 @@ static bool tricore_attach(target_s *target) {
 static void tricore_detach(target_s *target) {
   const int core = CORE_OF(target);
 
-  /* GDB gone mid-load: BMP detaches without ending the flash session. */
+  /* GDB gone mid-load: BMP detaches without ending the flash session.  The
+   * load was only collected, so the flash is as it was. */
   if (target->flash_mode) {
+    load_reset();
     tricore_flash_end(false);
     forget_triggers();
     target->flash_mode = false;

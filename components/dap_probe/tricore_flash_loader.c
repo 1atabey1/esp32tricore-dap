@@ -11,6 +11,7 @@
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -309,13 +310,20 @@ esp_err_t tricore_flash_run_loader(uint32_t cmd, uint32_t address,
         return fail("could not resume into the loader");
     }
 
-    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    const int64_t started = esp_timer_get_time();
+    const int64_t deadline = started + (int64_t)timeout_ms * 1000;
     uint32_t dbgsr = 0;
     while (esp_timer_get_time() < deadline) {
         if (tricore_dbgsr(0, &dbgsr) == ESP_OK && (dbgsr & 0x2u)) {
             break;
         }
-        vTaskDelay(1);
+        /* Short runs (a sector's checksum takes ~7 ms) are polled closely;
+         * a tick is 10 ms, which would double them. */
+        if (esp_timer_get_time() - started < 20000) {
+            esp_rom_delay_us(250);
+        } else {
+            vTaskDelay(1);
+        }
     }
     tricore_halt(0, HALT_LINE, 200);
     tricore_read_pc(0, &pc);
