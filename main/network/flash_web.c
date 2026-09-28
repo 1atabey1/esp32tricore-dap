@@ -18,8 +18,8 @@
 
 static const char *TAG = "FLASH_WEB";
 
-/* Accepted program-flash window (uncached).  Records outside it (UCBs, data
- * flash) are counted and skipped. */
+/* Accepted program-flash window (uncached).  Records outside it and the UCB
+ * window (data flash, RAM) are counted and skipped. */
 #define PFLASH_BASE  0xA0000000u
 #define PFLASH_END   0xA0800000u
 /* The cached alias the linker usually emits; the flash is the same. */
@@ -33,7 +33,10 @@ typedef struct {
     uint32_t lowest;        /* physical address of the first byte seen */
     uint32_t highest;       /* physical address after the last byte seen */
     uint32_t bytes;         /* program-flash bytes accepted */
-    uint32_t skipped;       /* bytes outside program flash */
+    uint32_t skipped;       /* bytes outside program flash and the UCBs */
+    uint8_t *ucb;           /* PSRAM, TRICORE_UCB_WINDOW, 0x00-filled (erased data flash) */
+    uint64_t ucb_present;   /* bit n: the image has records in UCB slot n */
+    uint32_t ucb_bytes;
     uint32_t records;
     uint32_t upper;         /* from the last type 04/02 record */
     bool     bad;
@@ -44,6 +47,7 @@ typedef struct {
 } hex_image_t;
 
 static hex_image_t s_image;
+static tricore_ucb_image_t s_ucb_image;
 static TaskHandle_t s_flash_task;
 
 /* -- the parser ----------------------------------------------------------- */
@@ -116,6 +120,18 @@ static void parse_record(const char *text, size_t len)
         /* The linker emits the cached alias; the flash is the same. */
         if (address >= PFLASH_CACHED_BASE && address < PFLASH_CACHED_BASE + 0x800000u) {
             address = address - PFLASH_CACHED_BASE + PFLASH_BASE;
+        }
+        /* UCB contents are kept aside; they are written only when asked. */
+        if (address >= TRICORE_UCB_BASE &&
+            address + count <= TRICORE_UCB_BASE + TRICORE_UCB_WINDOW) {
+            const uint32_t at = address - TRICORE_UCB_BASE;
+            memcpy(s_image.ucb + at, &raw[4], count);
+            for (uint32_t slot = at / TRICORE_UCB_SIZE;
+                 count && slot <= (at + count - 1u) / TRICORE_UCB_SIZE; slot++) {
+                s_image.ucb_present |= 1ull << slot;
+            }
+            s_image.ucb_bytes += count;
+            return;
         }
         if (address < PFLASH_BASE || address + count > PFLASH_END) {
             s_image.skipped += count;
@@ -194,9 +210,18 @@ static esp_err_t image_reset(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    uint8_t *keep = s_image.data;
+    if (s_image.ucb == NULL) {
+        s_image.ucb = heap_caps_malloc(TRICORE_UCB_WINDOW, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_image.ucb == NULL) {
+            ESP_LOGE(TAG, "no PSRAM for the UCB image");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    uint8_t *keep = s_image.data, *keep_ucb = s_image.ucb;
     memset(&s_image, 0, sizeof(s_image));
     s_image.data = keep;
+    s_image.ucb = keep_ucb;
+    memset(s_image.ucb, 0x00, TRICORE_UCB_WINDOW);
     s_image.lowest = 0xFFFFFFFFu;
     /* Erased, so a gap inside the image programs as erased flash. */
     memset(s_image.data, TRICORE_FLASH_ERASED, IMAGE_MAX_BYTES);
@@ -251,7 +276,7 @@ static esp_err_t flash_upload_handler(httpd_req_t *req)
         s_image.line_len = 0;
     }
 
-    char reply[256];
+    char reply[512];
     if (s_image.bad) {
         snprintf(reply, sizeof(reply), "rejected: %s\n", s_image.error);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -260,11 +285,23 @@ static esp_err_t flash_upload_handler(httpd_req_t *req)
                  "rejected: nothing in this file lands in program flash\n");
         httpd_resp_set_status(req, "400 Bad Request");
     } else {
-        snprintf(reply, sizeof(reply),
-                 "ok records=%" PRIu32 " bytes=%" PRIu32 " skipped=%" PRIu32
-                 " span=0x%08" PRIX32 "..0x%08" PRIX32 "\n",
-                 s_image.records, s_image.bytes, s_image.skipped,
-                 s_image.lowest, s_image.highest);
+        int n = snprintf(reply, sizeof(reply),
+                         "ok records=%" PRIu32 " bytes=%" PRIu32 " skipped=%" PRIu32
+                         " span=0x%08" PRIX32 "..0x%08" PRIX32 " ucb_bytes=%" PRIu32 " ucb=",
+                         s_image.records, s_image.bytes, s_image.skipped,
+                         s_image.lowest, s_image.highest, s_image.ucb_bytes);
+        const char *sep = "";
+        for (uint32_t slot = 0; slot < TRICORE_UCB_SLOTS && n > 0 && n < (int)sizeof(reply);
+             slot++) {
+            if (s_image.ucb_present & (1ull << slot)) {
+                const char *name = tricore_ucb_slot_name(slot);
+                n += snprintf(reply + n, sizeof(reply) - n, "%s%s", sep, name ? name : "?");
+                sep = ",";
+            }
+        }
+        if (n > 0 && n < (int)sizeof(reply)) {
+            snprintf(reply + n, sizeof(reply) - n, "%s\n", *sep ? "" : "none");
+        }
     }
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req, reply);
@@ -287,6 +324,7 @@ static void flash_task(void *arg)
     ESP_LOGI(TAG, "programming 0x%08" PRIX32 ", %" PRIu32 " bytes",
              region.address, region.length);
     tricore_flash_write(&region, 1);
+    tricore_flash_set_ucb(NULL);
 
     s_flash_task = NULL;
     vTaskDelete(NULL);
@@ -308,9 +346,10 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
     }
 
     /* ?slow=1 forces word-at-a-time transfers instead of block writes;
-     * ?full=1 erases and programs every sector, not only the changed ones. */
+     * ?full=1 erases and programs every sector, not only the changed ones;
+     * ?ucb=1 also writes the image's boot mode headers (off by default). */
     char query[48], val[8];
-    bool fast = true, full = false;
+    bool fast = true, full = false, ucb = false;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "slow", val, sizeof(val)) == ESP_OK) {
             fast = (atoi(val) == 0);
@@ -318,14 +357,20 @@ static esp_err_t flash_start_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "full", val, sizeof(val)) == ESP_OK) {
             full = (atoi(val) != 0);
         }
+        if (httpd_query_key_value(query, "ucb", val, sizeof(val)) == ESP_OK) {
+            ucb = (atoi(val) != 0);
+        }
     }
     tricore_flash_set_blockwrite(fast);
     tricore_flash_set_differential(!full);
+    s_ucb_image = (tricore_ucb_image_t){ .data = s_image.ucb, .present = s_image.ucb_present };
+    tricore_flash_set_ucb(ucb ? &s_ucb_image : NULL);
 
     /* Own low-priority task, so the single httpd task keeps serving status. */
     if (xTaskCreate(flash_task, "tricore_flash", 8192, NULL, 4,
                     &s_flash_task) != pdPASS) {
         s_flash_task = NULL;
+        tricore_flash_set_ucb(NULL);
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_sendstr(req, "could not start the flash task\n");
         return ESP_OK;
@@ -353,7 +398,7 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
     if (check_auth(req) != ESP_OK) return ESP_OK;
 
     tricore_flash_status_t st;
-    char line[384];
+    char line[512];
 
     tricore_flash_get_status(&st);
     const int n = snprintf(line, sizeof(line),
@@ -361,16 +406,27 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
         " sectors=%" PRIu32 " sectors_done=%" PRIu32 " skipped=%" PRIu32 " ms=%" PRIu32
         " compare_ms=%" PRIu32
         " erase_ms=%" PRIu32 " write_ms=%" PRIu32 " loader_ms=%" PRIu32
-        " verified=%d errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
+        " verified=%d ucb=%s errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
         " message=%s\n",
         phase_name(st.phase), s_flash_task ? 1 : 0, st.total_bytes,
         st.done_bytes, st.sectors, st.sectors_done, st.sectors_skipped, st.elapsed_ms,
         st.compare_ms, st.erase_ms, st.write_ms, st.loader_ms,
-        st.verified ? 1 : 0, st.errsr, s_image.bytes, st.message);
+        st.verified ? 1 : 0,
+        st.ucb == TRICORE_FLASH_UCB_OK ? "ok" : st.ucb == TRICORE_FLASH_UCB_FAILED ? "failed" : "off",
+        st.errsr, s_image.bytes, st.message);
 
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, line, (n > 0) ? (size_t)n : 0);
     return ESP_OK;
+}
+
+/* What the last UCB run decided and did, one line per block. */
+static esp_err_t flash_ucb_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, tricore_ucb_report());
 }
 
 esp_err_t flash_page_handler(httpd_req_t *req)
@@ -399,6 +455,10 @@ static httpd_uri_t uri_flash_status = {
     .uri = "/api/flash/status", .method = HTTP_GET,
     .handler = flash_status_handler, .user_ctx = NULL
 };
+static httpd_uri_t uri_flash_ucb = {
+    .uri = "/api/flash/ucb", .method = HTTP_GET,
+    .handler = flash_ucb_handler, .user_ctx = NULL
+};
 
 void flash_web_register(httpd_handle_t server)
 {
@@ -406,4 +466,5 @@ void flash_web_register(httpd_handle_t server)
     httpd_register_uri_handler(server, &uri_flash_upload);
     httpd_register_uri_handler(server, &uri_flash_start);
     httpd_register_uri_handler(server, &uri_flash_status);
+    httpd_register_uri_handler(server, &uri_flash_ucb);
 }

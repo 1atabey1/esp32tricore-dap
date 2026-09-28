@@ -750,6 +750,13 @@ esp_err_t tricore_flash_apply(const tricore_flash_region_t *regions, size_t coun
     return err;
 }
 
+static const tricore_ucb_image_t *s_ucb;
+
+void tricore_flash_set_ucb(const tricore_ucb_image_t *image)
+{
+    s_ucb = image;
+}
+
 static esp_err_t write_locked(const tricore_flash_region_t *regions,
                               size_t count)
 {
@@ -763,8 +770,21 @@ static esp_err_t write_locked(const tricore_flash_region_t *regions,
         return ESP_FAIL;            /* left halted, for inspection */
     }
 
+    /* The reference's order: program flash verified, then the UCBs, then the
+     * reset that starts the target - which happens whatever the UCBs did. */
+    if (s_ucb != NULL) {
+        tricore_flash_set_phase(TRICORE_FLASH_PROGRAMMING, "programming the boot mode headers");
+        tricore_flash_status.ucb = (tricore_ucb_program(s_ucb) == ESP_OK)
+                                       ? TRICORE_FLASH_UCB_OK : TRICORE_FLASH_UCB_FAILED;
+    }
+
     tricore_flash_set_phase(TRICORE_FLASH_DONE, "starting the target");
     if (tricore_flash_end(true) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (tricore_flash_status.ucb == TRICORE_FLASH_UCB_FAILED) {
+        tricore_flash_set_phase(TRICORE_FLASH_FAILED, "programmed, verified and started, but "
+                                "a boot mode header was refused or failed (UCB report)");
         return ESP_FAIL;
     }
     tricore_flash_set_phase(TRICORE_FLASH_DONE, "programmed, verified and started");

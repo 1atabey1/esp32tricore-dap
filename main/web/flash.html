@@ -29,6 +29,7 @@
   button:disabled { opacity:.4; cursor:default; }
   button.primary { background:var(--accent); border-color:var(--accent);
                    color:#08121f; font-weight:600; }
+  button.primary:hover:not(:disabled) { color:#08121f; filter:brightness(1.15); }
   input[type=file] { color:var(--dim); font-size:13px; }
   .bar { height:8px; background:var(--panel); border:1px solid var(--line);
          border-radius:6px; overflow:hidden; margin:6px 0 14px; }
@@ -48,6 +49,12 @@
   h2 { font-size:13px; color:var(--dim); text-transform:uppercase;
        letter-spacing:.6px; margin:22px 0 8px; font-weight:600; }
   .note { color:var(--dim); font-size:12.5px; max-width:68ch; }
+  label.opt { display:flex; gap:8px; align-items:center; color:var(--ink);
+              font-size:13px; cursor:pointer; }
+  label.opt input { accent-color:var(--warn); }
+  #ucbreport { font-family:var(--mono); font-size:12px; white-space:pre;
+               color:var(--dim); background:var(--panel); border:1px solid var(--line);
+               border-radius:9px; padding:11px 13px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -65,9 +72,17 @@
     <button id="start" class="primary" disabled>Erase &amp; program</button>
   </div>
 
+  <div class="row">
+    <label class="opt"><input type="checkbox" id="ucb">
+      Also program the boot mode headers (BMHD0..3, ORIG and COPY) from the image</label>
+  </div>
+
   <p class="note">
-    Takes an Intel HEX (<code>.hex</code>). Only flashes PFLASH, no UCB or DFLASH.
-    Every flash is a full erase & write, not differential.
+    Takes an Intel HEX (<code>.hex</code>). Programs program flash, skipping sectors
+    that already hold the image; never DFLASH. The boot mode headers are written only
+    with the box ticked, only after the program flash verifies, and only while the
+    device reports them UNREAD or UNLOCKED; other UCBs (SWAP, OTP, DBG, HSM, ...) are
+    never written.
   </p>
 
   <div class="bar"><i id="bar"></i></div>
@@ -78,10 +93,16 @@
     <div class="cell"><div class="k">Sectors</div><div class="v" id="s_sect">-</div></div>
     <div class="cell"><div class="k">Elapsed</div><div class="v" id="s_ms">-</div></div>
     <div class="cell"><div class="k">Verified</div><div class="v" id="s_ver">-</div></div>
+    <div class="cell"><div class="k">Boot headers</div><div class="v" id="s_ucb">-</div></div>
   </div>
 
   <h2>Log</h2>
   <div id="log"></div>
+
+  <div id="ucbbox" hidden>
+    <h2>User configuration blocks</h2>
+    <div id="ucbreport"></div>
+  </div>
 </main>
 
 <script>
@@ -118,10 +139,15 @@ el("upload").onclick = async () => {
 };
 
 el("start").onclick = async () => {
-  if (!confirm("Erase and reprogram the target's flash?")) return;
+  const ucb = el("ucb").checked;
+  if (!confirm(ucb
+      ? "Erase and reprogram the target's flash AND its boot mode headers?\n\n" +
+        "A wrong boot mode header can leave a part that does not boot."
+      : "Erase and reprogram the target's flash?")) return;
   el("start").disabled = true;
+  el("ucbbox").hidden = true;
   try {
-    const r = await fetch("/api/flash/start", { method: "POST" });
+    const r = await fetch("/api/flash/start" + (ucb ? "?ucb=1" : ""), { method: "POST" });
     log((await r.text()).trim());
   } catch (e) {
     log("could not start: " + e.message);
@@ -158,9 +184,14 @@ async function poll() {
   el("s_ms").textContent = num("ms") ? (num("ms") / 1000).toFixed(1) + " s" : "-";
 
   const v = el("s_ver");
-  if (kv.phase === "done") { v.textContent = "yes"; v.className = "v ok"; }
+  if (num("verified")) { v.textContent = "yes"; v.className = "v ok"; }
   else if (kv.phase === "failed") { v.textContent = "no"; v.className = "v bad"; }
   else { v.textContent = "-"; v.className = "v"; }
+
+  const u = el("s_ucb");
+  if (kv.ucb === "ok") { u.textContent = "ok"; u.className = "v ok"; }
+  else if (kv.ucb === "failed") { u.textContent = "failed"; u.className = "v bad"; }
+  else { u.textContent = running && el("ucb").checked ? "..." : "-"; u.className = "v"; }
 
   el("bar").style.width = num("total")
     ? Math.round(100 * num("done") / num("total")) + "%" : "0";
@@ -171,9 +202,17 @@ async function poll() {
   }
 
   if (wasRunning && !running) {
+    wasRunning = false;           /* before the await, so an overlapping poll does not repeat this */
     log(kv.phase + ": " + (kv.message || ""));
     if (kv.phase === "done") {
       log("elapsed " + (num("ms") / 1000).toFixed(1) + " s");
+    }
+    if (kv.ucb && kv.ucb !== "off") {
+      try {
+        el("ucbreport").textContent =
+          await (await fetch("/api/flash/ucb", { cache: "no-store" })).text();
+        el("ucbbox").hidden = false;
+      } catch (e) { log("could not fetch the UCB report: " + e.message); }
     }
     el("start").disabled = false;
   }

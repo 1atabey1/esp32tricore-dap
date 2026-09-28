@@ -42,6 +42,7 @@ flash programming, trace drain and a Black Magic Probe (BMP) GDB target.
 | `tricore_bmp.c`, `include/tricore_bmp.h` | BMP target: tdesc, memory map, flash callbacks |
 | `tricore_flash.c`, `include/tricore_flash.h` | Flash layout, erase/program/verify, sessions |
 | `tricore_flash_loader.c`, `tricore_flash_priv.h` | Loader stub (from tas-debug), reset-and-halt, trap dump |
+| `tricore_ucb.c`, `include/tricore_ucb.h` | Boot mode header (UCB) plan and writer, from tas-debug's `ucb.py` / `ucb_program.py` |
 | `dap_trace.c`, `include/dap_trace.h` | TRAM drain, stream records |
 | `dap_mcds.c`, `include/dap_mcds.h` | miniMCDS setup for data trace (DTU) / watch-points (WTU) |
 | `test/` | Host unit test for `dap_frame.c` (`make -C test`) |
@@ -102,7 +103,18 @@ reports `busy`.
   padded with the erased value) are collected in PSRAM and applied on `vFlashDone` with
   the same differential plan. An interrupted load leaves the flash as it was.
 - Block write loses its first parcel: after each block, drain IO_SUPERVISOR and rewrite word 0.
-- UCB range (0xAF000000) is mapped but writes are refused.
+- UCB range (0xAF000000) is mapped, but GDB writes to it are refused.
+- UCBs: web flasher only, `?ucb=1` (the page's checkbox, off by default), as tas-debug's
+  `--ucb`. After the program flash verifies and before the reset, `tricore_ucb.c` plans
+  every block the HEX carries (0xAF400000..0xAF406000, padded with 0x00): only
+  BMHD0..3 ORIG/COPY are candidates; SWAP, OTP, DBG, HSM, ... are listed and skipped.
+  A header is refused when it fails the formal check (BMHDID, BMI.HWCFG, STAD, CRCBMHD
+  pair, confirmation word), would be CONFIRMED by the image, is not UNREAD/UNLOCKED in
+  `DMU_HF_CONFIRMx`, or cannot be read; identical headers are skipped. A write is a
+  one-sector erase (read back as all 0x00), 8-byte data flash pages (`0x5D`) with the
+  confirmation-word page last, read-back compare and re-check: ~0.1 s per block.
+  The target is started either way; a refusal or failure sets `phase=failed ucb=failed`.
+  Report: `/api/flash/ucb`.
 - Sessions: `tricore_flash_begin` / `apply` / `end` (GDB `load`), or `tricore_flash_write`
   (web, all-in-one).
 
