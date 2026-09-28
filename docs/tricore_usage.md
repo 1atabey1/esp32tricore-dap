@@ -28,7 +28,7 @@ CLI:
 
 ```sh
 curl -u admin:admin --data-binary @app.hex http://<board>/api/flash/upload   # "ok records=.. bytes=.."
-curl -u admin:admin -X POST http://<board>/api/flash/start                   # block writes (~20 s / 700 kB)
+curl -u admin:admin -X POST http://<board>/api/flash/start                   # block writes (~15.5 s / 700 kB)
 curl -u admin:admin -X POST 'http://<board>/api/flash/start?slow=1'          # word writes (fallback)
 curl -u admin:admin http://<board>/api/flash/status                          # phase=done verified=1 ...
 ```

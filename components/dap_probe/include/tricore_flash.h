@@ -55,6 +55,9 @@ typedef struct {
     uint32_t sectors;
     uint32_t sectors_done;
     uint32_t elapsed_ms;
+    uint32_t erase_ms;          /* sector erases */
+    uint32_t write_ms;          /* data into the loader buffer, over DAP */
+    uint32_t loader_ms;         /* the loader programming pages */
     uint32_t errsr;             /* DMU_HF_ERRSR at the last failure */
     bool     verified;
     char     message[160];

@@ -82,7 +82,13 @@ reports `busy`.
 - Sequence per tas-debug: reset-and-halt, halt all started cores, load loader
   blob to CPU0 PSPR `0x70100000` (verify readback), ENDINIT, erase sectors,
   program pages, safe shutdown, verify (CRC32 on target), reset, resume.
-- Loader blob byte-identical to tas-debug; `PROGRAM_SETTLE` patched 4000 -> 16000.
+- Loader blob byte-identical to tas-debug; `PROGRAM_SETTLE` patched 4000 -> 12000
+  (the reference's ~200 us per page, at 300 MHz instead of the 100 MHz backup clock).
+- Sessions run the DAP narrow at 24 MHz (the attach default is 4 MHz, restored after).
+  A 700 kB image takes 15.5 s: erase 8.8 s (199 ms per 16 KB sector), page programming
+  5.5 s, buffer transfers 0.8 s. Wide mode would not help: it cannot carry block writes,
+  and verification is a CRC on the target. `/api/flash/status` reports the split
+  (`erase_ms`, `write_ms`, `loader_ms`).
 - Block write loses its first parcel: after each block, drain IO_SUPERVISOR and rewrite word 0.
 - UCB range (0xAF000000) is mapped but writes are refused.
 - Sessions: `tricore_flash_begin` / `erase` / `program` / `end` (GDB `load`),

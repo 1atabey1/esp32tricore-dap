@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "dap_phy_fpga.h"
 #include "dap_probe.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -291,6 +292,22 @@ uint32_t tricore_flash_crc32(const uint8_t *data, uint32_t length)
 
 /* -- stages --------------------------------------------------------------- */
 
+/*
+ * The DAP clock while flashing: 24 MHz instead of the 4 MHz attach default.
+ * Filling the loader buffer is the only link-bound part (block writes, which
+ * wide mode cannot carry); at 4 MHz it took 2.75 s of a 700 kB image.  The
+ * on-target CRC catches a bad transfer.  Every exit restores the default.
+ */
+#define FLASH_DAP_DIV    0u
+#define ATTACH_DAP_DIV   5u
+
+static void flash_clock(bool fast)
+{
+    if (dap_phy_fpga_ready() && !dap_phy_fpga_is_wide()) {
+        dap_phy_fpga_set_div(fast ? FLASH_DAP_DIV : ATTACH_DAP_DIV);
+    }
+}
+
 /* A session holds the DAP lock from begin to end, across GDB packets. */
 static bool s_session_locked;
 
@@ -298,6 +315,7 @@ static void session_unlock(void)
 {
     if (s_session_locked) {
         s_session_locked = false;
+        flash_clock(false);
         dap_unlock();
     }
 }
@@ -312,6 +330,7 @@ static esp_err_t begin_locked(void)
     if (tricore_flash_install_loader() != ESP_OK) {
         return ESP_FAIL;            /* the loader has set the reason */
     }
+    flash_clock(true);              /* after the resets, which attach at 4 MHz */
     if (tricore_flash_layout(NULL) == 0) {
         tricore_flash_safe_shutdown();
         return fail("unknown flash layout (SCU_CHIPID)", 0, 0);
@@ -350,7 +369,10 @@ esp_err_t tricore_flash_erase(uint32_t address, uint32_t length)
         }
     }
     for (uint32_t at = first; at < address + length; at += TRICORE_FLASH_SECTOR) {
-        if (erase_sector(at) != ESP_OK) {
+        const int64_t t0 = esp_timer_get_time();
+        const esp_err_t err = erase_sector(at);
+        tricore_flash_status.erase_ms += (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        if (err != ESP_OK) {
             return fail("erase of 0x%08" PRIX32 " failed, ERRSR 0x%08" PRIX32,
                         at, tricore_flash_status.errsr);
         }
@@ -382,13 +404,18 @@ esp_err_t tricore_flash_program(uint32_t address, const uint8_t *data,
         memset(buf, TRICORE_FLASH_ERASED, padded);   /* partial pages stay erased */
         memcpy(buf, data + off, chunk);
 
+        const int64_t t0 = esp_timer_get_time();
         if (tricore_flash_write_block(LOADER_BUFFER, buf, padded) != ESP_OK) {
             return fail("could not fill the loader buffer", 0, 0);
         }
-        if (tricore_flash_run_loader(LOADER_CMD_PROGRAM,
-                                     command_address(address + off),
-                                     padded / TRICORE_FLASH_PAGE, 20000,
-                                     NULL) != ESP_OK) {
+        const int64_t t1 = esp_timer_get_time();
+        const esp_err_t err = tricore_flash_run_loader(LOADER_CMD_PROGRAM,
+                                                       command_address(address + off),
+                                                       padded / TRICORE_FLASH_PAGE, 20000,
+                                                       NULL);
+        tricore_flash_status.write_ms += (uint32_t)((t1 - t0) / 1000);
+        tricore_flash_status.loader_ms += (uint32_t)((esp_timer_get_time() - t1) / 1000);
+        if (err != ESP_OK) {
             tricore_flash_status.phase = TRICORE_FLASH_FAILED;
             return ESP_FAIL;        /* the loader has set the reason */
         }

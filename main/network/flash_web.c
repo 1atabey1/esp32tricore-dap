@@ -347,16 +347,18 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
     if (check_auth(req) != ESP_OK) return ESP_OK;
 
     tricore_flash_status_t st;
-    char line[320];
+    char line[384];
 
     tricore_flash_get_status(&st);
     const int n = snprintf(line, sizeof(line),
         "phase=%s running=%d total=%" PRIu32 " done=%" PRIu32
         " sectors=%" PRIu32 " sectors_done=%" PRIu32 " ms=%" PRIu32
+        " erase_ms=%" PRIu32 " write_ms=%" PRIu32 " loader_ms=%" PRIu32
         " verified=%d errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
         " message=%s\n",
         phase_name(st.phase), s_flash_task ? 1 : 0, st.total_bytes,
         st.done_bytes, st.sectors, st.sectors_done, st.elapsed_ms,
+        st.erase_ms, st.write_ms, st.loader_ms,
         st.verified ? 1 : 0, st.errsr, s_image.bytes, st.message);
 
     httpd_resp_set_type(req, "text/plain");

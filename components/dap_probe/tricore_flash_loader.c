@@ -48,10 +48,12 @@ static const uint8_t LOADER_BLOB[] = {
  * because a DMU status read from the core hangs it mid-operation.  The blob is
  * built with 4000, sized for the 100 MHz backup clock a DAS reset leaves; the
  * OCDS reset used here keeps the application's PLL, so 4000 is too short and
- * page 2 hits a busy DMU.  16000 covers 300 MHz.  It is patched into the blob
- * (MOV d4 at offset 96) rather than rebuilt, so the blob stays the reference's.
+ * page 2 hits a busy DMU.  12000 is the reference's ~200 us window at 300 MHz,
+ * the TC38x maximum (a page needs ~100 us); 16000 cost 7.3 s instead of 5.9 s
+ * for a 700 kB image.  It is patched into the blob (MOV d4 at offset 96)
+ * rather than rebuilt, so the blob stays the reference's.
  */
-#define PROGRAM_SETTLE     16000u
+#define PROGRAM_SETTLE     12000u
 #define SETTLE_MOV_OFFSET  96u
 #define SETTLE_MOV_WORD(c) ((4u << 28) | (((c) & 0xFFFFu) << 12) | 0x3Bu)
 
