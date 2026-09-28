@@ -190,11 +190,13 @@ def drag_feedback(sig: Signal) -> ft.Control:
         padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)
 
 
-def dragged(e) -> tuple[str, int | None] | None:
+def dragged(e) -> tuple | None:
     """(signal id, plot it was dragged off or None) of a drop, whichever
     draggable it came from: the signal list carries the id, a plot's legend
-    or a table's cell (id, plot)."""
+    or a table's cell (id, plot), the symbol tree its node (node, None)."""
     data = getattr(getattr(e, 'src', None), 'data', None)
+    if isinstance(data, elfsyms.Node):
+        return data, None
     if isinstance(data, tuple) and len(data) == 2:
         return str(data[0]), data[1]
     return (data, None) if isinstance(data, str) and data else None
@@ -1121,7 +1123,14 @@ class App:
             on_click=self.guard(lambda e, n=node: self.add_leaf(n) if n.is_leaf
                                 else self._toggle_node(n)),
             ink=True)
-        rows.append(row)
+        rows.append(ft.Draggable(
+            group='signal', data=node, content=row, affinity=ft.Axis.HORIZONTAL,
+            content_feedback=ft.Container(
+                ft.Row([ft.Icon(ft.Icons.DATA_OBJECT if not node.is_leaf else ft.Icons.SHOW_CHART,
+                                size=14),
+                        ft.Text(short_path(node.path) if node.is_leaf else
+                                '%s (all members)' % short_path(node.path), size=13)], tight=True),
+                padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)))
         if exp and open_:
             limit = self.shown.get(node.path, TREE_PAGE)
             kids = node.children(0, limit)
@@ -1584,8 +1593,8 @@ class App:
             'the chart button, pick step/line/points and the Y range from a plot\'s menu. '
             'A value table (table button) shows the latest value of each signal in it as dec, '
             'hex or ascii; click a value to change that row\'s format. Dragging from a plot '
-            'into a table, or back, copies the signal. The check mark in the symbol tree '
-            'removes a selected signal.\n\n'
+            'into a table, or back, copies the signal. Symbols can be dragged from the tree '
+            'too (a struct brings all its members); the check mark removes a selected one.\n\n'
             '**Trace live.** Press Start. The probe traces up to two address ranges, chosen '
             'from the selected signals (Capture tab). Every capture is written to the capture '
             'folder while the plots follow the newest data. The first values come from a '
@@ -1979,6 +1988,9 @@ class App:
         """A signal dropped on plot/table `dst` (or 'plot' / 'table': a new
         one).  Between two plots or two tables it moves; from a plot into a
         table or back it is copied (both keep it); from the list it is added."""
+        if isinstance(sid, elfsyms.Node):
+            self.drop_node(sid, dst)
+            return
         if sid not in self.ws.signals or dst == src:
             return
         source = self.ws.plot(src) if src is not None else None
@@ -1991,6 +2003,40 @@ class App:
             dst = self.ws.new_plot(dst).id
         self.ws.move_signal(sid, src, dst)
         self.selection_changed(retrace=False)
+
+    def drop_node(self, node: elfsyms.Node, dst) -> None:
+        """A symbol dropped from the tree: a member becomes a signal on plot /
+        table `dst` (or a new one: 'plot' / 'table'); an aggregate brings all
+        its numeric members (asked first above 64, like its list button)."""
+        leaves = [node] if node.is_leaf else list(node.leaves(1025))
+        if not leaves:
+            self.toast('%s has nothing traceable inside' % node.path)
+            return
+
+        def go(leaves):
+            if dst in ('plot', 'table'):
+                pid = self.ws.new_plot(dst).id
+            elif self.ws.plot(dst) is not None:
+                pid = dst
+            else:
+                return
+            for leaf in leaves[:1024]:
+                self.ws.add_signal(self.ws.signals.get(leaf.path) or leaf_signal(leaf), pid)
+            self.selection_changed()
+
+        if len(leaves) > 64:
+            def ok(e):
+                close_dialog(dlg)
+                go(leaves)
+                self.page.update()
+            dlg = ft.AlertDialog(
+                title=ft.Text('Add %d signals?' % min(len(leaves), 1024)),
+                content=ft.Text('%s has %d numeric members.' % (node.path, len(leaves))),
+                actions=[ft.TextButton('Cancel', on_click=lambda e: close_dialog(dlg)),
+                         ft.FilledButton('Add', on_click=ok)])
+            self.page.show_dialog(dlg)
+            return
+        go(leaves)
 
     def unplot(self, pid: int, sid: str) -> None:
         p = self.ws.plot(pid)

@@ -41,7 +41,9 @@ reload or a network drop only pauses drawing; a running trace carries on.
    numeric member of an aggregate with the list button. Numbers, floats,
    enums (shown by name), bools, pointers and bitfields are traceable. A raw
    address works without an ELF. The check mark of a selected member
-   removes it again (from its plots, tables and the trace).
+   removes it again (from its plots, tables and the trace). Rows can also be
+   dragged (sideways) onto a plot, a table or the drop zones; a struct or
+   array brings all its numeric members.
 2. **Plots** - every picked signal gets its own plot; drag signals from the
    **Signals** tab onto a plot to overlay them. Drag a legend entry onto
    another plot to move it there, or onto the drop zone below the last plot
