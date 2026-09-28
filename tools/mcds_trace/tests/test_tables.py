@@ -40,6 +40,28 @@ def test_dec_is_scaled_and_hex_is_raw():
     assert s.format_as(10, 'hex') == '0x000A'
 
 
+def test_move_signal_between_plots_and_copy_into_tables():
+    ws = Workspace()
+    a, b = raw_signal(0x1000, 4, 'a'), raw_signal(0x1004, 4, 'b')
+    ws.add_signal(a, -1)
+    ws.add_signal(b, None)                                # both on plot 1
+    p1 = ws.subplots[0]
+    p2 = ws.new_plot()
+    ws.move_signal(b.id, p1.id, p2.id)                    # move: off p1, onto p2
+    assert (p1.signals, p2.signals) == ([a.id], [b.id])
+    table = ws.new_plot('table')
+    ws.move_signal(a.id, None, table.id)                  # copy (no source): p1 keeps it
+    assert p1.signals == [a.id] and table.signals == [a.id]
+    ws.move_signal(b.id, p2.id, p1.id)                    # p2 left empty: it goes
+    assert ws.plot(p2.id) is None and p1.signals == [a.id, b.id]
+    t2 = ws.new_plot('table')
+    table.row_fmt[a.id] = 'hex'
+    ws.move_signal(a.id, table.id, t2.id)                 # table -> table keeps the row format
+    assert t2.row_fmt == {a.id: 'hex'} and ws.plot(table.id) is None
+    ws.move_signal('nope', None, t2.id)                   # unknown signal: nothing
+    assert t2.signals == [a.id]
+
+
 def test_tables_persist_and_do_not_merge_into_plots():
     ws = Workspace()
     a, b = raw_signal(0x1000, 4, 'a'), raw_signal(0x1004, 4, 'b')

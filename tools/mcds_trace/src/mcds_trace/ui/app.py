@@ -182,6 +182,24 @@ class View:
         self.set(self.x0 + dt, self.x1 + dt)
 
 
+def drag_feedback(sig: Signal) -> ft.Control:
+    """What follows the pointer while a signal is dragged."""
+    return ft.Container(
+        ft.Row([ft.Container(width=12, height=12, bgcolor=sig.color, border_radius=6),
+                ft.Text(sig.label, size=13)], tight=True),
+        padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)
+
+
+def dragged(e) -> tuple[str, int | None] | None:
+    """(signal id, plot it was dragged off or None) of a drop, whichever
+    draggable it came from: the signal list carries the id, a plot's legend
+    or a table's cell (id, plot)."""
+    data = getattr(getattr(e, 'src', None), 'data', None)
+    if isinstance(data, tuple) and len(data) == 2:
+        return str(data[0]), data[1]
+    return (data, None) if isinstance(data, str) and data else None
+
+
 # -- plots --------------------------------------------------------------------
 
 class PlotCard:
@@ -297,8 +315,11 @@ class PlotCard:
                                   on_click=lambda e, i=sid: self.app.unplot(self.model.id, i)),
                 ], spacing=4, tight=True),
                 padding=ft.Padding.only(left=6, right=0, top=0, bottom=0),
-                border_radius=12, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH, tooltip=tip)
-            self.legend.controls.append(chip)
+                border_radius=12, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                tooltip=tip + '\nDrag onto another plot to move it, onto a table to copy it')
+            self.legend.controls.append(ft.Draggable(
+                group='signal', data=(sid, self.model.id), content=chip,
+                content_feedback=drag_feedback(s)))
         self.last_key = None
 
     def update_values(self, at: float | None) -> None:
@@ -490,10 +511,9 @@ class PlotCard:
 
     def _on_drop(self, e) -> None:
         self._on_leave(e)
-        src = getattr(e, 'src', None)
-        sid = getattr(src, 'data', None)
-        if sid:
-            self.app.plot_signal(sid, self.model.id)
+        d = dragged(e)
+        if d:
+            self.app.drop_signal(d[0], d[1], self.model.id)
 
     def _style(self, style: str) -> None:
         self.model.style = style
@@ -690,7 +710,9 @@ class TableCard:
                 content=ft.Row([
                     ft.Container(width=8, height=8, bgcolor=sig.color, border_radius=4),
                     ft.Text(sig.label, size=12, no_wrap=True, expand=True,
-                            overflow=ft.TextOverflow.ELLIPSIS, tooltip=tip),
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=tip + '\nDrag onto another table to move it, onto a plot '
+                                          'to copy it'),
                     ft.Container(content=val, on_click=lambda e, i=sid: self._cycle(i),
                                  tooltip='%s - click for %s' % (
                                      self.fmt_of(sid) + (' (this row)' if own else ''),
@@ -706,6 +728,8 @@ class TableCard:
                 width=CELL_WIDTH, height=24,
                 padding=ft.Padding.only(left=6, right=0),
                 border_radius=6, bgcolor=ft.Colors.SURFACE_CONTAINER_LOW))
+            cells[-1] = ft.Draggable(group='signal', data=(sid, self.model.id), content=cells[-1],
+                                     content_feedback=drag_feedback(sig))
         if not cells:
             cells.append(ft.Text('Drop signals here, or use "Add to table" in the Signals tab.',
                                  italic=True, size=12, color=ft.Colors.ON_SURFACE_VARIANT))
@@ -793,9 +817,9 @@ class TableCard:
 
     def _on_drop(self, e) -> None:
         self._on_leave(e)
-        sid = getattr(getattr(e, 'src', None), 'data', None)
-        if sid:
-            self.app.plot_signal(sid, self.model.id)
+        d = dragged(e)
+        if d:
+            self.app.drop_signal(d[0], d[1], self.model.id)
 
 
 # -- the application ------------------------------------------------------------
@@ -1075,8 +1099,11 @@ class App:
         if node.is_leaf:
             add = ft.IconButton(ft.Icons.ADD_CIRCLE_OUTLINE if not plotted else ft.Icons.CHECK_CIRCLE,
                                 icon_size=18, width=30, height=30, style=ft.ButtonStyle(padding=0),
-                                tooltip='Add to the plot' if not plotted else 'Already selected',
-                                on_click=self.guard(lambda e, n=node: self.add_leaf(n)))
+                                tooltip='Add to the plot' if not plotted
+                                else 'Selected - click to remove it (from its plots and the trace)',
+                                on_click=self.guard(lambda e, n=node, on=plotted:
+                                                    self.remove_signal(n.path) if on
+                                                    else self.add_leaf(n)))
         else:
             key = (node.path, node.addr, id(node.type))
             count = self._leaf_counts.get(key)
@@ -1185,12 +1212,8 @@ class App:
                 ], spacing=6),
                 padding=ft.Padding.symmetric(horizontal=6, vertical=4), border_radius=6,
                 bgcolor=ft.Colors.SURFACE_CONTAINER_LOW, tooltip=s.id)
-            rows.append(ft.Draggable(
-                group='signal', data=s.id, content=body,
-                content_feedback=ft.Container(
-                    ft.Row([ft.Container(width=12, height=12, bgcolor=s.color, border_radius=6),
-                            ft.Text(s.label, size=13)], tight=True),
-                    padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)))
+            rows.append(ft.Draggable(group='signal', data=s.id, content=body,
+                                     content_feedback=drag_feedback(s)))
         if not rows:
             rows.append(ft.Container(ft.Text('No signals yet: add them from the Symbols tab.',
                                              size=12, italic=True), padding=10))
@@ -1444,6 +1467,31 @@ class App:
             self.cursor_text,
         ], spacing=4, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         self.plots = ft.ListView(expand=True, spacing=8, padding=ft.Padding.only(right=8, bottom=8))
+
+        def zone(kind: str, icon, text: str) -> ft.DragTarget:
+            box = ft.Container(
+                content=ft.Row([ft.Icon(icon, size=16, color=ft.Colors.ON_SURFACE_VARIANT),
+                                ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+                               alignment=ft.MainAxisAlignment.CENTER, tight=True),
+                height=36, expand=True, border_radius=8, padding=ft.Padding.symmetric(horizontal=12),
+                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT))
+
+            def hover(on: bool):
+                box.border = ft.Border.all(2 if on else 1,
+                                           ft.Colors.PRIMARY if on else ft.Colors.OUTLINE_VARIANT)
+                box.update()
+
+            def drop(e):
+                hover(False)
+                d = dragged(e)
+                if d:
+                    self.drop_signal(d[0], d[1], kind)
+            return ft.DragTarget(group='signal', content=box, expand=True, on_accept=drop,
+                                 on_will_accept=lambda e: hover(True),
+                                 on_leave=lambda e: hover(False))
+        self.drop_zone = ft.Row([zone('plot', ft.Icons.ADD_CHART, 'Drop a signal here: new plot'),
+                                 zone('table', ft.Icons.TABLE_ROWS, 'Drop here: new table')],
+                                spacing=8)
         self.empty_state = ft.Container(
             content=ft.Column([
                 ft.Icon(ft.Icons.MULTILINE_CHART, size=64, color=ft.Colors.OUTLINE),
@@ -1531,10 +1579,13 @@ class App:
             '**Pick signals.** Open the ELF of the traced application, search a variable, '
             'expand structs and arrays, add numeric members (or a whole struct). Raw addresses '
             'work without an ELF.\n\n'
-            '**Plot.** Every signal lands on a plot; drag signals between plots, add plots '
-            'with the chart button, pick step/line/points and the Y range from a plot\'s menu. '
+            '**Plot.** Every signal lands on a plot; drag signals between plots (a legend '
+            'entry moves, the drop zone below the last plot makes a new one), add plots with '
+            'the chart button, pick step/line/points and the Y range from a plot\'s menu. '
             'A value table (table button) shows the latest value of each signal in it as dec, '
-            'hex or ascii; click a value to change that row\'s format.\n\n'
+            'hex or ascii; click a value to change that row\'s format. Dragging from a plot '
+            'into a table, or back, copies the signal. The check mark in the symbol tree '
+            'removes a selected signal.\n\n'
             '**Trace live.** Press Start. The probe traces up to two address ranges, chosen '
             'from the selected signals (Capture tab). Every capture is written to the capture '
             'folder while the plots follow the newest data. The first values come from a '
@@ -1924,6 +1975,23 @@ class App:
         self.ws.add_signal(s, pid)
         self.selection_changed(retrace=False)
 
+    def drop_signal(self, sid: str, src: int | None, dst) -> None:
+        """A signal dropped on plot/table `dst` (or 'plot' / 'table': a new
+        one).  Between two plots or two tables it moves; from a plot into a
+        table or back it is copied (both keep it); from the list it is added."""
+        if sid not in self.ws.signals or dst == src:
+            return
+        source = self.ws.plot(src) if src is not None else None
+        target_kind = dst if dst in ('plot', 'table') else getattr(self.ws.plot(dst), 'kind', None)
+        if target_kind is None:
+            return
+        if source is not None and source.kind != target_kind:
+            src = None                    # plot <-> table: a copy
+        if dst in ('plot', 'table'):
+            dst = self.ws.new_plot(dst).id
+        self.ws.move_signal(sid, src, dst)
+        self.selection_changed(retrace=False)
+
     def unplot(self, pid: int, sid: str) -> None:
         p = self.ws.plot(pid)
         if p and sid in p.signals:
@@ -2031,8 +2099,8 @@ class App:
             new.append(c)
         self.plot_cards = new
         self._estimate_plot_width()
-        self.plots.controls = [c.control for c in new]
-        empty = not new or not any(sp.signals for sp in self.ws.subplots)
+        self.plots.controls = [c.control for c in new] + [self.drop_zone]
+        empty = not new
         self.empty_state.visible = empty
         self.plots.visible = not empty
         for c in new:

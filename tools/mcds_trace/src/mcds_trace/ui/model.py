@@ -187,6 +187,25 @@ class Workspace:
                 sp.signals.remove(sid)
             sp.row_fmt.pop(sid, None)
 
+    def move_signal(self, sid: str, src: int | None, dst: int) -> None:
+        """Put a signal on plot/table `dst`, taking it off `src` (None: from
+        the signal list, i.e. only add).  A source left empty by the move goes."""
+        d = self.plot(dst)
+        if d is None or sid not in self.signals:
+            return
+        s = self.plot(src) if src is not None else None
+        fmt = None
+        if s is not None and s is not d:
+            fmt = s.row_fmt.pop(sid, None)
+            if sid in s.signals:
+                s.signals.remove(sid)
+        if sid not in d.signals:
+            d.signals.append(sid)
+        if fmt and d.kind == 'table':
+            d.row_fmt[sid] = fmt
+        if s is not None and s is not d and not s.signals:
+            self.remove_plot(s.id)
+
     def plot(self, pid: int) -> SubplotModel | None:
         return next((p for p in self.subplots if p.id == pid), None)
 

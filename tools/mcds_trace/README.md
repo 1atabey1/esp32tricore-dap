@@ -40,15 +40,20 @@ reload or a network drop only pauses drawing; a running trace carries on.
    unions, classes and arrays; add a numeric member with its `+`, or every
    numeric member of an aggregate with the list button. Numbers, floats,
    enums (shown by name), bools, pointers and bitfields are traceable. A raw
-   address works without an ELF.
+   address works without an ELF. The check mark of a selected member
+   removes it again (from its plots, tables and the trace).
 2. **Plots** - every picked signal gets its own plot; drag signals from the
-   **Signals** tab onto a plot to overlay them. A plot's menu: step / lines /
+   **Signals** tab onto a plot to overlay them. Drag a legend entry onto
+   another plot to move it there, or onto the drop zone below the last plot
+   for a plot of its own; a plot left empty goes. A plot's menu: step / lines /
    points, normalize (compare shapes of different scales), statistics of the
    view (n, min, max, mean, typical interval), Y range and log scale, split
    into one plot per signal, merge into the plot above, height, order.
    **Value tables** (toolbar or *New table*) list signals compactly by name
    with their latest value, as `dec` (scaled, with unit), `hex` or `ascii`
    (both of the raw bits); click a value to give that row its own format.
+   Tables work without signals, like plots. Dragging between two tables
+   moves a signal; dragging from a plot into a table or back copies it.
 3. **Trace live** - press **Start** (or F5). The trace hardware watches two
    address ranges; they are chosen from the selected signals so that as few
    extra bytes as possible are watched (**Capture** tab shows the plan, and a
