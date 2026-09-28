@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
-import csv
 import datetime
 import json
 import math
@@ -26,6 +25,7 @@ import flet as ft
 import numpy as np
 
 from .. import elfsyms
+from ..export import parquet_bytes, samples_table, write_parquet
 from ..plotrender import (THEMES, FrameInfo, FrameSpec, SubplotRenderer, Trace, export_png,
                           value_at)
 from ..session import FileSession, LiveSession, Probe, ProbeError
@@ -1470,7 +1470,8 @@ class App:
             ib(ft.Icons.TABLE_ROWS, 'Add a value table (latest values as dec / hex / ascii)',
                lambda e: self.add_table()),
             ib(ft.Icons.IMAGE_OUTLINED, 'Export the view as PNG', self.export_png),
-            ib(ft.Icons.TABLE_VIEW_OUTLINED, 'Export the visible samples as CSV', self.export_csv),
+            ib(ft.Icons.TABLE_VIEW_OUTLINED, 'Export the visible samples as Parquet',
+               self.export_parquet),
             ib(ft.Icons.DOWNLOAD, 'Save the capture file as...', self.save_capture),
             gap(),
             self.cursor_text,
@@ -1605,7 +1606,7 @@ class App:
             'the time to it), right-click removes it. A plot\'s menu has statistics of the view, '
             'normalize, and splitting or merging plots.\n\n'
             '**Offline.** Open a capture file (.mcds) to analyse it; change the selected '
-            'signals at any time. Export PNG or CSV from the toolbar; the download button saves '
+            'signals at any time. Export PNG or Parquet from the toolbar; the download button saves '
             'the capture file anywhere (in the browser: downloads it).\n\n'
             '**Keys.** F5 start/stop, Ctrl+O open capture, Ctrl+S save workspace.')
         dlg = ft.AlertDialog(
@@ -2418,30 +2419,43 @@ class App:
             self.busy_text = ''
         self.toast('Saved %s (%s)' % (dest, fmt_bytes(os.path.getsize(dest))))
 
-    async def export_csv(self, e=None) -> None:
+    async def export_parquet(self, e=None) -> None:
+        """The visible samples of every shown signal as Parquet (one row per
+        sample, time order).  Built and written in a worker thread: a long
+        capture is millions of rows."""
         store = self.store()
-        if store is None:
+        sigs = self.ws.plotted()
+        if store is None or not sigs:
             self.toast('Nothing to export yet.', error=True)
             return
         x0, x1 = self.view.x0, self.view.x1
-        def num(x):
-            return '' if x != x else (int(x) if float(x).is_integer() else x)
-
-        rows = []
-        for s in self.ws.plotted():
-            t, v = store.window(self.trace_id(s), x0, x1)
-            m = (t >= x0) & (t <= x1)
-            shown = s.apply(v[m]) if s.kind == 'value' else v[m]
-            for tt, vv, ss in zip(t[m].tolist(), v[m].tolist(), shown.tolist()):
-                rows.append((tt, s.label, num(ss), s.unit, num(vv)))
-        rows.sort(key=lambda r: r[0])
-        import io
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(['time_s', 'signal', 'value', 'unit', 'raw'])
-        for r in rows:
-            w.writerow(['%.9f' % r[0]] + list(r[1:]))
-        await self._save_bytes(buf.getvalue().encode(), 'mcds-samples.csv', 'Export CSV')
+        meta = {'capture': os.path.basename(self.capture_path() or ''),
+                'elf': os.path.basename(self.settings.last_elf or '')}
+        build = lambda: samples_table(store, sigs, self.trace_id, x0, x1, meta, self.hits_mode())
+        name = 'mcds-samples.parquet'
+        if self.page.web:
+            self.busy_text = 'Exporting the visible samples'
+            try:
+                data = await asyncio.to_thread(lambda: parquet_bytes(build()))
+            finally:
+                self.busy_text = ''
+            await ft.FilePicker().save_file(file_name=name, src_bytes=data)
+            return
+        path = await ft.FilePicker().save_file(dialog_title='Export Parquet', file_name=name,
+                                               allowed_extensions=['parquet'],
+                                               initial_directory=self.settings.capture_dir)
+        if not path:
+            return
+        if not path.lower().endswith('.parquet'):
+            path += '.parquet'
+        self.busy_text = 'Exporting to %s' % os.path.basename(path)
+        try:
+            rows = await asyncio.to_thread(lambda: _write_table(build(), path))
+        except OSError as ex:
+            raise RuntimeError('writing %s: %s' % (path, ex)) from None
+        finally:
+            self.busy_text = ''
+        self.toast('Saved %s (%d samples, %s)' % (path, rows, fmt_bytes(os.path.getsize(path))))
 
     async def _save_bytes(self, data: bytes, name: str, title: str) -> None:
         if self.page.web:
@@ -2652,6 +2666,11 @@ class App:
         else:
             threading.Thread(target=stop_all, name='shutdown').start()
         self.settings.save()
+
+
+def _write_table(table, path: str) -> int:
+    write_parquet(table, path)
+    return table.num_rows
 
 
 def _close_session(sess) -> None:
