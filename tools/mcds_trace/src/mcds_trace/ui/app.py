@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
-import csv
 import datetime
 import json
 import math
@@ -26,11 +25,12 @@ import flet as ft
 import numpy as np
 
 from .. import elfsyms
+from ..export import parquet_bytes, samples_table, write_parquet
 from ..plotrender import (THEMES, FrameInfo, FrameSpec, SubplotRenderer, Trace, export_png,
                           value_at)
 from ..session import FileSession, LiveSession, Probe, ProbeError
 from ..signals import PALETTE, Signal, hits_signal, leaf_signal, raw_signal
-from .model import Settings, SubplotModel, Workspace
+from .model import FORMATS, Settings, SubplotModel, Workspace
 
 APP_TITLE = 'MCDS Trace'
 MONO = ft.TextStyle(font_family='monospace', size=12)
@@ -182,6 +182,26 @@ class View:
         self.set(self.x0 + dt, self.x1 + dt)
 
 
+def drag_feedback(sig: Signal) -> ft.Control:
+    """What follows the pointer while a signal is dragged."""
+    return ft.Container(
+        ft.Row([ft.Container(width=12, height=12, bgcolor=sig.color, border_radius=6),
+                ft.Text(sig.label, size=13)], tight=True),
+        padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)
+
+
+def dragged(e) -> tuple | None:
+    """(signal id, plot it was dragged off or None) of a drop, whichever
+    draggable it came from: the signal list carries the id, a plot's legend
+    or a table's cell (id, plot), the symbol tree its node (node, None)."""
+    data = getattr(getattr(e, 'src', None), 'data', None)
+    if isinstance(data, elfsyms.Node):
+        return data, None
+    if isinstance(data, tuple) and len(data) == 2:
+        return str(data[0]), data[1]
+    return (data, None) if isinstance(data, str) and data else None
+
+
 # -- plots --------------------------------------------------------------------
 
 class PlotCard:
@@ -297,8 +317,11 @@ class PlotCard:
                                   on_click=lambda e, i=sid: self.app.unplot(self.model.id, i)),
                 ], spacing=4, tight=True),
                 padding=ft.Padding.only(left=6, right=0, top=0, bottom=0),
-                border_radius=12, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH, tooltip=tip)
-            self.legend.controls.append(chip)
+                border_radius=12, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                tooltip=tip + '\nDrag onto another plot to move it, onto a table to copy it')
+            self.legend.controls.append(ft.Draggable(
+                group='signal', data=(sid, self.model.id), content=chip,
+                content_feedback=drag_feedback(s)))
         self.last_key = None
 
     def update_values(self, at: float | None) -> None:
@@ -341,11 +364,12 @@ class PlotCard:
                     v = normalized(t, v, app.view.x0, app.view.x1)
                 traces.append(Trace(t, v, s.color, kind, s.label))
         w, h = self.size
-        last = app.plot_cards and app.plot_cards[-1] is self
+        graphs = app.graph_cards()
+        last = graphs and graphs[-1] is self
         return FrameSpec(int(w), int(h), app.view.x0, app.view.x1, traces, self.model.style,
                          tuple(self.model.ylim) if self.model.ylim else None,
                          list(store.gaps) if store is not None else [], None,
-                         xlabel=bool(last) or len(app.plot_cards) == 1,
+                         xlabel=bool(last) or len(graphs) == 1,
                          theme=app.theme_name(), scale=app.pixel_ratio(), ylog=self.model.ylog,
                          t_end=store.t_end if store is not None else None)
 
@@ -357,7 +381,7 @@ class PlotCard:
                 tuple(self.model.signals),
                 app.theme_name(), id(store), store.samples if store else 0,
                 len(store.gaps) if store else 0,
-                self.app.plot_cards[-1] is self if self.app.plot_cards else True)
+                (self.app.graph_cards() or [self])[-1] is self)
 
     def schedule(self) -> None:
         """Render a new frame in the background if anything changed.  Each
@@ -489,10 +513,9 @@ class PlotCard:
 
     def _on_drop(self, e) -> None:
         self._on_leave(e)
-        src = getattr(e, 'src', None)
-        sid = getattr(src, 'data', None)
-        if sid:
-            self.app.plot_signal(sid, self.model.id)
+        d = dragged(e)
+        if d:
+            self.app.drop_signal(d[0], d[1], self.model.id)
 
     def _style(self, style: str) -> None:
         self.model.style = style
@@ -595,6 +618,240 @@ class PlotCard:
         self.app.page.show_dialog(dlg)
 
 
+# -- value tables ---------------------------------------------------------------
+
+FORMAT_NAMES = {'dec': 'dec', 'hex': 'hex', 'ascii': 'ascii'}
+CELL_WIDTH = 270                  # one name/value cell; the rows wrap into columns
+
+
+class TableCard:
+    """A value table: each signal's name and latest value, in a compact grid of
+    cells.  The table has a format (dec / hex / ascii); clicking a value cycles
+    that signal's own format."""
+
+    def __init__(self, app: 'App', model: SubplotModel):
+        self.app = app
+        self.model = model
+        self.last_key = None
+        self.measured = False
+        self.values: dict[str, ft.Text] = {}
+        self._dirty = False
+        self.title = ft.Text('', size=12, weight=ft.FontWeight.W_500)
+        self.when = ft.Text('', size=11, style=MONO, color=ft.Colors.ON_SURFACE_VARIANT)
+        self.fmt_row = ft.Row(spacing=2, tight=True)
+        self.menu = ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, tooltip='Table options',
+                                       icon_size=18)
+        self.grid = ft.Row(wrap=True, spacing=6, run_spacing=4)
+        self.header = ft.Row([ft.Icon(ft.Icons.TABLE_ROWS, size=16,
+                                      color=ft.Colors.ON_SURFACE_VARIANT),
+                              self.title, self.fmt_row, self.when, ft.Container(expand=True),
+                              self.menu],
+                             spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        self.card = ft.Container(
+            content=ft.Column([self.header, self.grid], spacing=4),
+            padding=ft.Padding.only(left=8, right=4, top=2, bottom=8),
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT), border_radius=8)
+        self.control = ft.DragTarget(group='signal', content=self.card,
+                                     on_accept=self._on_drop, on_will_accept=self._on_will,
+                                     on_leave=self._on_leave)
+        self.rebuild_legend()
+
+    def _menu_items(self) -> list:
+        app, model = self.app, self.model
+        return [
+            ft.PopupMenuItem(content='Move up', icon=ft.Icons.ARROW_UPWARD,
+                             on_click=lambda e: app.move_plot(model.id, -1)),
+            ft.PopupMenuItem(content='Move down', icon=ft.Icons.ARROW_DOWNWARD,
+                             on_click=lambda e: app.move_plot(model.id, +1)),
+            ft.PopupMenuItem(content='Merge into the table above', icon=ft.Icons.MERGE,
+                             on_click=lambda e: app.merge_up(model.id)),
+            ft.PopupMenuItem(content='Every row in the table format',
+                             icon=ft.Icons.FORMAT_CLEAR, on_click=lambda e: self._reset_rows()),
+            ft.PopupMenuItem(),
+            ft.PopupMenuItem(content='Remove table', icon=ft.Icons.DELETE_OUTLINE,
+                             on_click=lambda e: app.remove_plot(model.id)),
+        ]
+
+    def _fmt_buttons(self) -> list:
+        out = []
+        for f in FORMATS:
+            on = self.model.fmt == f
+            out.append(ft.Container(
+                content=ft.Text(FORMAT_NAMES[f], size=11, style=MONO,
+                                weight=ft.FontWeight.W_600 if on else None,
+                                color=ft.Colors.ON_PRIMARY if on else ft.Colors.ON_SURFACE_VARIANT),
+                padding=ft.Padding.symmetric(horizontal=7, vertical=1), border_radius=8,
+                bgcolor=ft.Colors.PRIMARY if on else ft.Colors.SURFACE_CONTAINER_HIGH,
+                tooltip='Show the values as %s' % {'dec': 'decimal (scaled, with unit)',
+                                                  'hex': 'hexadecimal (raw bits)',
+                                                  'ascii': 'ASCII (raw bytes)'}[f],
+                on_click=lambda e, f=f: self._set_fmt(f)))
+        return out
+
+    def fmt_of(self, sid: str) -> str:
+        return self.model.row_fmt.get(sid, self.model.fmt)
+
+    # the rows ------------------------------------------------------------------
+
+    def rebuild_legend(self) -> None:
+        """Rebuild the cells (the signals or their names changed)."""
+        self.menu.items = self._menu_items()
+        self.fmt_row.controls = self._fmt_buttons()
+        pos = next((i + 1 for i, p in enumerate(self.app.ws.subplots) if p is self.model), 0)
+        self.title.value = 'Table %d' % pos
+        self.values.clear()
+        cells = []
+        for sid in self.model.signals:
+            sig = self.app.ws.signals.get(sid)
+            if sig is None:
+                continue
+            val = ft.Text('-', style=MONO, no_wrap=True, text_align=ft.TextAlign.RIGHT)
+            self.values[sid] = val
+            own = sid in self.model.row_fmt
+            tip = '%s\n%s  %s  %d bytes' % (sig.id, sig.node.type_name() if sig.node else 'raw',
+                                            hexaddr(sig.addr), sig.size)
+            cells.append(ft.Container(
+                content=ft.Row([
+                    ft.Container(width=8, height=8, bgcolor=sig.color, border_radius=4),
+                    ft.Text(sig.label, size=12, no_wrap=True, expand=True,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=tip + '\nDrag onto another table to move it, onto a plot '
+                                          'to copy it'),
+                    ft.Container(content=val, on_click=lambda e, i=sid: self._cycle(i),
+                                 tooltip='%s - click for %s' % (
+                                     self.fmt_of(sid) + (' (this row)' if own else ''),
+                                     self._next_fmt(self.fmt_of(sid))),
+                                 padding=ft.Padding.symmetric(horizontal=4),
+                                 border_radius=4,
+                                 bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST if own else None),
+                    ft.IconButton(ft.Icons.CLOSE, icon_size=12, width=20, height=20,
+                                  style=ft.ButtonStyle(padding=0),
+                                  tooltip='Remove from this table',
+                                  on_click=lambda e, i=sid: self.app.unplot(self.model.id, i)),
+                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                width=CELL_WIDTH, height=24,
+                padding=ft.Padding.only(left=6, right=0),
+                border_radius=6, bgcolor=ft.Colors.SURFACE_CONTAINER_LOW))
+            cells[-1] = ft.Draggable(group='signal', data=(sid, self.model.id), content=cells[-1],
+                                     content_feedback=drag_feedback(sig))
+        if not cells:
+            cells.append(ft.Text('Drop signals here, or use "Add to table" in the Signals tab.',
+                                 italic=True, size=12, color=ft.Colors.ON_SURFACE_VARIANT))
+        self.grid.controls = cells
+        self.last_key = None
+        self._dirty = True
+
+    def shown_at(self) -> tuple[float | None, str]:
+        """The time the values are taken at, and how the header says it.  While
+        a trace streams: the latest.  Reviewing (a capture file, or a trace
+        after Stop): at the marker, else at the cursor, else the last."""
+        view = self.app.view
+        if self.app.mode == 'review':
+            if view.marker is not None:
+                return view.marker, 'at marker %s' % fmt_time(view.marker)
+            if view.cursor is not None:
+                return view.cursor, 'at cursor %s' % fmt_time(view.cursor)
+            return None, 'last values'
+        return None, 'latest'
+
+    def update_values(self, at: float | None) -> None:
+        """Each signal's value at shown_at() (the `at` of the plot legends is
+        the cursor only; a table prefers the marker)."""
+        store = self.app.store()
+        t_at, where = self.shown_at()
+        if self.when.value != where:
+            self.when.value = where
+            self._dirty = True
+        for sid, txt in self.values.items():
+            sig = self.app.ws.signals.get(sid)
+            ser = store.series.get(self.app.trace_id(sig)) if store is not None and sig else None
+            if ser is None or ser.n == 0:
+                text = '-'
+            elif sig.kind == 'hits' or self.app.hits_mode():
+                n = ser.n
+                if t_at is not None:
+                    n = int(np.searchsorted(ser.view()[0], t_at, side='right'))
+                text = '%d hits' % n
+            else:
+                v = ser.last
+                if t_at is not None:
+                    t, vv = ser.view()
+                    v = value_at(t, vv, t_at)
+                text = sig.format_as(v, self.fmt_of(sid))
+            if txt.value != text:
+                txt.value = text
+                self._dirty = True
+
+    def push_readouts(self) -> None:
+        if not self._dirty:
+            return
+        self._dirty = False
+        try:
+            self.grid.update()
+            self.when.update()
+        except (RuntimeError, AssertionError):
+            self._dirty = True            # not on the page (yet)
+
+    # the plot interface, which a table has nothing to do for ---------------------
+
+    def schedule(self) -> None:
+        pass
+
+    def update_stats(self) -> None:
+        pass
+
+    def place_overlays(self) -> None:
+        pass
+
+    def estimate_size(self, width: float) -> None:
+        pass
+
+    # events --------------------------------------------------------------------
+
+    @staticmethod
+    def _next_fmt(fmt: str) -> str:
+        return FORMATS[(FORMATS.index(fmt) + 1) % len(FORMATS)] if fmt in FORMATS else FORMATS[0]
+
+    def _cycle(self, sid: str) -> None:
+        nxt = self._next_fmt(self.fmt_of(sid))
+        if nxt == self.model.fmt:
+            self.model.row_fmt.pop(sid, None)
+        else:
+            self.model.row_fmt[sid] = nxt
+        self._refresh()
+
+    def _set_fmt(self, fmt: str) -> None:
+        self.model.fmt = fmt
+        self.model.row_fmt = {k: v for k, v in self.model.row_fmt.items() if v != fmt}
+        self._refresh()
+
+    def _reset_rows(self) -> None:
+        self.model.row_fmt.clear()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.rebuild_legend()
+        self.update_values(None)
+        try:
+            self.card.update()
+        except (RuntimeError, AssertionError):
+            pass
+
+    def _on_will(self, e) -> None:
+        self.card.border = ft.Border.all(2, ft.Colors.PRIMARY)
+        self.card.update()
+
+    def _on_leave(self, e) -> None:
+        self.card.border = ft.Border.all(1, ft.Colors.OUTLINE_VARIANT)
+        self.card.update()
+
+    def _on_drop(self, e) -> None:
+        self._on_leave(e)
+        d = dragged(e)
+        if d:
+            self.app.drop_signal(d[0], d[1], self.model.id)
+
+
 # -- the application ------------------------------------------------------------
 
 class App:
@@ -609,7 +866,7 @@ class App:
         self.session: LiveSession | FileSession | None = None
         self.mode = 'idle'                  # idle | starting | live | stopping | review | loading
         self.view = View(self.settings.window_s)
-        self.plot_cards: list[PlotCard] = []
+        self.plot_cards: list[PlotCard | TableCard] = []
         self.busy_text = ''
         self.progress: float | None = None
         self.probe_ok: bool | None = None
@@ -872,8 +1129,11 @@ class App:
         if node.is_leaf:
             add = ft.IconButton(ft.Icons.ADD_CIRCLE_OUTLINE if not plotted else ft.Icons.CHECK_CIRCLE,
                                 icon_size=18, width=30, height=30, style=ft.ButtonStyle(padding=0),
-                                tooltip='Add to the plot' if not plotted else 'Already selected',
-                                on_click=self.guard(lambda e, n=node: self.add_leaf(n)))
+                                tooltip='Add to the plot' if not plotted
+                                else 'Selected - click to remove it (from its plots and the trace)',
+                                on_click=self.guard(lambda e, n=node, on=plotted:
+                                                    self.remove_signal(n.path) if on
+                                                    else self.add_leaf(n)))
         else:
             key = (node.path, node.addr, id(node.type))
             count = self._leaf_counts.get(key)
@@ -891,7 +1151,14 @@ class App:
             on_click=self.guard(lambda e, n=node: self.add_leaf(n) if n.is_leaf
                                 else self._toggle_node(n)),
             ink=True)
-        rows.append(row)
+        rows.append(ft.Draggable(
+            group='signal', data=node, content=row, affinity=ft.Axis.HORIZONTAL,
+            content_feedback=ft.Container(
+                ft.Row([ft.Icon(ft.Icons.DATA_OBJECT if not node.is_leaf else ft.Icons.SHOW_CHART,
+                                size=14),
+                        ft.Text(short_path(node.path) if node.is_leaf else
+                                '%s (all members)' % short_path(node.path), size=13)], tight=True),
+                padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)))
         if exp and open_:
             limit = self.shown.get(node.path, TREE_PAGE)
             kids = node.children(0, limit)
@@ -925,9 +1192,11 @@ class App:
                 ft.Row([self.signals_title, ft.Container(expand=True),
                         ft.TextButton('New plot', icon=ft.Icons.ADD_CHART,
                                       on_click=self.guard(lambda e: self.add_plot())),
+                        ft.TextButton('New table', icon=ft.Icons.TABLE_ROWS,
+                                      on_click=self.guard(lambda e: self.add_table())),
                         ft.TextButton('Clear', icon=ft.Icons.DELETE_SWEEP_OUTLINED,
                                       on_click=self.guard(lambda e: self.clear_signals()))]),
-                ft.Text('Drag a signal onto a plot, or use its menu.', size=11,
+                ft.Text('Drag a signal onto a plot or table, or use its menu.', size=11,
                         color=ft.Colors.ON_SURFACE_VARIANT),
                 self.signal_list,
             ], expand=True, spacing=6),
@@ -937,16 +1206,20 @@ class App:
     def _render_signals(self) -> None:
         rows = []
         for s in self.ws.signals.values():
-            plots = [str(i + 1) for i, p in enumerate(self.ws.subplots) if s.id in p.signals]
+            where = [(p.kind, i + 1) for i, p in enumerate(self.ws.subplots) if s.id in p.signals]
+            plots = [', '.join('%s %s' % (k, ','.join(str(n) for kk, n in where if kk == k))
+                               for k in ('plot', 'table') if any(kk == k for kk, _ in where))]
             dot = ft.Container(width=14, height=14, bgcolor=s.color, border_radius=7,
                                tooltip='Change colour',
                                on_click=self.guard(lambda e, sid=s.id: self._cycle_color(sid)))
-            items = [ft.PopupMenuItem(content='Add to plot %d' % (i + 1),
+            items = [ft.PopupMenuItem(content='Add to %s %d' % (p.kind, i + 1),
                                       on_click=self.guard(lambda e, sid=s.id, pid=p.id:
                                                           self.plot_signal(sid, pid)))
                      for i, p in enumerate(self.ws.subplots)]
             items += [ft.PopupMenuItem(content='New plot with it', icon=ft.Icons.ADD_CHART,
                                        on_click=self.guard(lambda e, sid=s.id: self.plot_signal(sid, -1))),
+                      ft.PopupMenuItem(content='New table with it', icon=ft.Icons.TABLE_ROWS,
+                                       on_click=self.guard(lambda e, sid=s.id: self.table_signal(sid))),
                       ft.PopupMenuItem(content='Rename...', icon=ft.Icons.EDIT_OUTLINED,
                                        on_click=self.guard(lambda e, sid=s.id: self._rename(sid)))]
             if s.kind == 'value':
@@ -970,18 +1243,14 @@ class App:
                                        overflow=ft.TextOverflow.ELLIPSIS),
                                ft.Text(desc, size=11, color=ft.Colors.ON_SURFACE_VARIANT,
                                        no_wrap=True)], spacing=0, expand=True, tight=True),
-                    ft.Text(('plot ' + ','.join(plots)) if plots else 'not plotted', size=11,
+                    ft.Text(plots[0] if plots and plots[0] else 'not shown', size=11,
                             color=ft.Colors.ON_SURFACE_VARIANT),
                     ft.PopupMenuButton(icon=ft.Icons.MORE_VERT, items=items),
                 ], spacing=6),
                 padding=ft.Padding.symmetric(horizontal=6, vertical=4), border_radius=6,
                 bgcolor=ft.Colors.SURFACE_CONTAINER_LOW, tooltip=s.id)
-            rows.append(ft.Draggable(
-                group='signal', data=s.id, content=body,
-                content_feedback=ft.Container(
-                    ft.Row([ft.Container(width=12, height=12, bgcolor=s.color, border_radius=6),
-                            ft.Text(s.label, size=13)], tight=True),
-                    padding=8, border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST)))
+            rows.append(ft.Draggable(group='signal', data=s.id, content=body,
+                                     content_feedback=drag_feedback(s)))
         if not rows:
             rows.append(ft.Container(ft.Text('No signals yet: add them from the Symbols tab.',
                                              size=12, italic=True), padding=10))
@@ -1226,13 +1495,41 @@ class App:
             ib(ft.Icons.ZOOM_OUT, 'Zoom out', lambda e: self._zoom(2.0)),
             gap(),
             ib(ft.Icons.ADD_CHART, 'Add a plot', lambda e: self.add_plot()),
+            ib(ft.Icons.TABLE_ROWS, 'Add a value table (latest values as dec / hex / ascii)',
+               lambda e: self.add_table()),
             ib(ft.Icons.IMAGE_OUTLINED, 'Export the view as PNG', self.export_png),
-            ib(ft.Icons.TABLE_VIEW_OUTLINED, 'Export the visible samples as CSV', self.export_csv),
+            ib(ft.Icons.TABLE_VIEW_OUTLINED, 'Export the visible samples as Parquet',
+               self.export_parquet),
             ib(ft.Icons.DOWNLOAD, 'Save the capture file as...', self.save_capture),
             gap(),
             self.cursor_text,
         ], spacing=4, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         self.plots = ft.ListView(expand=True, spacing=8, padding=ft.Padding.only(right=8, bottom=8))
+
+        def zone(kind: str, icon, text: str) -> ft.DragTarget:
+            box = ft.Container(
+                content=ft.Row([ft.Icon(icon, size=16, color=ft.Colors.ON_SURFACE_VARIANT),
+                                ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+                               alignment=ft.MainAxisAlignment.CENTER, tight=True),
+                height=36, expand=True, border_radius=8, padding=ft.Padding.symmetric(horizontal=12),
+                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT))
+
+            def hover(on: bool):
+                box.border = ft.Border.all(2 if on else 1,
+                                           ft.Colors.PRIMARY if on else ft.Colors.OUTLINE_VARIANT)
+                box.update()
+
+            def drop(e):
+                hover(False)
+                d = dragged(e)
+                if d:
+                    self.drop_signal(d[0], d[1], kind)
+            return ft.DragTarget(group='signal', content=box, expand=True, on_accept=drop,
+                                 on_will_accept=lambda e: hover(True),
+                                 on_leave=lambda e: hover(False))
+        self.drop_zone = ft.Row([zone('plot', ft.Icons.ADD_CHART, 'Drop a signal here: new plot'),
+                                 zone('table', ft.Icons.TABLE_ROWS, 'Drop here: new table')],
+                                spacing=8)
         self.empty_state = ft.Container(
             content=ft.Column([
                 ft.Icon(ft.Icons.MULTILINE_CHART, size=64, color=ft.Colors.OUTLINE),
@@ -1320,8 +1617,13 @@ class App:
             '**Pick signals.** Open the ELF of the traced application, search a variable, '
             'expand structs and arrays, add numeric members (or a whole struct). Raw addresses '
             'work without an ELF.\n\n'
-            '**Plot.** Every signal lands on a plot; drag signals between plots, add plots '
-            'with the chart button, pick step/line/points and the Y range from a plot\'s menu.\n\n'
+            '**Plot.** Every signal lands on a plot; drag signals between plots (a legend '
+            'entry moves, the drop zone below the last plot makes a new one), add plots with '
+            'the chart button, pick step/line/points and the Y range from a plot\'s menu. '
+            'A value table (table button) shows the latest value of each signal in it as dec, '
+            'hex or ascii; click a value to change that row\'s format. Dragging from a plot '
+            'into a table, or back, copies the signal. Symbols can be dragged from the tree '
+            'too (a struct brings all its members); the check mark removes a selected one.\n\n'
             '**Trace live.** Press Start. The probe traces up to two address ranges, chosen '
             'from the selected signals (Capture tab). Every capture is written to the capture '
             'folder while the plots follow the newest data. The first values come from a '
@@ -1332,7 +1634,7 @@ class App:
             'the time to it), right-click removes it. A plot\'s menu has statistics of the view, '
             'normalize, and splitting or merging plots.\n\n'
             '**Offline.** Open a capture file (.mcds) to analyse it; change the selected '
-            'signals at any time. Export PNG or CSV from the toolbar; the download button saves '
+            'signals at any time. Export PNG or Parquet from the toolbar; the download button saves '
             'the capture file anywhere (in the browser: downloads it).\n\n'
             '**Keys.** F5 start/stop, Ctrl+O open capture, Ctrl+S save workspace.')
         dlg = ft.AlertDialog(
@@ -1711,6 +2013,60 @@ class App:
         self.ws.add_signal(s, pid)
         self.selection_changed(retrace=False)
 
+    def drop_signal(self, sid: str, src: int | None, dst) -> None:
+        """A signal dropped on plot/table `dst` (or 'plot' / 'table': a new
+        one).  Between two plots or two tables it moves; from a plot into a
+        table or back it is copied (both keep it); from the list it is added."""
+        if isinstance(sid, elfsyms.Node):
+            self.drop_node(sid, dst)
+            return
+        if sid not in self.ws.signals or dst == src:
+            return
+        source = self.ws.plot(src) if src is not None else None
+        target_kind = dst if dst in ('plot', 'table') else getattr(self.ws.plot(dst), 'kind', None)
+        if target_kind is None:
+            return
+        if source is not None and source.kind != target_kind:
+            src = None                    # plot <-> table: a copy
+        if dst in ('plot', 'table'):
+            dst = self.ws.new_plot(dst).id
+        self.ws.move_signal(sid, src, dst)
+        self.selection_changed(retrace=False)
+
+    def drop_node(self, node: elfsyms.Node, dst) -> None:
+        """A symbol dropped from the tree: a member becomes a signal on plot /
+        table `dst` (or a new one: 'plot' / 'table'); an aggregate brings all
+        its numeric members (asked first above 64, like its list button)."""
+        leaves = [node] if node.is_leaf else list(node.leaves(1025))
+        if not leaves:
+            self.toast('%s has nothing traceable inside' % node.path)
+            return
+
+        def go(leaves):
+            if dst in ('plot', 'table'):
+                pid = self.ws.new_plot(dst).id
+            elif self.ws.plot(dst) is not None:
+                pid = dst
+            else:
+                return
+            for leaf in leaves[:1024]:
+                self.ws.add_signal(self.ws.signals.get(leaf.path) or leaf_signal(leaf), pid)
+            self.selection_changed()
+
+        if len(leaves) > 64:
+            def ok(e):
+                close_dialog(dlg)
+                go(leaves)
+                self.page.update()
+            dlg = ft.AlertDialog(
+                title=ft.Text('Add %d signals?' % min(len(leaves), 1024)),
+                content=ft.Text('%s has %d numeric members.' % (node.path, len(leaves))),
+                actions=[ft.TextButton('Cancel', on_click=lambda e: close_dialog(dlg)),
+                         ft.FilledButton('Add', on_click=ok)])
+            self.page.show_dialog(dlg)
+            return
+        go(leaves)
+
     def unplot(self, pid: int, sid: str) -> None:
         p = self.ws.plot(pid)
         if p and sid in p.signals:
@@ -1721,6 +2077,19 @@ class App:
         self.ws.new_plot()
         self.rebuild_plots()
         self._render_signals()
+
+    def add_table(self) -> None:
+        self.ws.new_plot('table')
+        self.rebuild_plots()
+        self._render_signals()
+
+    def table_signal(self, sid: str) -> None:
+        """A new value table with this signal in it."""
+        s = self.ws.signals.get(sid)
+        if s is None:
+            return
+        self.ws.add_signal(s, self.ws.new_plot('table').id)
+        self.selection_changed(retrace=False)
 
     def remove_plot(self, pid: int) -> None:
         self.ws.remove_plot(pid)
@@ -1785,22 +2154,28 @@ class App:
             self._reselecting = False
             self.busy_text = ''
 
+    def graph_cards(self) -> list[PlotCard]:
+        """The plots, without the value tables."""
+        return [c for c in self.plot_cards if isinstance(c, PlotCard)]
+
     def rebuild_plots(self) -> None:
         cards = {c.model.id: c for c in self.plot_cards}
         new = []
         for sp in self.ws.subplots:
             c = cards.get(sp.id)
-            if c is None:
-                c = PlotCard(self, sp)
+            cls = TableCard if sp.kind == 'table' else PlotCard
+            if not isinstance(c, cls):
+                c = cls(self, sp)
             else:
                 c.model = sp
-                c.body.height = sp.height
+                if isinstance(c, PlotCard):
+                    c.body.height = sp.height
                 c.rebuild_legend()
             new.append(c)
         self.plot_cards = new
         self._estimate_plot_width()
-        self.plots.controls = [c.control for c in new]
-        empty = not new or not any(sp.signals for sp in self.ws.subplots)
+        self.plots.controls = [c.control for c in new] + [self.drop_zone]
+        empty = not new
         self.empty_state.visible = empty
         self.plots.visible = not empty
         for c in new:
@@ -2020,7 +2395,7 @@ class App:
         if not self.plot_cards or self.store() is None:
             self.toast('Nothing to export yet.', error=True)
             return
-        specs = [c.spec() for c in self.plot_cards if c.model.signals]
+        specs = [c.spec() for c in self.graph_cards() if c.model.signals]
         for s in specs:
             s.cursor = None
             s.width = max(s.width, 1000)
@@ -2072,30 +2447,43 @@ class App:
             self.busy_text = ''
         self.toast('Saved %s (%s)' % (dest, fmt_bytes(os.path.getsize(dest))))
 
-    async def export_csv(self, e=None) -> None:
+    async def export_parquet(self, e=None) -> None:
+        """The visible samples of every shown signal as Parquet (one row per
+        sample, time order).  Built and written in a worker thread: a long
+        capture is millions of rows."""
         store = self.store()
-        if store is None:
+        sigs = self.ws.plotted()
+        if store is None or not sigs:
             self.toast('Nothing to export yet.', error=True)
             return
         x0, x1 = self.view.x0, self.view.x1
-        def num(x):
-            return '' if x != x else (int(x) if float(x).is_integer() else x)
-
-        rows = []
-        for s in self.ws.plotted():
-            t, v = store.window(self.trace_id(s), x0, x1)
-            m = (t >= x0) & (t <= x1)
-            shown = s.apply(v[m]) if s.kind == 'value' else v[m]
-            for tt, vv, ss in zip(t[m].tolist(), v[m].tolist(), shown.tolist()):
-                rows.append((tt, s.label, num(ss), s.unit, num(vv)))
-        rows.sort(key=lambda r: r[0])
-        import io
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(['time_s', 'signal', 'value', 'unit', 'raw'])
-        for r in rows:
-            w.writerow(['%.9f' % r[0]] + list(r[1:]))
-        await self._save_bytes(buf.getvalue().encode(), 'mcds-samples.csv', 'Export CSV')
+        meta = {'capture': os.path.basename(self.capture_path() or ''),
+                'elf': os.path.basename(self.settings.last_elf or '')}
+        build = lambda: samples_table(store, sigs, self.trace_id, x0, x1, meta, self.hits_mode())
+        name = 'mcds-samples.parquet'
+        if self.page.web:
+            self.busy_text = 'Exporting the visible samples'
+            try:
+                data = await asyncio.to_thread(lambda: parquet_bytes(build()))
+            finally:
+                self.busy_text = ''
+            await ft.FilePicker().save_file(file_name=name, src_bytes=data)
+            return
+        path = await ft.FilePicker().save_file(dialog_title='Export Parquet', file_name=name,
+                                               allowed_extensions=['parquet'],
+                                               initial_directory=self.settings.capture_dir)
+        if not path:
+            return
+        if not path.lower().endswith('.parquet'):
+            path += '.parquet'
+        self.busy_text = 'Exporting to %s' % os.path.basename(path)
+        try:
+            rows = await asyncio.to_thread(lambda: _write_table(build(), path))
+        except OSError as ex:
+            raise RuntimeError('writing %s: %s' % (path, ex)) from None
+        finally:
+            self.busy_text = ''
+        self.toast('Saved %s (%d samples, %s)' % (path, rows, fmt_bytes(os.path.getsize(path))))
 
     async def _save_bytes(self, data: bytes, name: str, title: str) -> None:
         if self.page.web:
@@ -2306,6 +2694,11 @@ class App:
         else:
             threading.Thread(target=stop_all, name='shutdown').start()
         self.settings.save()
+
+
+def _write_table(table, path: str) -> int:
+    write_parquet(table, path)
+    return table.num_rows
 
 
 def _close_session(sess) -> None:

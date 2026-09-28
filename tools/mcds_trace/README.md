@@ -40,12 +40,24 @@ reload or a network drop only pauses drawing; a running trace carries on.
    unions, classes and arrays; add a numeric member with its `+`, or every
    numeric member of an aggregate with the list button. Numbers, floats,
    enums (shown by name), bools, pointers and bitfields are traceable. A raw
-   address works without an ELF.
+   address works without an ELF. The check mark of a selected member
+   removes it again (from its plots, tables and the trace). Rows can also be
+   dragged (sideways) onto a plot, a table or the drop zones; a struct or
+   array brings all its numeric members.
 2. **Plots** - every picked signal gets its own plot; drag signals from the
-   **Signals** tab onto a plot to overlay them. A plot's menu: step / lines /
+   **Signals** tab onto a plot to overlay them. Drag a legend entry onto
+   another plot to move it there, or onto the drop zone below the last plot
+   for a plot of its own; a plot left empty goes. A plot's menu: step / lines /
    points, normalize (compare shapes of different scales), statistics of the
    view (n, min, max, mean, typical interval), Y range and log scale, split
    into one plot per signal, merge into the plot above, height, order.
+   **Value tables** (toolbar or *New table*) list signals compactly by name
+   with their latest value, as `dec` (scaled, with unit), `hex` or `ascii`
+   (both of the raw bits); click a value to give that row its own format.
+   Reviewing (a capture file, or a trace after Stop) the values are those at
+   the marker, or at the cursor while there is none; the header says which.
+   Tables work without signals, like plots. Dragging between two tables
+   moves a signal; dragging from a plot into a table or back copies it.
 3. **Trace live** - press **Start** (or F5). The trace hardware watches two
    address ranges; they are chosen from the selected signals so that as few
    extra bytes as possible are watched (**Capture** tab shows the plan, and a
@@ -62,7 +74,9 @@ reload or a network drop only pauses drawing; a running trace carries on.
 5. **Offline** - open a `.mcds` file (toolbar, recent list, or command line).
    Selection changes re-extract from the decoded events without decoding
    again; variables the capture has accesses to are offered after opening.
-6. **Export** - PNG of the view, CSV of the visible samples, the capture file
+6. **Export** - PNG of the view, Parquet of the visible samples (one row per
+   sample: `time_s`, `signal`, `id`, `value` scaled, `raw`, `unit`; the
+   signals' addresses and types in the schema metadata), the capture file
    itself to any folder (a download in the browser); workspaces
    (`.mcdsws`: ELF, signals, plots, capture settings) save and load.
 
