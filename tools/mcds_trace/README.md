@@ -16,7 +16,12 @@ uv run mcds-trace-ui run.mcds                          # open a capture
 uv run mcds-trace-ui --web                             # in the browser instead of a window
 uv run mcds-trace-ui --serve --port 8550 --bind 0.0.0.0   # serve only, open http://HOST:8550
 uv run mcds-trace-ui --host 192.168.178.99 --workspace bench.mcdsws
+uv run flet run                                         # the same through Flet (src/main.py)
+uv run flet run --web -- --elf /abs/path/app.elf        # app arguments after --
 ```
+
+`flet run` starts the app with `.flet/storage/data` as working directory, so
+pass absolute paths.
 
 Pure Python (flet, matplotlib, numpy, Pillow, pyelftools); `uv` resolves
 everything on each platform, nothing is compiled.
@@ -57,7 +62,8 @@ reload or a network drop only pauses drawing; a running trace carries on.
 5. **Offline** - open a `.mcds` file (toolbar, recent list, or command line).
    Selection changes re-extract from the decoded events without decoding
    again; variables the capture has accesses to are offered after opening.
-6. **Export** - PNG of the view, CSV of the visible samples; workspaces
+6. **Export** - PNG of the view, CSV of the visible samples, the capture file
+   itself to any folder (a download in the browser); workspaces
    (`.mcdsws`: ELF, signals, plots, capture settings) save and load.
 
 Compact mode records hit times per range instead of values. Gaps (lost
