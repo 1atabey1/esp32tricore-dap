@@ -126,6 +126,9 @@ class CaptureOptions:
         return c
 
 
+FORMATS = ('dec', 'hex', 'ascii')        # value tables
+
+
 @dataclass
 class SubplotModel:
     id: int
@@ -136,6 +139,9 @@ class SubplotModel:
     ylog: bool = False
     normalize: bool = False                          # each signal scaled to 0..1 in view
     stats: bool = False                              # statistics row under the legend
+    kind: str = 'plot'                               # plot | table (latest values)
+    fmt: str = 'dec'                                 # table: dec | hex | ascii
+    row_fmt: dict = field(default_factory=dict)      # table: signal id -> its own format
 
 
 class Workspace:
@@ -179,12 +185,13 @@ class Workspace:
         for sp in self.subplots:
             if sid in sp.signals:
                 sp.signals.remove(sid)
+            sp.row_fmt.pop(sid, None)
 
     def plot(self, pid: int) -> SubplotModel | None:
         return next((p for p in self.subplots if p.id == pid), None)
 
-    def new_plot(self) -> SubplotModel:
-        sp = SubplotModel(self._next_plot)
+    def new_plot(self, kind: str = 'plot') -> SubplotModel:
+        sp = SubplotModel(self._next_plot, kind=kind)
         self._next_plot += 1
         self.subplots.append(sp)
         return sp
@@ -201,7 +208,9 @@ class Workspace:
         rest = sp.signals[1:]
         sp.signals = sp.signals[:1]
         for k, sid in enumerate(rest):
-            new = SubplotModel(self._next_plot, [sid], sp.style, None, sp.height)
+            new = SubplotModel(self._next_plot, [sid], sp.style, None, sp.height,
+                               kind=sp.kind, fmt=sp.fmt,
+                               row_fmt={sid: sp.row_fmt[sid]} if sid in sp.row_fmt else {})
             self._next_plot += 1
             self.subplots.insert(i + 1 + k, new)
 
@@ -210,10 +219,14 @@ class Workspace:
         i = next((k for k, p in enumerate(self.subplots) if p.id == pid), None)
         if not i:
             return
-        up = self.subplots[i - 1]
-        for sid in self.subplots[i].signals:
+        up, sp = self.subplots[i - 1], self.subplots[i]
+        if up.kind != sp.kind:
+            return                        # a plot does not merge into a table
+        for sid in sp.signals:
             if sid not in up.signals:
                 up.signals.append(sid)
+                if sid in sp.row_fmt:
+                    up.row_fmt[sid] = sp.row_fmt[sid]
         del self.subplots[i]
 
     def move_plot(self, pid: int, delta: int) -> None:
@@ -224,6 +237,7 @@ class Workspace:
         self.subplots.insert(j, self.subplots.pop(i))
 
     def plotted(self) -> list[Signal]:
+        """Signals shown anywhere: on plots or in tables."""
         seen = []
         for sp in self.subplots:
             for sid in sp.signals:
@@ -342,6 +356,10 @@ class Workspace:
                               pd.get('style', 'step'), pd.get('ylim'), int(pd.get('height', 220)),
                               bool(pd.get('ylog', False)), bool(pd.get('normalize', False)),
                               bool(pd.get('stats', False)))
+            sp.kind = 'table' if pd.get('kind') == 'table' else 'plot'
+            sp.fmt = pd.get('fmt') if pd.get('fmt') in FORMATS else 'dec'
+            rf = pd.get('row_fmt') if isinstance(pd.get('row_fmt'), dict) else {}
+            sp.row_fmt = {k: v for k, v in rf.items() if k in ws.signals and v in FORMATS}
             ws.subplots.append(sp)
             ws._next_plot = max(ws._next_plot, sp.id + 1)
         return ws, missing

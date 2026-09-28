@@ -46,6 +46,9 @@ reload or a network drop only pauses drawing; a running trace carries on.
    points, normalize (compare shapes of different scales), statistics of the
    view (n, min, max, mean, typical interval), Y range and log scale, split
    into one plot per signal, merge into the plot above, height, order.
+   **Value tables** (toolbar or *New table*) list signals compactly by name
+   with their latest value, as `dec` (scaled, with unit), `hex` or `ascii`
+   (both of the raw bits); click a value to give that row its own format.
 3. **Trace live** - press **Start** (or F5). The trace hardware watches two
    address ranges; they are chosen from the selected signals so that as few
    extra bytes as possible are watched (**Capture** tab shows the plan, and a

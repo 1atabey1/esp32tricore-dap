@@ -108,6 +108,37 @@ class Signal:
                                 and float(value).is_integer() else value)
         return str(int(value)) if float(value).is_integer() else '%.6g' % value
 
+    def raw_bits(self, value) -> tuple[int, int] | None:
+        """A stored (decoded) value back to its bits: (unsigned integer, bit
+        width).  None for a missing value or one without a bit pattern."""
+        if value is None or (isinstance(value, float) and not np.isfinite(value)):
+            return None
+        node = self.node
+        if node is not None and node.type.kind == 'base' and node.type.encoding == 'float':
+            if self.size == 4:
+                return int.from_bytes(_F32.pack(float(value)), 'little'), 32
+            if self.size == 8:
+                return int.from_bytes(_F64.pack(float(value)), 'little'), 64
+            return None
+        if not float(value).is_integer():
+            return None
+        width = node.bit_size if node is not None and node.bit_size else 8 * max(self.size, 1)
+        return int(value) & ((1 << width) - 1), width
+
+    def format_as(self, value, fmt: str) -> str:
+        """A stored value as 'dec' (scaled, with its unit, as in the legends),
+        'hex' or 'ascii' (both of the raw bits, little-endian bytes)."""
+        if fmt == 'dec' or self.kind != 'value':
+            return self.format_display(None if value is None else self.apply(value))
+        bits = self.raw_bits(value)
+        if bits is None:
+            return '-'
+        v, width = bits
+        if fmt == 'hex':
+            return '0x%0*X' % ((width + 3) // 4, v)
+        data = v.to_bytes((width + 7) // 8, 'little')
+        return "'%s'" % ''.join(chr(b) if 0x20 <= b < 0x7F else '.' for b in data)
+
     def to_json(self) -> dict:
         d = {'id': self.id, 'label': self.label, 'addr': '0x%08X' % self.addr,
              'size': self.size, 'kind': self.kind, 'color': self.color}
