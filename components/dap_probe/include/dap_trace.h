@@ -72,6 +72,10 @@ esp_err_t dap_trace_poll(void);
  * self-describing, so any chunking works. */
 size_t dap_trace_read(uint8_t *out, size_t max);
 
+/* Milliseconds since a consumer last called dap_trace_read() (or since the
+ * drain started, if none has yet): a trace nobody reads is orphaned. */
+uint32_t dap_trace_reader_idle_ms(void);
+
 void dap_trace_get_stats(dap_trace_stats_t *out);
 
 /* Write a known pattern into the TRAM, run the drain over it as if the write

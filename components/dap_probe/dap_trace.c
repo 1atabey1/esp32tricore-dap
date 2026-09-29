@@ -134,6 +134,9 @@ static void publish_flags(uint32_t par_index, const uint32_t *words, uint32_t lo
  * own thread (DAP access is not locked). */
 static esp_err_t trace_begin(void);
 
+/* When a consumer last called dap_trace_read(): tells an orphaned trace. */
+static volatile int64_t s_last_read_us;
+
 esp_err_t dap_trace_start(void)
 {
     const esp_err_t err = trace_begin();
@@ -206,6 +209,7 @@ static esp_err_t trace_begin(void)
     __atomic_store_n(&s_ring_reset, true, __ATOMIC_RELEASE);
 
     memset(&s_stats, 0, sizeof(s_stats));
+    s_last_read_us     = esp_timer_get_time();   /* a consumer gets time to connect */
     s_stats.queue_free = TRACE_RING_BYTES - 1u;
     s_stats.fifonow    = now;
     s_running          = true;
@@ -414,10 +418,16 @@ static void trace_task(void *arg)
     vTaskDelete(NULL);
 }
 
+uint32_t dap_trace_reader_idle_ms(void)
+{
+    return (uint32_t)((esp_timer_get_time() - s_last_read_us) / 1000);
+}
+
 size_t dap_trace_read(uint8_t *out, size_t max)
 {
     size_t n = 0;
 
+    s_last_read_us = esp_timer_get_time();
     if (s_ring == NULL) {
         return 0;
     }

@@ -120,6 +120,10 @@ void tricore_flash_set_ucb(const tricore_ucb_image_t *image);
 
 void tricore_flash_get_status(tricore_flash_status_t *out);
 
+/* A flash (web or GDB `load`) is under way: the target is being reset and
+ * programmed, so a trace must not start now. */
+bool tricore_flash_active(void);
+
 /* The CRC32 the stub computes, for comparing against an image held here. */
 uint32_t tricore_flash_crc32(const uint8_t *data, uint32_t length);
 
