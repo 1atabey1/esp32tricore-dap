@@ -738,8 +738,9 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
                                  size_t data_bits, size_t reply_bits, uint8_t parcels,
                                  uint8_t lead)
 {
-    uint8_t b[REG_DATA + 8 - REG_CMD];
-    uint8_t flags = s_flags;
+    uint8_t  b[REG_DATA + 8 - REG_CMD];
+    uint8_t  flags   = s_flags;
+    uint16_t maxwait = s_maxwait;
 
     /* Fast mode sends the frame raw; one that does not fit goes at DIV. */
     if (s_fast) {
@@ -750,6 +751,8 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
             data      = word;
             data_bits = bits;
             flags    |= FLAG_FAST | FLAG_RAW_FRAME;
+            /* MAXWAIT counts clocks: the same time is twice as many here. */
+            maxwait   = (s_maxwait > 0x7FFFu) ? 0xFFFFu : (uint16_t)(s_maxwait * 2u);
         }
     }
 
@@ -758,8 +761,8 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
     b[REG_DBITS - REG_CMD]       = (uint8_t)(data_bits & 0x3F);
     b[REG_RBITS - REG_CMD]       = (uint8_t)(reply_bits & 0x7F);
     b[REG_TRAIL - REG_CMD]       = s_trail;
-    b[REG_MAXWAIT - REG_CMD]     = (uint8_t)s_maxwait;
-    b[REG_MAXWAIT + 1 - REG_CMD] = (uint8_t)(s_maxwait >> 8);
+    b[REG_MAXWAIT - REG_CMD]     = (uint8_t)maxwait;
+    b[REG_MAXWAIT + 1 - REG_CMD] = (uint8_t)(maxwait >> 8);
     b[REG_PARCELS - REG_CMD]     = parcels;
     b[REG_FLAGS - REG_CMD]       = flags;
     b[REG_LEAD - REG_CMD]        = lead;
