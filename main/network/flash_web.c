@@ -406,11 +406,12 @@ static esp_err_t flash_status_handler(httpd_req_t *req)
         " sectors=%" PRIu32 " sectors_done=%" PRIu32 " skipped=%" PRIu32 " ms=%" PRIu32
         " compare_ms=%" PRIu32
         " erase_ms=%" PRIu32 " write_ms=%" PRIu32 " loader_ms=%" PRIu32
+        " bursts=%" PRIu32 " op_us_max=%" PRIu32
         " verified=%d ucb=%s errsr=0x%08" PRIX32 " image_bytes=%" PRIu32
         " message=%s\n",
         phase_name(st.phase), s_flash_task ? 1 : 0, st.total_bytes,
         st.done_bytes, st.sectors, st.sectors_done, st.sectors_skipped, st.elapsed_ms,
-        st.compare_ms, st.erase_ms, st.write_ms, st.loader_ms,
+        st.compare_ms, st.erase_ms, st.write_ms, st.loader_ms, st.bursts, st.op_us_max,
         st.verified ? 1 : 0,
         st.ucb == TRICORE_FLASH_UCB_OK ? "ok" : st.ucb == TRICORE_FLASH_UCB_FAILED ? "failed" : "off",
         st.errsr, s_image.bytes, st.message);

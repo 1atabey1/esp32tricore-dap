@@ -29,7 +29,7 @@ CLI:
 ```sh
 curl -u admin:admin --data-binary @app.hex http://<board>/api/flash/upload   # "ok records=.. bytes=.."
 curl -u admin:admin -X POST http://<board>/api/flash/start                   # changed sectors only
-curl -u admin:admin -X POST 'http://<board>/api/flash/start?full=1'          # every sector (~7 s / 700 kB)
+curl -u admin:admin -X POST 'http://<board>/api/flash/start?full=1'          # every sector (~3 s / 700 kB)
 curl -u admin:admin -X POST 'http://<board>/api/flash/start?slow=1'          # word writes (fallback)
 curl -u admin:admin -X POST 'http://<board>/api/flash/start?ucb=1'           # + boot mode headers
 curl -u admin:admin http://<board>/api/flash/ucb                             # per-block UCB report

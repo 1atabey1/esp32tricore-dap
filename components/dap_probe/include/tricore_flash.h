@@ -67,6 +67,8 @@ typedef struct {
     uint32_t erase_ms;          /* sector erases */
     uint32_t write_ms;          /* data into the loader buffer, over DAP */
     uint32_t loader_ms;         /* the loader programming pages */
+    uint32_t bursts;            /* 256-byte Write Burst operations */
+    uint32_t op_us_max;         /* longest polled program operation */
     uint32_t errsr;             /* DMU_HF_ERRSR at the last failure */
     bool     verified;
     uint8_t  ucb;               /* TRICORE_FLASH_UCB_* */
