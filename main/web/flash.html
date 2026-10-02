@@ -73,13 +73,19 @@
   </div>
 
   <div class="row">
+    <label class="opt"><input type="checkbox" id="full">
+      Full flash: erase and program every sector (otherwise only the sectors that differ)</label>
+  </div>
+
+  <div class="row">
     <label class="opt"><input type="checkbox" id="ucb">
       Also program the boot mode headers (BMHD0..3, ORIG and COPY) from the image</label>
   </div>
 
   <p class="note">
-    Takes an Intel HEX (<code>.hex</code>). Programs program flash, skipping sectors
-    that already hold the image; never DFLASH. The boot mode headers are written only
+    Takes an Intel HEX (<code>.hex</code>). Programs program flash; by default only the
+    sectors whose bytes differ from the image are erased and written (the rest are
+    compared on the target and skipped), with the first box every sector is. Never DFLASH. The boot mode headers are written only
     with the box ticked, only after the program flash verifies, and only while the
     device reports them UNREAD or UNLOCKED; other UCBs (SWAP, OTP, DBG, HSM, ...) are
     never written.
@@ -138,16 +144,27 @@ el("upload").onclick = async () => {
   el("upload").disabled = false;
 };
 
+/* The mode is remembered per browser; storage may be unavailable (private window). */
+try { el("full").checked = localStorage.getItem("flash.full") === "1"; } catch (e) {}
+el("full").onchange = () => {
+  try { localStorage.setItem("flash.full", el("full").checked ? "1" : "0"); } catch (e) {}
+};
+
 el("start").onclick = async () => {
   const ucb = el("ucb").checked;
+  const full = el("full").checked;
+  const what = full ? "Erase and reprogram every sector of the target's flash"
+                    : "Erase and reprogram the sectors that differ from the image";
   if (!confirm(ucb
-      ? "Erase and reprogram the target's flash AND its boot mode headers?\n\n" +
+      ? what + " AND its boot mode headers?\n\n" +
         "A wrong boot mode header can leave a part that does not boot."
-      : "Erase and reprogram the target's flash?")) return;
+      : what + "?")) return;
   el("start").disabled = true;
   el("ucbbox").hidden = true;
+  const query = [full ? "full=1" : "", ucb ? "ucb=1" : ""].filter(Boolean).join("&");
+  log("starting a " + (full ? "full" : "differential") + " flash" + (ucb ? " with boot headers" : ""));
   try {
-    const r = await fetch("/api/flash/start" + (ucb ? "?ucb=1" : ""), { method: "POST" });
+    const r = await fetch("/api/flash/start" + (query ? "?" + query : ""), { method: "POST" });
     log((await r.text()).trim());
   } catch (e) {
     log("could not start: " + e.message);
@@ -179,8 +196,9 @@ async function poll() {
   el("s_image").textContent = num("image_bytes") ? fmt(num("image_bytes")) : "-";
   el("s_done").textContent = num("total")
     ? fmt(num("done")) + " / " + fmt(num("total")) : "-";
-  el("s_sect").textContent = num("sectors")
-    ? num("sectors_done") + " / " + num("sectors") : "-";
+  el("s_sect").textContent = (num("sectors") || num("skipped"))
+    ? num("sectors_done") + " / " + num("sectors") +
+      (num("skipped") ? " (+" + num("skipped") + " same)" : "") : "-";
   el("s_ms").textContent = num("ms") ? (num("ms") / 1000).toFixed(1) + " s" : "-";
 
   const v = el("s_ver");
@@ -205,7 +223,9 @@ async function poll() {
     wasRunning = false;           /* before the await, so an overlapping poll does not repeat this */
     log(kv.phase + ": " + (kv.message || ""));
     if (kv.phase === "done") {
-      log("elapsed " + (num("ms") / 1000).toFixed(1) + " s");
+      log("elapsed " + (num("ms") / 1000).toFixed(1) + " s: " + num("sectors") +
+          " sectors written" + (num("skipped") ? ", " + num("skipped") +
+          " already held the image and were skipped" : ""));
     }
     if (kv.ucb && kv.ucb !== "off") {
       try {

@@ -22,7 +22,9 @@ curl -u admin:admin 'http://<board>/api/fpga_image?sel=dap'    # DAP master (def
 
 ## 2. Flash via web
 
-Browser: `http://<board>/flash.html` -> choose `.hex` -> Flash. Target is reset and started afterwards.
+Browser: `http://<board>/flash.html` -> choose `.hex` -> Upload -> Erase & program. Target is reset and
+started afterwards. Changed sectors only by default; tick *Full flash* for every sector (remembered per
+browser).
 
 CLI:
 
