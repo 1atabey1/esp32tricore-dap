@@ -175,10 +175,25 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   data with div-5 taps). Block writes are refused in wide mode (parcels arrive corrupted).
 - 1 kB block reads: narrow 24 MHz 2.3 MB/s, wide 24 MHz 3.65-3.9 MB/s chained, data verified
   (`/api/dap_bench?div=0&wide=1&chain=16`).
-- A 48 MHz DAP clock is within the TC38x's limits (160 MHz) but not this fabric's: device-to-host
-  data is only guaranteed valid for 8-10 ns per bit with no fixed position, which needs sub-5 ns
-  sampling; the 48 MHz UP5K fabric samples in 20.8 ns steps (10.4 ns with DDR inputs), and it
-  closes timing at 50 MHz with little margin. The link (4.7 MB/s) would cap the gain at ~20%.
+- Fast mode, experimental (`dap_phy_fpga_set_fast`, FLAGS bit 6): a 48 MHz DAP clock, one bit per
+  fabric clock. DAP0 comes from the pad's DDR register, high in the second half of each cycle;
+  DAP1/DAP2 are sampled in the I/O cell, on either edge (SKEW bits 4/5). Only cycles where a DAP0
+  clock lands are samples (SKEW [7:6] LAG + tap + 1 clocks after it), and DAP0 stops by budget so
+  the target gets exactly each reply's clocks. Frames go out raw, built by the firmware; one over
+  44 data bits narrow (40 wide) goes at DIV.
+  - Measured on the TC387 (`/api/dap_bench?div=0&fast=1&skew=0x40`): narrow 3.0 MB/s single,
+    3.65 MB/s chained (24 MHz: 2.1 / 2.3), data verified, block writes and word writes clean.
+    Wide 3.26 MB/s: past 48 MHz the SPI drain (214 µs per kB) is the limit, not the DAP.
+  - Timing window, narrow: LAG 0-1 any edge, LAG 2 rising edge, any tap 0-2; LAG 3 fails. Wide
+    passes up to LAG 3 rising edge. A failing setting can lose the DAP (re-attach).
+  - Single-word reads are ~10 µs slower than at 24 MHz (read32_fast 36 vs 26 µs), not from
+    MAXWAIT (doubled for fast frames); cause not found.
+  - The fabric does not close timing with it: 46.7 MHz on the best of 120 seeds, built with
+    `--timing-allow-fail`. Normal modes passed the bench and the GDB suite on that bitstream.
+  - What it cost to get there: an explicit `CLOCK_ENABLE(1'b1)` on the pads makes no difference;
+    the netlist outcome is chaotic (trivial changes move the seed distribution by 3 MHz); the
+    field-end compares, the fast/normal muxes on enables and the receiver's start-bit-to-DAP0
+    path were the real critical paths and are now registered.
 
 ## Known limits
 
