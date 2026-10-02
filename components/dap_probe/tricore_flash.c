@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dap_mcds.h"
 #include "dap_phy_fpga.h"
 #include "dap_probe.h"
 #include "esp_log.h"
@@ -401,8 +402,29 @@ static esp_err_t begin_locked(void)
     return ESP_OK;
 }
 
+/* A flash resets the target under a running trace, and the trace's drain
+ * would compete for the DAP meanwhile: stop it first, before taking the lock
+ * (stopping waits for the drain, which needs the lock to finish its pass). */
+static void stop_trace(void)
+{
+    if (dap_mcds_running()) {
+        ESP_LOGW(TAG, "stopping the running trace: flashing resets the target");
+        dap_mcds_stop();
+    }
+}
+
+static volatile bool s_flash_active;
+
+bool tricore_flash_active(void)
+{
+    return s_flash_active || s_session_locked;
+}
+
 esp_err_t tricore_flash_begin(void)
 {
+    if (!s_session_locked) {
+        stop_trace();
+    }
     dap_lock();
     if (s_session_locked) {
         dap_unlock();               /* already inside a session */
@@ -794,9 +816,12 @@ static esp_err_t write_locked(const tricore_flash_region_t *regions,
 esp_err_t tricore_flash_write(const tricore_flash_region_t *regions,
                               size_t count)
 {
+    s_flash_active = true;
+    stop_trace();
     dap_lock();
     const esp_err_t err = write_locked(regions, count);
     session_unlock();
     dap_unlock();
+    s_flash_active = false;
     return err;
 }

@@ -18,9 +18,11 @@
 #include "dap_probe_priv.h"
 #include "dap_trace.h"
 #include "dap_wide.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "DAP_MCDS";
@@ -393,9 +395,41 @@ static void take_snapshot(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
     }
 }
 
+/*
+ * A trace nobody reads is orphaned: the host that started it went away (a UI
+ * closed or restarted mid-trace) without /api/mcds/stop.  Left alone it keeps
+ * the drain busy-polling core 0 above everything else and the DAP in wide
+ * mode, and the next flash has to fight it for the link.  The watcher stops a
+ * trace no consumer has asked for data for ORPHAN_MS.  Its stack is in PSRAM:
+ * internal RAM is the scarce kind, and it only makes DAP calls.
+ */
+#define ORPHAN_MS  10000u
+
+static TaskHandle_t s_watch;
+
+static void watch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (s_running && dap_trace_reader_idle_ms() > ORPHAN_MS) {
+            ESP_LOGW(TAG, "nothing read the trace for %u s (its host went away?): stopping it",
+                     (unsigned)(ORPHAN_MS / 1000u));
+            dap_mcds_stop();
+        }
+    }
+}
+
 esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
 {
     esp_err_t err;
+
+    if (s_watch == NULL &&
+        xTaskCreatePinnedToCoreWithCaps(watch_task, "mcds_watch", 3072, NULL, 3, &s_watch,
+                                        1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        s_watch = NULL;
+        ESP_LOGW(TAG, "no orphan watcher: a trace whose host goes away keeps running");
+    }
 
     if (s_running) {
         dap_mcds_stop();
@@ -448,6 +482,11 @@ esp_err_t dap_mcds_stop(void)
 {
     uint32_t ctl = 0;
 
+    /* Once: the watcher, a flash and /api/mcds/stop may all want to. */
+    if (!__atomic_exchange_n(&s_running, false, __ATOMIC_ACQ_REL)) {
+        return ESP_OK;
+    }
+
     /* Flush first (tracing stops, the drain keeps reading), then stop the
      * drain, then collect the rest. */
     dap_probe_write32(DAP_ADDR_FIFOCTL, FIFOCTL_SET);
@@ -464,7 +503,6 @@ esp_err_t dap_mcds_stop(void)
     mcds_reset();                        /* no trace, no heartbeat left armed */
     restore_link();
     dap_unlock();
-    s_running = false;
     ESP_LOGI(TAG, "tracing stopped");
     return ESP_OK;
 }

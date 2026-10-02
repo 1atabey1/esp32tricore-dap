@@ -160,7 +160,11 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
         return
     try:
         hdr = {'Authorization': 'Basic ' + base64.b64encode(auth.encode()).decode()}
-        ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=0.2)
+        # Connect and handshake get seconds: over Wi-Fi, with the probe's one
+        # HTTP task serving other requests, 0.2 s was often not enough ("trace
+        # stream: timed out").  Only the drain of leftovers below is short.
+        ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=5)
+        ws.settimeout(0.2)
         quiet_since, t0 = time.monotonic(), time.monotonic()
         while time.monotonic() - quiet_since < 0.3 and time.monotonic() - t0 < 5:
             try:

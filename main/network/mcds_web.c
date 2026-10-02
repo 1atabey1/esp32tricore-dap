@@ -19,6 +19,7 @@
 #include "dap_trace.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "tricore_flash.h"
 
 static const char *TAG = "MCDS_WEB";
 
@@ -268,6 +269,14 @@ static esp_err_t start_handler(httpd_req_t *req)
 
     if (!s_cfg_valid) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "POST /api/mcds/config first");
+        return ESP_OK;
+    }
+    /* Refused, not queued: the start would wait for the DAP for the length of
+     * the flash (holding this server), then trace a target that just reset. */
+    if (tricore_flash_active()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "a flash is in progress; start the trace when it is done\n");
         return ESP_OK;
     }
     const esp_err_t err = dap_mcds_start(&s_cfg, &s_info);

@@ -350,6 +350,7 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
  * tick (10 ms at CONFIG_FREERTOS_HZ=100); the 1 MB drain ring covers it. */
 #define TRACE_WS_CHUNK   16384
 #define TRACE_WS_IDLE_MS 10
+#define TRACE_WS_END_US  1000000        /* drained and not running this long: the end */
 
 static httpd_handle_t s_trace_ws_hd;
 static int            s_trace_ws_fd = -1;
@@ -398,10 +399,31 @@ static void trace_ws_task(void *arg)
 
     ESP_LOGI(TAG, "trace ws: streaming to fd %d", s_trace_ws_fd);
 
+    /* The client connects before it starts the trace, so an idle stream is
+     * fine; one whose trace ran and has ended (stopped by the host, a flash
+     * or the orphan watcher) is closed once drained, so the host notices. */
+    bool    traced   = false;
+    int64_t ended_at = 0;
+
     while (s_trace_ws_run && s_trace_ws_fd >= 0) {
         const size_t n = dap_trace_read(buf, TRACE_WS_CHUNK);
 
         if (n == 0) {
+            dap_trace_stats_t st;
+            dap_trace_get_stats(&st);
+            const int64_t now = esp_timer_get_time();
+            if (st.running) {
+                traced   = true;
+                ended_at = 0;
+            } else if (traced && ended_at == 0) {
+                ended_at = now;
+            } else if (traced && now - ended_at > TRACE_WS_END_US) {
+                httpd_ws_frame_t bye = { .final = true, .type = HTTPD_WS_TYPE_CLOSE };
+                httpd_ws_send_frame_async(s_trace_ws_hd, s_trace_ws_fd, &bye);
+                httpd_sess_trigger_close(s_trace_ws_hd, s_trace_ws_fd);
+                ESP_LOGI(TAG, "trace ws: the trace ended; closing the stream");
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
             continue;
         }
@@ -759,6 +781,15 @@ static esp_err_t dap_gdb_status_handler(httpd_req_t *req)
         n += (size_t)snprintf(line + n, sizeof(line) - n, " gdb_stack_free=%u",
                               (unsigned)uxTaskGetStackHighWaterMark(gdb_task));
     }
+    /* Internal RAM (lwIP, SPI DMA and task stacks live there, not in PSRAM):
+     * free now, the lowest since boot, the largest block, and DMA-capable. */
+    n += (size_t)snprintf(line + n, sizeof(line) - n,
+                          " iram_free=%u iram_min=%u iram_block=%u dma_free=%u tasks=%u",
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                          (unsigned)uxTaskGetNumberOfTasks());
     n += (size_t)snprintf(line + n, sizeof(line) - n, "\n");
 
     httpd_resp_set_type(req, "text/plain");

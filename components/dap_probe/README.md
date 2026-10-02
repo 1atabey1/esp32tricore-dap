@@ -83,8 +83,12 @@ reports `busy`.
 - Sequence per tas-debug: reset-and-halt, halt all started cores, load loader
   blob to CPU0 PSPR `0x70100000` (verify readback), ENDINIT, erase sectors,
   program pages, safe shutdown, verify (CRC32 on target), reset, resume.
-- Loader blob byte-identical to tas-debug; `PROGRAM_SETTLE` patched 4000 -> 12000
-  (the reference's ~200 us per page, at 300 MHz instead of the 100 MHz backup clock).
+- Loader blob byte-identical to tas-debug's (`loader_blob.py`, 516 bytes): it programs 256-byte
+  Write Bursts where the address allows (pages for the rest) and polls `DMU_HF_STATUS` until the
+  bank is idle, timed out in STM ticks. The STM's frequency is measured at install (100 MHz here:
+  our OCDS reset keeps the application's PLL); STM0's suspend-while-halted, which a killed GDB
+  session leaves on, is lifted for the measurement. Only if the STM does not count does the stub
+  use its spin loop, whose `PROGRAM_SETTLE` is patched 4000 -> 12000 wherever the `mov` sits.
 - Differential, as tas-debug's `differential` mode: before erasing, the loader CRCs the
   bytes the image programs into each sector (only those); matching sectors are neither
   erased nor written. Unreadable (erased, no valid ECC) counts as changed. `?full=1`
@@ -96,9 +100,10 @@ reports `busy`.
 - Sessions run the DAP narrow at 24 MHz (the attach default is 4 MHz, restored after).
   Wide mode would not help: it cannot carry block writes, and verification is a CRC on
   the target.
-- A 700 kB image: 7.1 s in full (erase 0.4 s, page programming 5.5 s, buffer transfers
-  0.8 s); 0.7 s when unchanged, ~0.34 s more per changed sector. `/api/flash/status`
-  reports `compare_ms`, `erase_ms`, `write_ms`, `loader_ms` and `skipped`.
+- A 736 kB image: **2.8 s** in full (erase 0.4 s, programming 1.2 s in 2880 bursts, buffer
+  transfers 0.8 s) - 7.3 s with page-by-page programming; 0.8 s when unchanged.
+  `/api/flash/status` reports `compare_ms`, `erase_ms`, `write_ms`, `loader_ms`, `skipped`,
+  `bursts` and `op_us_max` (longest polled operation; 378 us measured, 530 us data-sheet max).
 - GDB `load` erases nothing on `vFlashErase`: the sectors BMP hands over (whole 16 KB,
   padded with the erased value) are collected in PSRAM and applied on `vFlashDone` with
   the same differential plan. An interrupted load leaves the flash as it was.

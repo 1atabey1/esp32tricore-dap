@@ -69,6 +69,9 @@ static const struct { uint32_t start, end; } NEVER_PROGRAM[] = {
 
 #define LOADER_CMD_PROGRAM    1u
 #define LOADER_CMD_CHECKSUM   3u
+#define LOADER_FLAG_BURST     0x1u
+#define LOADER_FLAG_POLL      0x2u
+#define LOADER_PARAM_WORDS    14
 #define LOADER_ST_RUNNING     0u
 #define LOADER_ST_OK          1u
 
