@@ -23,11 +23,15 @@
  *   0x0B FLAGS    rw  0 TRST asserted, 1 raw reply window (no start-bit hunt),
  *                     2 wide mode (DAP1 even bits, DAP2 odd),
  *                     3 raw frame (DATA is the whole frame, DBITS its length),
- *                     5 receive wide without driving DAP2
+ *                     5 receive wide without driving DAP2,
+ *                     6 fast: one bit per fabric clock (48 MHz), DIV ignored
  *   0x0C LEAD     rw  idle clocks before each frame
  *   0x0D LEVEL    ro  12-bit bytes waiting in the FIFO, low byte first;
  *                     0x0E bit 4: a block start is queued (chaining)
- *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks
+ *   0x0F SKEW     rw  capture tap: [1:0] DAP1, [3:2] DAP2, in fabric clocks;
+ *                     4 DAP1, 5 DAP2: sample half a clock later (falling edge),
+ *                     [7:6] fast mode LAG: a DAP0 clock's bit is sampled
+ *                     LAG + DAP1 tap + 1 fabric clocks after it
  *   0x10 DATA     rw  64-bit frame payload, low byte first
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
@@ -90,6 +94,20 @@ module dap_top #(
      */
     reg [1:0]  r_skew1   = 2'd0;
     reg [1:0]  r_skew2   = 2'd0;
+    /* SKEW bits 4 and 5: take that line from the pad's falling-edge register. */
+    reg        r_edge1   = 1'b0;
+    reg        r_edge2   = 1'b0;
+    /* SKEW [7:6]: the pad-to-sample latency beyond the tap, fast mode only. */
+    reg [1:0]  r_lag     = 2'd0;
+    /* The receiver's whole latency, registered off the register file. */
+    reg [2:0]  rx_lag    = 3'd0;
+    always @(posedge clk) rx_lag <= {1'b0, r_lag} + {1'b0, r_skew1};
+    /*
+     * FLAGS bit 6: a bit every fabric clock.  The pad then makes DAP0 from
+     * both clock edges: low for the first half of each cycle, high for the
+     * second, the data changing at the cycle start.
+     */
+    reg        r_fast    = 1'b0;
 
     reg [31:0] s_reply;
     reg [5:0]  s_crc;
@@ -275,6 +293,7 @@ module dap_top #(
     wire [62:0] rx_payload;
     wire [5:0]  rx_crc;
     wire        rx_dap0, rx_oe;
+    wire        tx_dap0_next, rx_dap0_next, tx_dap0_d, rx_dap0_d;
 
     reg [6:0]   rx_bits;
     reg         rx_expect_crc;
@@ -290,27 +309,82 @@ module dap_top #(
     wire drive    = tx_busy ? tx_oe : (rx_oe && !block_gap);
     wire dap1_out = tx_dap1;
 
-    assign dap1 = drive ? dap1_out : 1'bz;
+    /* DAP2 is driven only while a wide frame is being sent. */
+    wire drive2 = tx_busy && tx_oe2;
 
     /*
-     * Input synchronisers plus per-line capture tap.  Tap 0 is two clocks of
-     * delay (narrow-mode timing); taps 1..3 sample one clock later each.  The
-     * tap mux is registered to keep it off the start-bit hunt path.
+     * The pads.  DAP1 and DAP2 sample in the I/O cell on both clock edges;
+     * their outputs are unregistered, as plain fabric outputs were.  Every
+     * pad takes both clocks: DAP0 and DAP1 share an I/O tile, whose two
+     * cells must agree on them.  CLOCK_ENABLE is left open, as Lattice's
+     * technology library advises: tied to 1 it costs a LUT, and nextpnr
+     * then lost about 4 MHz across the whole fabric.
      */
-    reg [3:0] dap1_sync, dap2_sync;
+    wire dap1_p, dap1_n, dap2_p, dap2_n;
+
+    SB_IO #(.PIN_TYPE(6'b1010_00)) u_dap1_io (
+        .PACKAGE_PIN   (dap1),
+        .INPUT_CLK     (clk),
+        .OUTPUT_CLK    (clk),
+        .OUTPUT_ENABLE (drive),
+        .D_OUT_0       (dap1_out),
+        .D_IN_0        (dap1_p),
+        .D_IN_1        (dap1_n)
+    );
+
+    SB_IO #(.PIN_TYPE(6'b1010_00)) u_dap2_io (
+        .PACKAGE_PIN   (dap2),
+        .INPUT_CLK     (clk),
+        .OUTPUT_CLK    (clk),
+        .OUTPUT_ENABLE (drive2),
+        .D_OUT_0       (tx_dap2),
+        .D_IN_0        (dap2_p),
+        .D_IN_1        (dap2_n)
+    );
+
+    /*
+     * DAP0 from the I/O cell's DDR output register: D_OUT_0 holds the first
+     * half of each cycle, D_OUT_1 the second.  Normal modes register the
+     * engines' next value into both halves, timing as before.  Fast mode
+     * holds the first half low and raises the second for every cycle with a
+     * bit, so DAP0 rises mid-cycle with half a clock of setup and of hold.
+     * Only one engine is ever busy and an idle one holds dap0 low.  The
+     * second half comes straight from a register, a copy of the engines'
+     * dap0: the falling-edge register leaves only half a clock (timing).
+     */
+    reg  dap0_now  = 1'b0;
+    always @(posedge clk) dap0_now <= tx_dap0_d | rx_dap0_d;
+    wire dap0_next = tx_dap0_next | rx_dap0_next;
+
+    SB_IO #(.PIN_TYPE(6'b0100_00)) u_dap0_io (
+        .PACKAGE_PIN   (dap0),
+        .INPUT_CLK     (clk),
+        .OUTPUT_CLK    (clk),
+        .D_OUT_0       (dap0_next & ~r_fast),
+        .D_OUT_1       (dap0_now)
+    );
+
+    /*
+     * Synchronisers plus per-line capture tap.  Stage 0 is the pad register,
+     * the rising edge's or (SKEW bit 4/5) the falling edge's, half a clock
+     * later.  Tap 0 is two clocks of delay (narrow-mode timing); taps 1..3
+     * sample one clock later each.  The tap mux is registered to keep it off
+     * the start-bit hunt path.
+     */
+    wire      dap1_s0 = r_edge1 ? dap1_n : dap1_p;
+    wire      dap2_s0 = r_edge2 ? dap2_n : dap2_p;
+    reg [3:1] dap1_sync, dap2_sync;
+    wire [3:0] dap1_taps = {dap1_sync, dap1_s0};
+    wire [3:0] dap2_taps = {dap2_sync, dap2_s0};
     reg       dap1_tap,  dap2_tap;
     always @(posedge clk) begin
-        dap1_sync <= {dap1_sync[2:0], dap1};
-        dap2_sync <= {dap2_sync[2:0], dap2};
-        dap1_tap  <= dap1_sync[r_skew1];
-        dap2_tap  <= dap2_sync[r_skew2];
+        dap1_sync <= dap1_taps[2:0];
+        dap2_sync <= dap2_taps[2:0];
+        dap1_tap  <= dap1_taps[r_skew1];
+        dap2_tap  <= dap2_taps[r_skew2];
     end
     assign dap1_in = dap1_tap;
     wire   dap2_in = dap2_tap;
-
-    assign dap0    = tx_busy ? tx_dap0 : rx_dap0;
-    /* DAP2 is driven only while a wide frame is being sent. */
-    assign dap2    = (tx_busy && tx_oe2) ? tx_dap2 : 1'bz;
 
     /*
      * A block-write parcel is a start bit and 32 data bits, sent through the
@@ -324,9 +398,10 @@ module dap_top #(
         .clk (clk), .rst (rst), .div (r_div),
         .start (tx_start), .cmd (r_cmd), .len (r_len),
         .data_bits (tx_dbits), .data (r_data[62:0]), .lead (r_lead),
-        .wide (r_wide), .raw (r_raw | tx_parcel),
+        .wide (r_wide), .raw (r_raw | tx_parcel), .fast (r_fast),
         .busy (tx_busy), .done (tx_done),
-        .dap0 (tx_dap0), .dap1 (tx_dap1), .dat_oe (tx_oe),
+        .dap0 (tx_dap0), .dap0_d (tx_dap0_d), .dap0_next (tx_dap0_next),
+        .dap1 (tx_dap1), .dat_oe (tx_oe),
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
     );
 
@@ -340,13 +415,14 @@ module dap_top #(
         .max_wait (r_maxwait), .trail_clocks (r_trail),
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
-        .wide (rx_wide_any),
+        .wide (rx_wide_any), .fast (r_fast), .lag (rx_lag),
         .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
         .idle_high (rx_idle_high), .crc_ok (rx_crc_ok),
         .payload (rx_payload), .crc (rx_crc),
-        .dap0 (rx_dap0), .dap1_in (dap1_in), .dap2_in (dap2_in), .dat_oe (rx_oe)
+        .dap0 (rx_dap0), .dap0_d (rx_dap0_d), .dap0_next (rx_dap0_next),
+        .dap1_in (dap1_in), .dap2_in (dap2_in), .dat_oe (rx_oe)
     );
 
     /* ------------------------------------------------------------------ */
@@ -596,6 +672,10 @@ module dap_top #(
             r_rx_wide <= 1'b0;
             r_skew1   <= 2'd0;
             r_skew2   <= 2'd0;
+            r_edge1   <= 1'b0;
+            r_edge2   <= 1'b0;
+            r_lag     <= 2'd0;
+            r_fast    <= 1'b0;
         end else begin
             /*
              * Block-write parcel assembly, here because this block owns DATA.
@@ -629,10 +709,14 @@ module dap_top #(
                         r_wide    <=  reg_wdata[2];
                         r_raw     <=  reg_wdata[3];
                         r_rx_wide <=  reg_wdata[5];
+                        r_fast    <=  reg_wdata[6];
                     end
                     7'h0F: begin
                         r_skew1 <= reg_wdata[1:0];
                         r_skew2 <= reg_wdata[3:2];
+                        r_edge1 <= reg_wdata[4];
+                        r_edge2 <= reg_wdata[5];
+                        r_lag   <= reg_wdata[7:6];
                     end
                     7'h10: r_data[7:0]   <= reg_wdata;
                     7'h11: r_data[15:8]  <= reg_wdata;
@@ -698,10 +782,10 @@ module dap_top #(
             3'h0: rd_ctrl_hi = r_maxwait[7:0];         /* 0x08 */
             3'h1: rd_ctrl_hi = r_maxwait[15:8];
             3'h2: rd_ctrl_hi = r_parcels;
-            3'h3: rd_ctrl_hi = {2'd0, r_rx_wide, 1'b0,
+            3'h3: rd_ctrl_hi = {1'b0, r_fast, r_rx_wide, 1'b0,
                                 r_raw, r_wide, r_no_hunt, ~trst};
             3'h4: rd_ctrl_hi = {2'd0, r_lead};
-            3'h7: rd_ctrl_hi = {4'd0, r_skew2, r_skew1};
+            3'h7: rd_ctrl_hi = {r_lag, r_edge2, r_edge1, r_skew2, r_skew1};
             /* LEVEL: reply FIFO fill, so the host can drain during a block. */
             3'h5: rd_ctrl_hi = fifo_count[7:0];
             /* 0x0E: LEVEL high nibble, and a block start still queued. */

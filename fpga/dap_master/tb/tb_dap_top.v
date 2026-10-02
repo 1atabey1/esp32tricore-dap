@@ -6,6 +6,15 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
+/* Fast mode's LAG for this bench's round trip, and the target's busy bits
+ * before each block-read parcel; overridable to sweep them. */
+`ifndef FAST_LAG
+`define FAST_LAG 1
+`endif
+`ifndef FAST_BUSY
+`define FAST_BUSY 1
+`endif
+
 module tb_dap_top;
 
     /* 50 MHz, near the 48 MHz hardware clock. */
@@ -105,16 +114,17 @@ module tb_dap_top;
         end
     endtask
 
-    /* What went out on the wire, sampled at DAP0 rising, transmitter only. */
-    reg [95:0] sent;
+    /* What went out on the wire, sampled at DAP0 rising, transmitter only.
+     * On the edge itself, not the fabric clock: fast mode raises DAP0 at
+     * mid-cycle. */
+    reg [95:0] sent, sent2;
     integer    sent_bits;
-    reg        dap0_d;
 
-    always @(posedge clk) begin
-        dap0_d <= dap0;
-        if (!rst && dap0 && !dap0_d && dut.u_tx.busy) begin
-            sent[sent_bits] <= dap1;
-            sent_bits       <= sent_bits + 1;
+    always @(posedge dap0) begin
+        if (!rst && dut.u_tx.busy) begin
+            sent[sent_bits]  <= dap1;
+            sent2[sent_bits] <= dap2;
+            sent_bits        <= sent_bits + 1;
         end
     end
 
@@ -145,6 +155,9 @@ module tb_dap_top;
         end
     endfunction
 
+    /* Busy bits before each parcel's start bit. */
+    integer busy_bits = 1;
+
     /* One parcel: a start bit and 32 data bits, CRC only when asked. */
     task send_parcel;
         input [31:0] value;
@@ -153,7 +166,8 @@ module tb_dap_top;
         reg [5:0] c;
         begin
             c = crc_of({32'd0, value}, 32);
-            drive_bit(1'b0);              /* one busy cycle */
+            for (i = 0; i < busy_bits; i = i + 1)
+                drive_bit(1'b0);          /* busy cycles */
             drive_bit(1'b1);              /* start bit */
             for (i = 0; i < 32; i = i + 1) drive_bit(value[i]);
             if (with_crc)
@@ -175,18 +189,18 @@ module tb_dap_top;
     /* Every parcel the transmitter sent (start bit + 32 data bits), captured
      * off the wire; the start bit is dropped and the word kept. */
     reg [31:0] parcel_seen [0:7];
-    integer    parcels_seen;
-    reg [5:0]  parcel_bit;
+    integer    parcels_seen = 0;
+    reg [5:0]  parcel_bit   = 6'd0;
     reg [31:0] parcel_acc;
-    reg        in_parcel;
+    reg        in_parcel    = 1'b0;
 
-    always @(posedge clk) begin
+    always @(posedge dap0 or posedge rst) begin
         if (rst) begin
             parcels_seen <= 0;
             parcel_bit   <= 6'd0;
             in_parcel    <= 1'b0;
         /* Parcels only; the command frame's start bit must not count. */
-        end else if (dap0 && !dap0_d && dut.tx_parcel && capture_parcels) begin
+        end else if (dut.tx_parcel && capture_parcels) begin
             if (!in_parcel) begin
                 if (dap1) begin          /* the start bit */
                     in_parcel  <= 1'b1;
@@ -204,6 +218,50 @@ module tb_dap_top;
             end
         end
     end
+
+    /*
+     * A whole frame as raw mode takes it: start bit, CMD, LEN, ndata bits of
+     * DATA, CRC6 over those three, trailing zero; bit 0 first.
+     */
+    function [63:0] frame_of;
+        input [4:0]   cmd;
+        input [5:0]   len;
+        input [63:0]  data;
+        input integer ndata;
+        reg   [63:0]  body;
+        reg   [5:0]   c;
+        begin
+            body = {53'd0, len, cmd} | (data << 11);
+            c = crc_of(body, 11 + ndata);
+            frame_of = 64'd1 | (body << 1) | ({58'd0, c} << (12 + ndata));
+        end
+    endfunction
+
+    /* Two line words as one wide raw frame: DAP1 even bits, DAP2 odd. */
+    function [63:0] interleave;
+        input [10:0] even;
+        input [10:0] odd;
+        integer i;
+        begin
+            interleave = 64'd0;
+            for (i = 0; i < 11; i = i + 1) begin
+                interleave[2*i]   = even[i];
+                interleave[2*i+1] = odd[i];
+            end
+        end
+    endfunction
+
+    /* DATA and DBITS for a raw frame. */
+    task load_raw;
+        input [63:0]  f;
+        input integer n;
+        integer k;
+        begin
+            for (k = 0; k < 8; k = k + 1) burst[k] = f[8*k +: 8];
+            wr_burst(7'h10, 8);
+            wr(7'h05, n);
+        end
+    endtask
 
     reg capture_parcels = 1'b0;
 
@@ -605,6 +663,178 @@ module tb_dap_top;
         check("parcel 1", parcel_seen[1], 32'h55667788);
         check("parcel 2", parcel_seen[2], 32'hDEADBEEF);
         check("block write not timed out", {31'd0, scratch[2]}, 32'd0);
+
+        /*
+         * ---- fast mode: a bit every fabric clock ----
+         *
+         * DAP0 comes from the pad's DDR register, high in the second half of
+         * each cycle.  Fast mode sends raw frames only, so the frames are
+         * built here (frame_of, checked against the known wire words): sync
+         * with a reply, a payload frame, a block read and a block write.
+         */
+        $display("fast mode: sync, a bit per fabric clock");
+        check("frame_of(sync)", frame_of(5'h10, 6'd63, 64'd0, 0), 32'h09FE1);
+        check("frame_of(client_set(1))", frame_of(5'h1C, 6'd3, 64'd1, 3), 32'h1B10F9);
+        wr(7'h0B, 8'h48);                      /* FLAGS: fast, raw frame */
+        rd(7'h0B, scratch);
+        check("FLAGS reads back fast", {24'd0, scratch}, 32'h48);
+        /* This bench's round trip: a clock's bit is sampled two cycles on. */
+        wr(7'h0F, `FAST_LAG << 6);
+        rd(7'h0F, scratch);
+        check("SKEW reads back LAG", {24'd0, scratch}, `FAST_LAG << 6);
+        load_raw(frame_of(5'h10, 6'd63, 64'd0, 0), 19);
+        wr(7'h06, 8'd32);
+
+        sent_bits = 0;
+        sent      = 96'd0;
+
+        fork
+            wr(7'h01, 8'h01);
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                send_parcel(32'h5A5AC33C, 1'b1);
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("fast crc_ok", scratch[4], 1'b1);
+        check("fast not timed out", scratch[2], 1'b0);
+        rd(7'h20, b0); rd(7'h21, b1); rd(7'h22, b2); rd(7'h23, b3);
+        check("fast reply", {b3, b2, b1, b0}, 32'h5A5AC33C);
+        check("fast sync clocks", sent_bits - 2, 19);
+        check("fast sync word", (sent >> 2) & 96'h7FFFF, 32'h09FE1);
+
+        $display("fast mode: client_set(1)");
+        load_raw(frame_of(5'h1C, 6'd3, 64'd1, 3), 22);
+        wr(7'h06, 8'd0);
+
+        sent_bits = 0;
+        sent      = 96'd0;
+
+        fork
+            wr(7'h01, 8'h01);
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                send_ack;
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("fast acknowledge not timed out", scratch[2], 1'b0);
+        check("fast frame length", sent_bits - 2, 22);
+        check("fast client_set word", (sent >> 2) & 96'h3FFFFF, 32'h1B10F9);
+
+        /*
+         * Sampling trails DAP0 by two clocks, two bits here.  With LAG right
+         * the target still gets exactly each parcel's clocks, so one busy bit
+         * before the next start bit is enough.
+         */
+        $display("fast mode: block read, 3 parcels");
+        busy_bits = `FAST_BUSY;
+        wr(7'h01, 8'h08);
+        wr(7'h0A, 8'd2);
+        load_raw(frame_of(5'h0A, 6'd40, 64'h0C, 40), 59);
+
+        fork
+            wr(7'h01, 8'h02);
+            begin
+                for (p = 0; p < 3; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_parcel(32'h0BADF00D + 32'h01010101 * p, (p == 2));
+                    target_drive = 1'b0;
+                    @(posedge clk);
+                end
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("fast block not timed out", scratch[2], 1'b0);
+        check("fast block crc_ok", scratch[4], 1'b1);
+        ss = 1'b0; #HALF;
+        spi_byte(8'h40, scratch);
+        spi_byte(8'h00, scratch);              /* the dummy */
+        for (p = 0; p < 3; p = p + 1) begin
+            spi_byte(8'h00, b0);
+            spi_byte(8'h00, b1);
+            spi_byte(8'h00, b2);
+            spi_byte(8'h00, b3);
+            check("fast parcel", {b3, b2, b1, b0}, 32'h0BADF00D + 32'h01010101 * p);
+        end
+        #HALF; ss = 1'b1; #(HALF*4);
+        busy_bits = 1;
+
+        $display("fast mode: block write, 3 words");
+        wr(7'h01, 8'h20);
+        burst[0] = 8'h01; burst[1] = 8'h02; burst[2] = 8'h03; burst[3] = 8'h04;
+        burst[4] = 8'hA5; burst[5] = 8'h5A; burst[6] = 8'hFF; burst[7] = 8'h00;
+        burst[8] = 8'h0D; burst[9] = 8'hF0; burst[10] = 8'hAD; burst[11] = 8'h0B;
+        wr_burst(7'h48, 12);
+        load_raw(frame_of(5'h09, 6'd40, 64'h40000000, 40), 59);
+        wr(7'h06, 8'd0);
+        wr(7'h0A, 8'd2);
+        capture_parcels = 1'b1;
+        parcels_seen = 0;
+
+        fork
+            wr(7'h01, 8'h10);
+            begin
+                for (p = 0; p < 4; p = p + 1) begin
+                    wait (dut.u_rx.dat_oe == 1'b0);
+                    target_drive = 1'b1;
+                    send_ack;
+                    target_drive = 1'b0;
+                    wait (dut.u_rx.dat_oe == 1'b1);
+                end
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        capture_parcels = 1'b0;
+        check("fast: three parcels went out", parcels_seen, 32'd3);
+        check("fast parcel 0", parcel_seen[0], 32'h04030201);
+        check("fast parcel 1", parcel_seen[1], 32'h00FF5AA5);
+        check("fast parcel 2", parcel_seen[2], 32'h0BADF00D);
+        check("fast block write not timed out", {31'd0, scratch[2]}, 32'd0);
+
+        /* Wide and fast: two bits a clock, sync's line words as tb_dap_frame
+         * has them, interleaved into one raw frame.  Only the transmit side
+         * is checked; DAP2 floats here. */
+        $display("fast and wide: sync goes out as pairs");
+        wr(7'h0B, 8'h4C);                      /* FLAGS: fast, raw, wide */
+        load_raw(interleave(11'h179, 11'h371), 22);
+        wr(7'h06, 8'd0);
+
+        sent_bits = 0;
+        sent      = 96'd0;
+        sent2     = 96'd0;
+
+        fork
+            wr(7'h01, 8'h01);
+            begin
+                wait (dut.u_rx.dat_oe == 1'b0);
+                target_drive = 1'b1;
+                send_ack;
+                target_drive = 1'b0;
+            end
+        join
+
+        scratch = 8'h00;
+        while (!scratch[1]) rd(7'h00, scratch);
+        check("fast wide sync clocks", sent_bits - 2, 11);
+        check("fast wide sync dap1", (sent  >> 2) & 96'h7FF, 32'h179);
+        check("fast wide sync dap2", (sent2 >> 2) & 96'h7FF, 32'h371);
+
+        wr(7'h0B, 8'h00);
+        wr(7'h0F, 8'h00);
 
         $display("");
         if (errors == 0) $display("PASSED (0 failures)");

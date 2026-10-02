@@ -1,4 +1,5 @@
 #include "dap_phy_fpga.h"
+#include "dap_frame.h"
 #include "dap_lock.h"
 
 #include <inttypes.h>
@@ -54,7 +55,9 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define REG_LEAD        0x0C
 #define REG_LEVEL       0x0D    /* 12-bit, bytes waiting in the reply FIFO */
 #define LEVEL_HI_QUEUED  (1u << 4)  /* in LEVEL's high byte: a block start is held */
-#define REG_SKEW        0x0F    /* capture tap: [1:0] DAP1, [3:2] DAP2 */
+#define REG_SKEW        0x0F    /* capture tap: [1:0] DAP1, [3:2] DAP2;
+                                 * [5:4] falling-edge sample, [7:6] fast LAG */
+#define SKEW_TAPS        0x0Fu
 
 #define REG_DATA        0x10
 #define REG_REPLY       0x20
@@ -85,6 +88,7 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define FLAG_WIDE        (1u << 2)
 #define FLAG_RAW_FRAME   (1u << 3)
 #define FLAG_RX_WIDE     (1u << 5)
+#define FLAG_FAST        (1u << 6)
 
 /* Wide-mode start-bit alignment. */
 #define REG_LINES       0x27
@@ -250,10 +254,13 @@ static uint8_t  s_trail   = 1;
 static uint8_t  s_lead    = 2;
 static uint8_t  s_skew    = 0;
 static uint16_t s_maxwait = 256;
+/* Fast mode (FLAG_FAST per frame, added by load_frame_lead). */
+static bool     s_fast;
 
 static void shadows_reset(void)
 {
     s_flags = 0;
+    s_fast = false;
     s_trail = 1;
     s_lead = 2;
     s_skew = 0;
@@ -595,12 +602,88 @@ esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap)
     if (dap1_tap > 3 || dap2_tap > 3) {
         return ESP_ERR_INVALID_ARG;
     }
-    const uint8_t v = (uint8_t)((dap1_tap & 3u) | ((dap2_tap & 3u) << 2));
+    const uint8_t v = (uint8_t)((s_skew & ~SKEW_TAPS) |
+                                (dap1_tap & 3u) | ((dap2_tap & 3u) << 2));
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
     s_skew = v;
     return reg_write8(REG_SKEW, v);
+}
+
+esp_err_t dap_phy_fpga_set_fast(bool enable)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_fast = enable;
+    return ESP_OK;
+}
+
+bool dap_phy_fpga_is_fast(void)
+{
+    return s_fast;
+}
+
+esp_err_t dap_phy_fpga_set_fast_timing(uint8_t lag, bool edge1, bool edge2)
+{
+    if (lag > 3) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_skew = (uint8_t)((s_skew & SKEW_TAPS) | (edge1 ? 0x10u : 0u) |
+                       (edge2 ? 0x20u : 0u) | (uint8_t)(lag << 6));
+    return reg_write8(REG_SKEW, s_skew);
+}
+
+/*
+ * The whole frame as fast mode sends it (the fabric's raw-frame path; it does
+ * not assemble frames a bit per clock).  Narrow: start bit, CMD, LEN, DATA,
+ * CRC6, trailing zero.  Wide, as the fabric pairs it (even bits DAP1, odd
+ * DAP2): the start bit on both lines, CMD and an odd DATA each padded with a
+ * zero, the CRC over the padded fields, a trailing pair.  False when it does
+ * not fit the 63-bit DATA register.
+ */
+static bool raw_frame(uint8_t cmd, uint8_t len_field, uint64_t data, size_t data_bits,
+                      bool wide, uint64_t *word, uint8_t *bits)
+{
+    uint8_t payload[5 + 1 + 6 + 63 + 1];
+    size_t  n = 0;
+
+    if (data_bits > 63) {
+        return false;
+    }
+    for (size_t i = 0; i < 5; i++) {
+        payload[n++] = (uint8_t)((cmd >> i) & 1u);
+    }
+    if (wide) {
+        payload[n++] = 0;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        payload[n++] = (uint8_t)((len_field >> i) & 1u);
+    }
+    for (size_t i = 0; i < data_bits; i++) {
+        payload[n++] = (uint8_t)((data >> i) & 1u);
+    }
+    if (wide && (data_bits & 1u)) {
+        payload[n++] = 0;
+    }
+    const size_t edge  = wide ? 2 : 1;          /* start bit, trailing zero */
+    const size_t total = edge + n + 6 + edge;
+    if (total > 63) {
+        return false;
+    }
+    const uint8_t crc = dap_crc6(payload, n);
+    uint64_t w = wide ? 3u : 1u;
+    for (size_t i = 0; i < n; i++) {
+        w |= (uint64_t)payload[i] << (edge + i);
+    }
+    w |= (uint64_t)(crc & 0x3Fu) << (edge + n);
+    *word = w;
+    *bits = (uint8_t)total;
+    return true;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -656,6 +739,19 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
                                  uint8_t lead)
 {
     uint8_t b[REG_DATA + 8 - REG_CMD];
+    uint8_t flags = s_flags;
+
+    /* Fast mode sends the frame raw; one that does not fit goes at DIV. */
+    if (s_fast) {
+        uint64_t word = 0;
+        uint8_t  bits = 0;
+        if (raw_frame(cmd, len_field, data, data_bits, (s_flags & FLAG_WIDE) != 0u,
+                      &word, &bits)) {
+            data      = word;
+            data_bits = bits;
+            flags    |= FLAG_FAST | FLAG_RAW_FRAME;
+        }
+    }
 
     b[REG_CMD - REG_CMD]         = (uint8_t)(cmd & 0x1F);
     b[REG_LEN - REG_CMD]         = (uint8_t)(len_field & 0x3F);
@@ -665,7 +761,7 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
     b[REG_MAXWAIT - REG_CMD]     = (uint8_t)s_maxwait;
     b[REG_MAXWAIT + 1 - REG_CMD] = (uint8_t)(s_maxwait >> 8);
     b[REG_PARCELS - REG_CMD]     = parcels;
-    b[REG_FLAGS - REG_CMD]       = s_flags;
+    b[REG_FLAGS - REG_CMD]       = flags;
     b[REG_LEAD - REG_CMD]        = lead;
     b[REG_LEVEL - REG_CMD]       = 0;
     b[REG_LEVEL + 1 - REG_CMD]   = 0;

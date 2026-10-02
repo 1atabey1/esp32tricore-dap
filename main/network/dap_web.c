@@ -706,7 +706,8 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /api/dap_bench?addr=&n=&words=&div=&wide=&chain= - block-read benchmark. */
+/* GET /api/dap_bench?addr=&n=&words=&div=&wide=&chain=&trail=&vrep=&fast=&skew= -
+ * block-read benchmark; fast=1 measures at 48 MHz, skew= sets SKEW outright. */
 static esp_err_t dap_bench_handler(httpd_req_t *req)
 {
     if (check_auth(req) != ESP_OK) return ESP_OK;
@@ -714,6 +715,7 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
     char query[128] = "", val[16];
     uint32_t addr = 0x70000000u;
     int n = 64, words = 256, div = 0, wide = 0, chain = 1, trail = 1, vreps = 8;
+    int fast = 0, skew = -1;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "addr", val, sizeof(val)) == ESP_OK) addr = strtoul(val, NULL, 0);
         if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) n = atoi(val);
@@ -723,11 +725,14 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "chain", val, sizeof(val)) == ESP_OK) chain = atoi(val);
         if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) trail = atoi(val);
         if (httpd_query_key_value(query, "vrep", val, sizeof(val)) == ESP_OK) vreps = atoi(val);
+        if (httpd_query_key_value(query, "fast", val, sizeof(val)) == ESP_OK) fast = atoi(val);
+        if (httpd_query_key_value(query, "skew", val, sizeof(val)) == ESP_OK) skew = (int)strtol(val, NULL, 0);
     }
     char out[640];
     dap_capture_begin();
     const esp_err_t err = dap_fpga_bench(addr, n, (size_t)words, (uint8_t)div, wide != 0,
-                                         chain, trail, vreps, out, sizeof(out));
+                                         chain, trail, vreps, fast != 0, skew,
+                                         out, sizeof(out));
     ESP_LOGW(TAG, "%s", out);
     dap_capture_end(req, err == ESP_OK ? "\n=== bench done ===\n" : "\n=== bench had errors ===\n");
     return ESP_OK;

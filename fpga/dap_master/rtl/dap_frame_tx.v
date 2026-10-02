@@ -41,12 +41,24 @@ module dap_frame_tx #(
      * no assembly or CRC.
      */
     input  wire                  raw,
+    /*
+     * One bit every fabric clock, `div` ignored.  dap0 then means "a clock
+     * this cycle": the pad raises DAP0 for the second half of the cycle, with
+     * DAP1 changing at the cycle start.  Raw frames only: the CRC is taken
+     * half a period before the bit's field ends, and there is no half period
+     * here (keeping it out of the field logic is timing).  Latched at start.
+     */
+    input  wire                  fast,
 
     output reg                   busy,
     output reg                   done,       /* one-cycle pulse at the end */
 
     /* To the pads.  dat_oe low hands the line to the target. */
     output reg                   dap0,
+    /* What dap0 holds next cycle, and the same for normal mode only (a few
+     * registers deep), for the pad's two output registers. */
+    output reg                   dap0_d,
+    output reg                   dap0_next,
     output reg                   dap1,
     output reg                   dat_oe,
     /* DAP2 carries the odd bits, driven only in wide mode. */
@@ -80,10 +92,33 @@ module dap_frame_tx #(
     reg [62:0] data_r;
     reg        wide_r;
     reg        raw_r;
+    reg        fast_r;
+    /* A half period of one clock; always so in fast mode. */
+    wire       div_zero = fast_r | (div == {DIV_WIDTH{1'b0}});
 
     /* Field lengths in clock periods: wide mode halves them (CMD plus pad is 3). */
     wire [5:0] cmd_last = wide_r ? 6'd2 : 6'd4;
     wire [5:0] f6_last  = wide_r ? 6'd2 : 6'd5;   /* LEN and CRC, both six */
+
+    /*
+     * at_last: index is the current field's last position, registered so
+     * no field-end compare sits on the advance paths (timing).  It is
+     * computed at each advance from the field the index stays in, or, at a
+     * field boundary, from the field that follows.  nb_zero: a one-clock
+     * payload, for a field that starts already at its end.
+     */
+    reg        at_last;
+    reg        nb_zero;
+    reg  [5:0] last_cur;
+    always @(*) begin
+        case (state)
+            S_LEAD:         last_cur = lead_last;
+            S_CMD:          last_cur = cmd_last;
+            S_LEN, S_CRC:   last_cur = f6_last;
+            default:        last_cur = nbits_last;  /* S_DATA, S_RAW */
+        endcase
+    end
+    wire [5:0] nbits_last_in = wide ? ((data_bits - 1'b1) >> 1) : (data_bits - 1'b1);
     /* The finished CRC, latched when the payload runs out and then shifted out
      * like every other field. */
     reg [5:0]  crc_sr;
@@ -146,9 +181,9 @@ module dap_frame_tx #(
         case (state)
             S_LEAD: begin
                 /* After the lead-in: the start bit, or bit 0/1 of a raw frame. */
-                next_bit  = (index == lead_last)
+                next_bit  = at_last
                           ? (raw_r ? data_r[0] : 1'b1) : 1'b0;
-                next_bit2 = (index == lead_last)
+                next_bit2 = at_last
                           ? (raw_r ? data_r[1] : 1'b1) : 1'b0;
             end
             S_START: begin
@@ -156,29 +191,29 @@ module dap_frame_tx #(
                 next_bit2 = cmd_r[1];
             end
             S_CMD: begin
-                next_bit  = (index == cmd_last) ? len_r[0] : cmd_n0;
-                next_bit2 = (index == cmd_last) ? len_r[1] : cmd_n1;
+                next_bit  = at_last ? len_r[0] : cmd_n0;
+                next_bit2 = at_last ? len_r[1] : cmd_n1;
             end
             S_LEN: begin
-                next_bit  = (index == f6_last)
+                next_bit  = at_last
                           ? ((nbits_r == 6'd0) ? crc[0] : data_r[0])
                           : len_n0;
-                next_bit2 = (index == f6_last)
+                next_bit2 = at_last
                           ? ((nbits_r == 6'd0) ? crc[1] : data_r[1])
                           : len_n1;
             end
             S_DATA: begin
-                next_bit  = (index == nbits_last) ? crc[0] : data_n0;
-                next_bit2 = (index == nbits_last) ? crc[1] : data_n1;
+                next_bit  = at_last ? crc[0] : data_n0;
+                next_bit2 = at_last ? crc[1] : data_n1;
             end
             S_RAW: begin
                 /* The host supplied the trailing zero; then the idle line. */
-                next_bit  = (index == nbits_last) ? 1'b0 : data_n0;
-                next_bit2 = (index == nbits_last) ? 1'b0 : data_n1;
+                next_bit  = at_last ? 1'b0 : data_n0;
+                next_bit2 = at_last ? 1'b0 : data_n1;
             end
             S_CRC: begin
-                next_bit  = (index == f6_last) ? 1'b0 : crc_n0;
-                next_bit2 = (index == f6_last) ? 1'b0 : crc_n1;
+                next_bit  = at_last ? 1'b0 : crc_n0;
+                next_bit2 = at_last ? 1'b0 : crc_n1;
             end
             default: begin                 /* the trailing zero, then idle */
                 next_bit  = 1'b0;
@@ -199,15 +234,48 @@ module dap_frame_tx #(
         end
     end
 
+    /* The last bit of the frame is on the wire: the next advance ends it. */
+    wire ending = (state == S_TRAIL) || (state == S_RAW && at_last);
+
+    /*
+     * DAP0's next value.  Normal mode: low in the first half of the period,
+     * high in the second.  Fast mode: high for every cycle with a bit on the
+     * wire.
+     */
+    always @(*) begin
+        if (rst)
+            dap0_d = 1'b0;
+        else if (state == S_IDLE)
+            dap0_d = start & fast;
+        else if (!tick_done)
+            dap0_d = dap0;
+        else if (phase == 1'b0)
+            dap0_d = 1'b1;
+        else
+            dap0_d = fast_r & ~ending;
+    end
+
+    /* The same for normal mode only, for the pad's first-half register (fast
+     * mode holds that half low): a few registers deep (timing). */
+    always @(*) begin
+        if (rst || state == S_IDLE)
+            dap0_next = 1'b0;
+        else if (!tick_done)
+            dap0_next = dap0;
+        else
+            dap0_next = ~phase;
+    end
+
     always @(posedge clk) begin
         crc_rst <= 1'b0;
         done    <= 1'b0;
+        dap0    <= dap0_d;
 
         /* index is loaded at the start of every frame, so it is not reset. */
         if (rst) begin
             state   <= S_IDLE;
             busy    <= 1'b0;
-            dap0    <= 1'b0;
+            fast_r  <= 1'b0;
             dap1    <= 1'b1;      /* parked idle high, probe driving */
             dat_oe  <= 1'b1;
             dap2    <= 1'b1;
@@ -217,15 +285,15 @@ module dap_frame_tx #(
             tick_done <= (div == {DIV_WIDTH{1'b0}});
             phase     <= 1'b0;
         end else if (state == S_IDLE) begin
-            dap0 <= 1'b0;
             if (start) begin
                 cmd_r   <= cmd;
                 len_r   <= len;
                 nbits_r    <= data_bits;
                 /* One clock per pair in wide mode; an odd payload gets a
                  * zero pad bit from data_r. */
-                nbits_last <= wide ? ((data_bits - 1'b1) >> 1)
-                                   :  (data_bits - 1'b1);
+                nbits_last <= nbits_last_in;
+                /* One clock: nbits_last_in == 0, without its subtract. */
+                nb_zero    <= (data_bits == 6'd1) || (wide && data_bits == 6'd2);
                 lead_r     <= lead;
                 lead_last  <= lead - 1'b1;
                 data_r  <= data;
@@ -234,42 +302,56 @@ module dap_frame_tx #(
                 dat_oe  <= 1'b1;
                 wide_r  <= wide;
                 raw_r   <= raw;
+                fast_r  <= fast;
                 dat2_oe <= wide;
                 /* Zero lead clocks means straight into the frame. */
                 state   <= (lead == 6'd0) ? (raw ? S_RAW : S_START) : S_LEAD;
+                at_last  <= (lead != 6'd0) ? (lead == 6'd1)
+                          : (raw && ((data_bits == 6'd1) || (wide && data_bits == 6'd2)));
                 /* The first bit has to be on the wire before the first rising
                  * edge, which is a whole low phase away. */
                 dap1    <= (lead == 6'd0) ? (raw ? data[0] : 1'b1) : 1'b0;
                 dap2    <= (lead == 6'd0) ? (raw ? data[1] : 1'b1) : 1'b0;
                 index     <= 6'd0;
                 tick      <= {DIV_WIDTH{1'b0}};
-                tick_done <= (div == {DIV_WIDTH{1'b0}});
-                phase     <= 1'b0;
+                tick_done <= fast | (div == {DIV_WIDTH{1'b0}});
+                /* Fast mode stays in the second half: an advance each clock,
+                 * without fast_r on the enables (timing). */
+                phase     <= fast;
             end
         end else begin
             /* One bit per period: present it with dap0 low, then raise dap0;
-             * DAP1 changes only at the falling edge. */
+             * DAP1 changes only at the falling edge.  Fast mode skips the
+             * first half: a bit per clock, the pad making the edges. */
             if (!tick_done) begin
                 tick      <= tick + 1'b1;
                 tick_done <= (tick + 1'b1 == div);
             end else begin
                 tick      <= {DIV_WIDTH{1'b0}};
-                tick_done <= (div == {DIV_WIDTH{1'b0}});
+                tick_done <= div_zero;
 
                 if (phase == 1'b0) begin
-                    dap0  <= 1'b1;
                     phase <= 1'b1;
                 end else begin
-                    dap0  <= 1'b0;
-                    phase <= 1'b0;
+                    phase <= fast_r;
                     dap1  <= next_bit;   /* changes with the falling edge */
                     dap2  <= next_bit2;
 
                     /* Advance to the next bit, and the next field when this
                      * one runs out. */
+                    if (at_last || state == S_START) begin
+                        case (state)
+                            S_LEAD:  at_last <= raw_r && nb_zero;
+                            S_LEN:   at_last <= (nbits_r != 6'd0) && nb_zero;
+                            default: at_last <= 1'b0;
+                        endcase
+                    end else begin
+                        at_last <= (index + 1'b1 == last_cur);
+                    end
+
                     case (state)
                         S_LEAD: begin
-                            if (index == lead_last) begin
+                            if (at_last) begin
                                 state <= raw_r ? S_RAW : S_START;
                                 index <= 6'd0;
                             end else begin
@@ -283,7 +365,7 @@ module dap_frame_tx #(
                         S_CMD: begin
                             cmd_r <= wide_r ? {2'b0, cmd_r[4:2]}
                                             : {1'b0, cmd_r[4:1]};
-                            if (index == cmd_last) begin
+                            if (at_last) begin
                                 state <= S_LEN;
                                 index <= 6'd0;
                             end else begin
@@ -293,7 +375,7 @@ module dap_frame_tx #(
                         S_LEN: begin
                             len_r <= wide_r ? {2'b0, len_r[5:2]}
                                             : {1'b0, len_r[5:1]};
-                            if (index == f6_last) begin
+                            if (at_last) begin
                                 /* No data (sync): straight to the CRC.  The
                                  * generator took this bit on phase 0, so
                                  * `crc` is final. */
@@ -307,7 +389,7 @@ module dap_frame_tx #(
                         S_DATA: begin
                             data_r <= wide_r ? {2'b0, data_r[62:2]}
                                              : {1'b0, data_r[62:1]};
-                            if (index == nbits_last) begin
+                            if (at_last) begin
                                 state  <= S_CRC;
                                 crc_sr <= crc;
                                 index  <= 6'd0;
@@ -318,7 +400,7 @@ module dap_frame_tx #(
                         S_CRC: begin
                             crc_sr <= wide_r ? {2'b0, crc_sr[5:2]}
                                              : {1'b0, crc_sr[5:1]};
-                            if (index == f6_last) begin
+                            if (at_last) begin
                                 state <= S_TRAIL;
                                 index <= 6'd0;
                             end else begin
@@ -328,7 +410,7 @@ module dap_frame_tx #(
                         S_RAW: begin
                             data_r <= wide_r ? {2'b0, data_r[62:2]}
                                              : {1'b0, data_r[62:1]};
-                            if (index == nbits_last) begin
+                            if (at_last) begin
                                 state <= S_IDLE;
                                 busy  <= 1'b0;
                                 done  <= 1'b1;

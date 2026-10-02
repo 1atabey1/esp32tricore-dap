@@ -39,7 +39,7 @@ module tb_dap_frame;
         .clk (clk), .rst (rst),
         .div (8'd1),               /* fast, so the test runs in little time */
         .start (start), .cmd (cmd), .len (len), .data_bits (dbits), .data (data),
-        .lead (6'd2), .wide (wide), .raw (raw),
+        .lead (6'd2), .wide (wide), .raw (raw), .fast (1'b0),
         .busy (busy), .done (done),
         .dap0 (dap0), .dap1 (dap1), .dat_oe (dat_oe),
         .dap2 (dap2), .dat2_oe (dat2_oe)

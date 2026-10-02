@@ -135,8 +135,14 @@ void dap_fpga_block_read_sweep(const char *label)
     dap_phy_fpga_set_div(1);
 }
 
+/*
+ * `fast`: the measured transfers run in fast mode (48 MHz), frames too long
+ * for it at `div`.  `skew` >= 0: the whole SKEW register (taps, edges, LAG)
+ * for the measured part, overriding wide-mode calibration.
+ */
 esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
-                         int chain, int trail, int vreps, char *out, size_t outlen)
+                         int chain, int trail, int vreps, bool fast, int skew,
+                         char *out, size_t outlen)
 {
     dap_fpga_stats_t st;
     dap_block_req_t  reqs[16];
@@ -187,6 +193,12 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
         return err;
     }
     dap_phy_fpga_set_div(div);
+    if (skew >= 0) {
+        dap_phy_fpga_set_skew((uint8_t)(skew & 3), (uint8_t)((skew >> 2) & 3));
+        dap_phy_fpga_set_fast_timing((uint8_t)((skew >> 6) & 3), (skew & 0x10) != 0,
+                                     (skew & 0x20) != 0);
+    }
+    dap_phy_fpga_set_fast(fast);
 
     /* The same flash block read back at this clock, as chains. */
     int mismatch = 0;
@@ -299,6 +311,11 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
     int      sck_khz  = 0;
     dap_phy_fpga_link_timing(&ns_short, &ns_long, &sck_khz);
 
+    dap_phy_fpga_set_fast(false);
+    if (skew >= 0) {
+        dap_phy_fpga_set_fast_timing(0, false, false);
+        dap_phy_fpga_set_skew(0, 0);
+    }
     if (wide) {
         dap_wide_exit();
     }
@@ -308,16 +325,16 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
 
     const double kbps = us > 0 ? (double)ok * words * 4 * 1e6 / 1024.0 / (double)us : 0;
     snprintf(out, outlen,
-             "addr 0x%08" PRIX32 " div %u (%u kHz) %s: %d/%d blocks of %u words, "
-             "chains of %d\n"
+             "addr 0x%08" PRIX32 " div %u (%u kHz)%s %s skew 0x%02X: %d/%d blocks "
+             "of %u words, chains of %d\n"
              "  %.0f kB/s, %.1f us/block\n"
              "  per block: %.1f SPI xfers, %.0f bytes, %.1f us inside SPI (%.0f%%), %.1f polls\n"
              "  verify: %d of %d trace-RAM blocks differ from the pattern written; "
              "block write: %d of 128 words wrong (-1: failed)\n"
              "  read32: %lld us, read32_fast: %lld us, write32+read32 failures %d/16\n"
              "  link: SCK %d kHz, 7-byte read %.2f us, 1 KB read %.1f us (%.0f kB/s)\n",
-             addr, div, (unsigned)(48000u / (2u * (div + 1u))), wide ? "wide" : "narrow",
-             ok, n, (unsigned)words, chain, kbps, (double)us / n,
+             addr, div, (unsigned)(48000u / (2u * (div + 1u))), fast ? " FAST 48 MHz" : "",
+             wide ? "wide" : "narrow", (unsigned)(skew < 0 ? 0 : skew), ok, n, (unsigned)words, chain, kbps, (double)us / n,
              (double)st.xfers / n, (double)st.xfer_bytes / n, (double)st.xfer_us / n,
              us ? 100.0 * st.xfer_us / (double)us : 0.0, (double)st.polls / n,
              mismatch, vreps * chain, bw_bad,
