@@ -20,6 +20,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "tricore_flash.h"
+#include "dap_phy_fpga.h"
+#include "trace_ws.h"
 
 static const char *TAG = "MCDS_WEB";
 
@@ -82,6 +84,7 @@ static esp_err_t config_from_json(const char *text, dap_mcds_config_t *cfg, char
     cfg->masters    = flag(root, "masters", false);
     cfg->dap_div    = (uint8_t)num(root, "dap_div", 0);
     cfg->wide       = flag(root, "wide", true);
+    cfg->fast       = flag(root, "fast", true);
 
     const cJSON *slots = cJSON_GetObjectItem(root, "slots");
     int enabled = 0;
@@ -140,6 +143,7 @@ static cJSON *config_to_json(const dap_mcds_config_t *cfg)
     cJSON_AddBoolToObject(root, "masters", cfg->masters);
     cJSON_AddNumberToObject(root, "dap_div", cfg->dap_div);
     cJSON_AddBoolToObject(root, "wide", cfg->wide);
+    cJSON_AddBoolToObject(root, "fast", cfg->fast);
     cJSON *slots = cJSON_AddArrayToObject(root, "slots");
     for (int j = 0; j < DAP_MCDS_SLOTS; j++) {
         const dap_mcds_slot_t *s = &cfg->slot[j];
@@ -218,6 +222,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "emu_hz", s_info.emu_hz);
     cJSON_AddNumberToObject(root, "tsu_start", s_info.tsu_start);
     cJSON_AddBoolToObject(root, "wide_active", s_info.wide);
+    cJSON_AddBoolToObject(root, "fast_active", s_info.fast);
     cJSON_AddNumberToObject(root, "format", 1);
 
     /* Initial memory of the watched ranges, hex, per slot. */
@@ -260,6 +265,27 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(stats, "queue_free", st.queue_free);
     cJSON_AddNumberToObject(stats, "queue_dropped", st.queue_dropped);
     cJSON_AddNumberToObject(stats, "poll_us_max", st.poll_us_max);
+    /* The drain's speed (read_paragraphs over read_us), and the ring's size
+     * for its fill; dual: the FIFO drain runs over two SPI lines. */
+    cJSON_AddNumberToObject(stats, "read_us", st.read_us);
+    cJSON_AddNumberToObject(stats, "read_paragraphs", st.read_paragraphs);
+    cJSON_AddNumberToObject(stats, "passes", st.passes);
+    cJSON_AddNumberToObject(stats, "queue_size", st.queue_size);
+    cJSON_AddBoolToObject(stats, "dual", dap_phy_fpga_dual_ok());
+
+    /* The /ws/trace sender: what reached the wire, and LZ4's part in it. */
+    trace_ws_stats_t ws;
+    trace_ws_get_stats(&ws);
+    cJSON *wso = cJSON_AddObjectToObject(stats, "ws");
+    cJSON_AddBoolToObject(wso, "streaming", ws.streaming);
+    cJSON_AddBoolToObject(wso, "framed", ws.framed);
+    cJSON_AddNumberToObject(wso, "frames", ws.frames);
+    cJSON_AddNumberToObject(wso, "packed", ws.packed);
+    cJSON_AddNumberToObject(wso, "raw_bytes", (double)ws.raw_bytes);
+    cJSON_AddNumberToObject(wso, "wire_bytes", (double)ws.wire_bytes);
+    cJSON_AddNumberToObject(wso, "comp_kbps", ws.comp_kbps);
+    cJSON_AddNumberToObject(wso, "comp_pct", ws.comp_pct);
+    cJSON_AddNumberToObject(wso, "wire_kbps", ws.wire_kbps);
     return send_json(req, root);
 }
 
@@ -281,9 +307,9 @@ static esp_err_t start_handler(httpd_req_t *req)
     }
     const esp_err_t err = dap_mcds_start(&s_cfg, &s_info);
     char line[128];
-    snprintf(line, sizeof(line), "%s emu_hz=%lu wide=%d\n",
+    snprintf(line, sizeof(line), "%s emu_hz=%lu wide=%d fast=%d\n",
              err == ESP_OK ? "started" : esp_err_to_name(err), (unsigned long)s_info.emu_hz,
-             s_info.wide ? 1 : 0);
+             s_info.wide ? 1 : 0, s_info.fast ? 1 : 0);
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
     }

@@ -151,17 +151,55 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   full rate); keeps 3 paragraphs margin to the writer. Paragraphs are read as one chain of block
   reads, each followed by a one-word FIFONOW read (torn → dropped, flagged).
   1 MB PSRAM ring → `/ws/trace` (core 1, 16 kB frames). WiFi/lwIP pinned to core 1.
-- Sessions run the DAP wide at 24 MHz (`"wide"`/`"dap_div"` in the config; narrow if P21.7 is
-  driven). The start snapshot of the watched ranges is in `GET /api/mcds/config` (`"snapshot"`).
-- Measured: the drain sustains ~2.7 MB/s of trace data against a source writing 5-6 MB/s
-  (paragraph reads 318 µs/kB while tracing vs 257 µs/kB idle - the trace RAM itself is not the
-  limit, the DAP is). Lower offered rates are lossless.
+- Sessions run the DAP wide and fast by default (`"wide"`, `"fast"`, `"dap_div"` in the config):
+  wide calibrates its taps at `dap_div` (0, 24 MHz), then `dap_fast_enter` finds fast mode's
+  receive timing against the same reference block (known-good LAG/edge/tap settings first, three
+  clean reads to accept, the DAP checked at DIV after each miss) and falls back to DIV if none
+  carries data; narrow if P21.7 is driven. `fast_active`/`wide_active` in `GET /api/mcds/config`
+  say what the session got; the start log line also names the FIFO drain (one or two lines).
+  The start snapshot of the watched ranges is in `GET /api/mcds/config` (`"snapshot"`).
+- `/ws/trace?z=1` frames carry an 8-byte header (`DTRZ`, u32 raw length, top bit = stored) and
+  are LZ4-compressed where it pays: the sender measures the compressor's speed C and ratio r and
+  the wire rate L as it streams and compresses a frame only when n/C + n/(rL) < n/L (probing one
+  frame in 16 otherwise). On the probe's WiFi it does not pay: the compressor runs ~5-6 MB/s on
+  the S3 (after replacing memcpy loads, which made it ~3 MB/s), live traces compress 1.5-1.85x,
+  and the link takes ~3.5-4.4 MB/s, so break-even would need ~8-9 MB/s; on a weak link it
+  switches on by itself. `tools/mcds_trace` asks for the framing; the web pages take the raw
+  stream. The sender logs C, r, L and how many frames it compressed when it stops.
+- Measured (TC387, CPU2 watches on the mlpc PXROS application, 4.4-5.5 MB/s sources), against
+  the previous firmware on the same board: the drain reads 5.15-5.3 MB/s (186-190 µs per
+  paragraph), was 3.06 MB/s (319 µs; wide at 24 MHz, one-line FIFO reads). FIFONOW is read after
+  every fourth paragraph (`TRACE_NOW_EVERY`), not after each, and a block's frame and its start go
+  in one transfer (GO). What the session keeps is now set by WiFi: 2.1-2.8 MB/s of raw trace
+  delivered (it varies with the link), the 4 MB ring covering bursts at the drain's rate for 1-2 s;
+  a fuller ring drops whole paragraphs (`queue_dropped`). Note `paragraphs`+`lost` in the stats
+  understates the source: ring drops are counted in `queue_dropped` only.
 
 ## Fabric link (dap_phy_fpga.c, fpga/dap_master)
 
 - SPI at 40 MHz (GPIO matrix limit on these pins); register-level transfers: the 64-byte CPU
   buffer for short ones, GDMA (the driver's idle channels, LL calls from IRAM) above 96 bytes.
-  7-byte register read 5.4 µs, 1 kB FIFO read 214 µs (4.7 MB/s).
+  7-byte register read 5.4 µs, 1 kB FIFO read 214 µs (4.7 MB/s), single line.
+- The reply FIFO's read side runs on SCK (`reply_fifo.v`: block RAM with separate clocks, Gray
+  pointers), so a burst read costs no fabric clocks per byte. Before, each byte crossed to the
+  fabric and back (~8 fabric clocks against 7.5 SCK periods): SCK could not exceed ~0.9x the
+  fabric clock, and 40 MHz already failed at the industrial HFOSC corner in simulation.
+- `0x50` reads the FIFO over two lines (the S3's half-duplex dual read: header on MOSI, eight dummy
+  clocks to turn SI round, data on MOSI+MISO), opening with a prefix - the level when the header
+  ended and {busy, timed_out, overrun, queued} - then exactly that many bytes; clocking more reads
+  zeros and pops nothing. One transfer replaces the LEVEL read and the FIFO read, and the torn
+  LEVEL above cannot happen. At init `TESTPUSH` (0x51) proves 0x40 and 0x50 with no target, and
+  the S3's input timing for the two lines (din_mode/din_num, plus a ninth dummy clock) is swept
+  over a pattern and its complement; the middle of the longest passing run is used, the drain
+  stays on one line if none passes. In simulation: byte-exact at SCK 40/50/80 MHz against fabric
+  clocks 38.4-52.8 MHz; the SCK domain closes at 40 MHz on every seed (54.4 on the pinned one).
+  On the board the window is dummy 9 + din_mode 1/din_num 1 (four points pass). A ninth dummy
+  clock gives the fabric one clock more than the host samples, so a byte pops only after its last
+  clock (the next one prefetched): popping on the first lost a byte per read on hardware, and the
+  calibration now reads each pattern in two parts to catch exactly that.
+- Measured on the board, 1 kB blocks chained, data verified, previous firmware in brackets:
+  narrow 24 MHz 2.43 MB/s (2.37), wide 24 MHz 4.19 (3.89), fast narrow 4.28 (3.88), fast wide
+  6.28 MB/s (3.93). read32_fast 22 µs at 24 MHz (27), 32 µs fast (36).
 - Block reads chain: a CTRL start written while the sequencer is busy is queued (LEVEL high byte
   bit 4) and taken on idle, so blocks run back to back while the host drains. With the reply FIFO
   full the fabric pauses between parcels (DAP0 stopped, DAP1 released) instead of overrunning;
@@ -175,7 +213,7 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   data with div-5 taps). Block writes are refused in wide mode (parcels arrive corrupted).
 - 1 kB block reads: narrow 24 MHz 2.3 MB/s, wide 24 MHz 3.65-3.9 MB/s chained, data verified
   (`/api/dap_bench?div=0&wide=1&chain=16`).
-- Fast mode, experimental (`dap_phy_fpga_set_fast`, FLAGS bit 6): a 48 MHz DAP clock, one bit per
+- Fast mode (`dap_phy_fpga_set_fast`, FLAGS bit 6): a 48 MHz DAP clock, one bit per
   fabric clock. DAP0 comes from the pad's DDR register, high in the second half of each cycle;
   DAP1/DAP2 are sampled in the I/O cell, on either edge (SKEW bits 4/5). Only cycles where a DAP0
   clock lands are samples (SKEW [7:6] LAG + tap + 1 clocks after it), and DAP0 stops by budget so
@@ -188,12 +226,29 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
     passes up to LAG 3 rising edge. A failing setting can lose the DAP (re-attach).
   - Single-word reads are ~10 µs slower than at 24 MHz (read32_fast 36 vs 26 µs), not from
     MAXWAIT (doubled for fast frames); cause not found.
-  - The fabric does not close timing with it: 46.7 MHz on the best of 120 seeds, built with
-    `--timing-allow-fail`. Normal modes passed the bench and the GDB suite on that bitstream.
-  - What it cost to get there: an explicit `CLOCK_ENABLE(1'b1)` on the pads makes no difference;
-    the netlist outcome is chaotic (trivial changes move the seed distribution by 3 MHz); the
-    field-end compares, the fast/normal muxes on enables and the receiver's start-bit-to-DAP0
-    path were the real critical paths and are now registered.
+  - Timing closes at 53 MHz, the HFOSC's +10% corner (48 MHz +-10% commercial), not just the
+    nominal 48: 57.7 MHz on the pinned seed, which also covers the industrial +20% corner (57.6),
+    built without `--timing-allow-fail`. Seeds 1-48 span 46.9-57.7 (median 51.1, 12 pass 53).
+    Before: 46.7 MHz on the best of 120, median 44.5. The remaining critical paths are the
+    receiver's start-bit decisions and the transmitter's field ends.
+  - Every DAP output and output enable now leaves from a register in its I/O cell. Driven from
+    fabric, DAP1's enable reached its pad 13.9 ns after the clock (seed-dependent), later than
+    fast mode's DAP0 edge at half a cycle. The pins lag the engines by one clock, all alike;
+    the receiver takes its bit a clock later (and adds one to LAG internally), so the line is
+    sampled where it was relative to the pins and SKEW/LAG settings keep their meaning.
+  - What got the fabric there (iCE40 tiles share one clock enable per eight flops, and
+    routing was 60-75% of every critical path): payload/CRC capture as shift registers with a
+    fixed entry point instead of index-decoded writes (one enable per field, not per bit);
+    down-counters with constant compares for the half-period tick, both engines' field ends and
+    MAXWAIT; the fast-mode clock budget pipelined and its counter enable-free; one-hot receiver
+    state; register writes and the read mux taken through local address/data registers (the
+    read one rides a spare pipeline cycle, so no added latency); STATUS timed_out as a set/clear
+    register; the read mux as AND-OR over a registered one-hot select; per-reply parameters
+    loaded every idle clock instead of on start; a block read's word stored by a pusher beside
+    the sequencer (which also drops four dead clocks per parcel); DAP1's sample duplicated, one
+    register for the payload, one for the decisions. Each step was checked on 24-48 seeds; an
+    explicit `CLOCK_ENABLE(1'b1)` on the pads makes no difference, nor does yosys
+    `-dffe_min_ce_use`.
 
 ## Known limits
 

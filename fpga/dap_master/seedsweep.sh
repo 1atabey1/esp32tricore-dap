@@ -14,7 +14,8 @@ for s in "$@"; do
     # Two clock domains now, and nextpnr pads their names into columns, so the
     # pattern has to tolerate the whitespace it uses to line them up.
     f=$(nextpnr-ice40 --up5k --package sg48 --json "$json" \
-            --pcf dap_master.pcf --asc "/tmp/seed_$s.asc" --freq 48 --seed "$s" 2>&1 |
+            --pcf dap_master.pcf --asc "/tmp/seed_$s.asc" --freq 53 --seed "$s" \
+            --timing-allow-fail 2>&1 |
         grep -oE "Max frequency for clock +'clk': [0-9.]+ MHz" | tail -1)
     echo "seed $s: ${f:-did not report}"
 done

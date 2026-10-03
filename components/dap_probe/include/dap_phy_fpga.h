@@ -65,10 +65,18 @@ esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap);
  * Fast mode: a bit every fabric clock, a 48 MHz DAP clock, DIV ignored.  The
  * frames go out raw, built here; one too long for that (over 44 data bits
  * narrow, 40 wide) is sent at DIV instead, so keep DIV fast too.
- * Experimental: the fabric does not meet 48 MHz timing with it.
  */
 esp_err_t dap_phy_fpga_set_fast(bool enable);
 bool      dap_phy_fpga_is_fast(void);
+
+/*
+ * Dual-line reply FIFO reads (block-read drain over MOSI and MISO, the level
+ * in each read's prefix).  Turned on at init when the input-timing
+ * calibration finds a window; set_dual(true) re-runs it, (false) turns the
+ * drain back to one line.
+ */
+bool dap_phy_fpga_dual_ok(void);
+void dap_phy_fpga_set_dual(bool enable);
 
 /*
  * Fast-mode receive timing.  LAG (0..3): a DAP0 clock's bit is sampled LAG +

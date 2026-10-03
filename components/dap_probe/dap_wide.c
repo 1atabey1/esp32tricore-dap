@@ -26,6 +26,8 @@ static const char *TAG = "DAP_WIDE";
 #define REF_WORDS   64u
 
 static bool s_active;
+/* The taps wide mode calibrated at DIV, for when fast mode is left. */
+static uint8_t s_tap1, s_tap2;
 
 bool dap_wide_active(void)
 {
@@ -209,6 +211,8 @@ static esp_err_t enter_locked(uint8_t div)
         return ESP_FAIL;
     }
     dap_phy_fpga_set_skew(tap1, tap2);
+    s_tap1 = tap1;
+    s_tap2 = tap2;
     s_active = true;
     ESP_LOGI(TAG, "wide mode on at div %u, taps DAP1 %u DAP2 %u", (unsigned)div, tap1, tap2);
     return ESP_OK;
@@ -230,6 +234,101 @@ void dap_wide_exit(void)
         dap_phy_fpga_set_skew(0, 0);
         s_active = false;
         ESP_LOGI(TAG, "back to narrow mode");
+    }
+    dap_unlock();
+}
+
+/*
+ * Fast-mode receive timing, tried in order: {LAG, edges (bit 0 DAP1, bit 1
+ * DAP2 falling), DAP1 tap, DAP2 tap}.  First the settings measured on the
+ * TC387 bench (LAG 0-1 any edge or LAG 2 rising, narrow; up to LAG 3 rising,
+ * wide), then their neighbours.
+ */
+static const uint8_t k_fast_narrow[][4] = {
+    {1, 0, 0, 0}, {0, 0, 0, 0}, {1, 1, 0, 0}, {0, 1, 0, 0}, {2, 0, 0, 0},
+    {1, 0, 1, 0},
+};
+static const uint8_t k_fast_wide[][4] = {
+    {1, 0, 0, 0}, {2, 0, 0, 0}, {0, 0, 0, 0}, {3, 0, 0, 0}, {1, 3, 0, 0},
+    {1, 0, 1, 1}, {2, 0, 1, 1}, {1, 0, 0, 1}, {1, 0, 1, 0},
+};
+static bool s_fast;
+
+/* Back to DIV and its taps (wide's calibrated pair, or none). */
+static void timing_at_div(void)
+{
+    dap_phy_fpga_set_fast(false);
+    dap_phy_fpga_set_fast_timing(0, false, false);
+    dap_phy_fpga_set_skew(s_active ? s_tap1 : 0, s_active ? s_tap2 : 0);
+}
+
+/* Still talking to the DAP at all, back at DIV? */
+static bool dap_alive(void)
+{
+    uint32_t w = 0;
+    timing_at_div();
+    dap_probe_clear_error_state();
+    return dap_probe_read32(REF_ADDR, &w) == ESP_OK && w == s_ref_block[0];
+}
+
+esp_err_t dap_fast_enter(void)
+{
+    dap_lock();
+    if (!dap_phy_fpga_in_use()) {
+        dap_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Wide mode wrote the reference already; narrow writes it here. */
+    if (!s_active && (dap_probe_enable_ocds() != ESP_OK || write_reference() != ESP_OK)) {
+        ESP_LOGE(TAG, "fast mode: the reference did not read back at DIV");
+        dap_unlock();
+        return ESP_FAIL;
+    }
+    const uint8_t (*tab)[4] = s_active ? k_fast_wide : k_fast_narrow;
+    const size_t  n = s_active ? sizeof(k_fast_wide) / sizeof(k_fast_wide[0])
+                               : sizeof(k_fast_narrow) / sizeof(k_fast_narrow[0]);
+
+    /* Failing reads are expected while searching; keep them out of the log. */
+    const esp_log_level_t was = esp_log_level_get("DAP");
+    esp_log_level_set("DAP", ESP_LOG_ERROR);
+    int found = -1;
+    for (size_t i = 0; i < n && found < 0; i++) {
+        dap_phy_fpga_set_skew(tab[i][2], tab[i][3]);
+        dap_phy_fpga_set_fast_timing(tab[i][0], (tab[i][1] & 1u) != 0, (tab[i][1] & 2u) != 0);
+        dap_phy_fpga_set_fast(true);
+        if (taps_carry_data() && taps_carry_data() && taps_carry_data()) {
+            found = (int)i;
+            break;
+        }
+        ESP_LOGI(TAG, "  fast LAG %u edges %u taps %u/%u: no", tab[i][0], tab[i][1],
+                 tab[i][2], tab[i][3]);
+        if (!dap_alive()) {
+            esp_log_level_set("DAP", was);
+            ESP_LOGE(TAG, "fast mode: the DAP stopped answering at DIV; giving up");
+            dap_unlock();
+            return ESP_FAIL;
+        }
+    }
+    esp_log_level_set("DAP", was);
+    if (found < 0) {
+        timing_at_div();
+        ESP_LOGW(TAG, "fast mode: no receive timing carried data; staying at DIV");
+        dap_unlock();
+        return ESP_FAIL;
+    }
+    s_fast = true;
+    ESP_LOGI(TAG, "fast mode on (%s): LAG %u edges %u taps %u/%u", s_active ? "wide" : "narrow",
+             tab[found][0], tab[found][1], tab[found][2], tab[found][3]);
+    dap_unlock();
+    return ESP_OK;
+}
+
+void dap_fast_exit(void)
+{
+    dap_lock();
+    if (s_fast) {
+        timing_at_div();
+        s_fast = false;
     }
     dap_unlock();
 }

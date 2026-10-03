@@ -12,6 +12,7 @@ import urllib.request
 import websocket
 
 from .capfile import write_header
+from .zframe import QUERY, unframe
 
 
 def _get(host: str, path: str, auth: str, timeout: float = 30) -> str:
@@ -53,7 +54,8 @@ def capture(host: str, out_path: str, auth: str = 'admin:admin',
         _get(host, '/api/mcds/start', auth)
     config = trace_config(host, auth)
     hdr = {'Authorization': 'Basic ' + base64.b64encode(auth.encode()).decode()}
-    ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=1)
+    ws = websocket.create_connection('ws://%s/ws/trace%s' % (host, QUERY), header=hdr,
+                                     timeout=1)
 
     stop = {'flag': False}
     old = signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
@@ -77,6 +79,7 @@ def capture(host: str, out_path: str, auth: str = 'admin:admin',
                 return
             if isinstance(frame, str):
                 continue
+            frame = unframe(frame)
             f.write(frame)
             count['bytes'] += len(frame)
             count['frames'] += 1

@@ -110,6 +110,23 @@ def hexaddr(a: int) -> str:
     return '0x%08X' % a
 
 
+def link_text(cfg: dict) -> str:
+    """What the probe's session got: DAP width and clock, and the FIFO drain."""
+    st = cfg.get('stats') or {}
+    clock = 'fast 48 MHz' if cfg.get('fast_active') else dict(DIVS).get(cfg.get('dap_div', 0), 'DIV')
+    return '%s, %s, %s drain' % ('wide' if cfg.get('wide_active') else 'narrow', clock,
+                                  'two-line' if st.get('dual') else 'one-line')
+
+
+def probe_rates(p: dict) -> tuple[float, float, int]:
+    """(drain read rate in B/s, probe buffer fill 0..1, bytes the buffer dropped)."""
+    read_us, read_par = int(p.get('read_us', 0)), int(p.get('read_paragraphs', 0))
+    rate = read_par * 1024 / (read_us / 1e6) if read_us else 0.0
+    size = int(p.get('queue_size', 0))
+    fill = (size - int(p.get('queue_free', size))) / size if size else 0.0
+    return rate, max(0.0, min(1.0, fill)), int(p.get('queue_dropped', 0))
+
+
 def parse_int(text: str, default: int | None = None) -> int | None:
     try:
         return int(str(text).strip(), 0)
@@ -1351,6 +1368,10 @@ class App:
                                 self._cap_changed, width=130)
         self.cap_wide = ft.Switch(label='Wide mode (DAP2)', value=c.wide,
                                   on_change=self.guard(self._cap_changed))
+        self.cap_fast = ft.Switch(label='Fast (48 MHz)', value=c.fast,
+                                  tooltip='A DAP bit every fabric clock; the probe calibrates it '
+                                          'at start and falls back to the clock beside it',
+                                  on_change=self.guard(self._cap_changed))
         self.cap_masters = ft.Checkbox(label='Keep bus master in addresses', value=c.masters,
                                        on_change=self.guard(self._cap_changed))
         self.cap_dir = ft.TextField(label='Capture folder', value=self.settings.capture_dir,
@@ -1384,7 +1405,7 @@ class App:
                 self.plan_view,
                 self.warn_view,
                 section('Link'),
-                ft.Row([self.cap_div, self.cap_wide]),
+                ft.Row([self.cap_div, self.cap_wide, self.cap_fast]),
                 section('Recording'),
                 ft.Row([self.cap_dir,
                         ft.IconButton(ft.Icons.FOLDER_OUTLINED, tooltip='Choose the folder',
@@ -1406,7 +1427,10 @@ class App:
         c.timestamps = self.cap_ts.value or 'hit'
         c.dap_div = parse_int(self.cap_div.value, 0)
         c.wide = bool(self.cap_wide.value)
+        c.fast = bool(self.cap_fast.value)
         c.masters = bool(self.cap_masters.value)
+        # With fast mode the divider only clocks frames too long for it.
+        self.cap_div.label = 'Fallback clock' if c.fast else 'DAP clock'
         try:
             c.duration = max(0.0, float(self.cap_duration.value or 0))
         except ValueError:
@@ -1930,6 +1954,7 @@ class App:
         self.cap_source.value, self.cap_cpu.value, self.cap_mode.value = c.source, str(c.cpu), c.mode
         self.cap_access.value, self.cap_payload.value, self.cap_ts.value = c.access, c.payload, c.timestamps
         self.cap_div.value, self.cap_wide.value, self.cap_masters.value = str(c.dap_div), c.wide, c.masters
+        self.cap_fast.value = c.fast
         self.cap_duration.value = '%g' % c.duration
 
     async def _pick_dir(self, e=None) -> None:
@@ -2341,8 +2366,7 @@ class App:
         self.follow_sw.value = True
         self._update_start_buttons()
         self.rebuild_plots()
-        wide = sess.config.get('wide_active')
-        self.toast('Tracing%s - recording to %s' % ('' if wide else ' (narrow DAP)', path))
+        self.toast('Tracing (%s) - recording to %s' % (link_text(sess.config), path))
 
     async def stop_trace(self) -> None:
         sess = self.session
@@ -2384,7 +2408,8 @@ class App:
             b.style = ft.ButtonStyle(bgcolor=ft.Colors.ERROR if live else None,
                                      color=ft.Colors.ON_ERROR if live else None)
         for ctl in (self.cap_source, self.cap_cpu, self.cap_mode, self.cap_access,
-                    self.cap_payload, self.cap_ts, self.cap_div, self.cap_wide, self.cap_masters):
+                    self.cap_payload, self.cap_ts, self.cap_div, self.cap_wide, self.cap_fast,
+                    self.cap_masters):
             ctl.disabled = live or busy
         if not (live or busy):
             self._cap_changed(None)
@@ -2596,9 +2621,12 @@ class App:
             st = sess.stats
             p = st.probe or {}
             lost = int(p.get('lost', 0))
-            self.status_left.value = 'LIVE  %s/s  %s recorded  lost %d  %s' % (
-                fmt_bytes(st.rate), fmt_bytes(st.bytes), lost,
-                ('decoder behind by %s' % fmt_bytes(st.backlog)) if st.backlog > 2 << 20 else '')
+            _, fill, dropped = probe_rates(p)
+            self.status_left.value = 'LIVE  %s/s  %s recorded  lost %d  probe buffer %d%%%s%s' % (
+                fmt_bytes(st.rate), fmt_bytes(st.bytes), lost, round(100 * fill),
+                # The drain outruns WiFi now: the probe's buffer is what gives.
+                ('  WiFi-limited: %s dropped' % fmt_bytes(dropped)) if dropped else '',
+                ('  decoder behind by %s' % fmt_bytes(st.backlog)) if st.backlog > 2 << 20 else '')
             if sess.error:
                 self.status_left.value += '  ERROR: %s' % sess.error
         elif sess is not None:
@@ -2622,9 +2650,24 @@ class App:
             self.status_right.value = ''
         if isinstance(sess, LiveSession):
             p = sess.stats.probe or {}
+            drain, fill, dropped = probe_rates(p)
+            ws = p.get('ws') or {}
+            if not ws.get('framed'):
+                wifi = 'raw stream'
+            else:
+                wifi = 'LZ4 on %d of %d frames (%d%% size; compressor %s/s)' % (
+                    ws.get('packed', 0), ws.get('frames', 0), ws.get('comp_pct', 0),
+                    fmt_bytes(1000 * ws.get('comp_kbps', 0)))
             self.stats_view.value = (
+                'link       %s\n'
+                'probe      drain %s/s, buffer %d%% of %s, dropped %s\n'
+                'wifi       %s/s on the wire, %s\n'
                 'received   %s (%s/s)\nparagraphs %s  lost %s  laps %s\n'
                 'decoded    %d records, backlog %s' % (
+                    link_text(sess.config),
+                    fmt_bytes(drain), round(100 * fill), fmt_bytes(int(p.get('queue_size', 0))),
+                    fmt_bytes(dropped),
+                    fmt_bytes(1000 * ws.get('wire_kbps', 0)), wifi,
                     fmt_bytes(sess.stats.bytes), fmt_bytes(sess.stats.rate),
                     p.get('paragraphs', '-'), p.get('lost', '-'), p.get('laps', '-'),
                     sess.stats.records, fmt_bytes(max(0, sess.stats.backlog))))

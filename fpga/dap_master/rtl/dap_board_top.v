@@ -15,7 +15,7 @@ module dap_board_top (
 
     /* ESP32, on the FPGA configuration SPI reused as user IO. */
     input  wire spi_sck,
-    input  wire spi_si,
+    inout  wire spi_si,    /* turns round for dual-line FIFO reads */
     output wire spi_so,
     input  wire spi_ss
 );
@@ -46,7 +46,7 @@ module dap_board_top (
     end
 
     dap_top #(
-        .FIFO_DEPTH (1024)          /* exactly one maximum block read */
+        .FIFO_AW (10)               /* 1 kB: exactly one maximum block read */
     ) u_dap (
         .clk     (clk),
         .rst     (rst),

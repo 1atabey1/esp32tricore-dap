@@ -33,11 +33,19 @@
  *                     [7:6] fast mode LAG: a DAP0 clock's bit is sampled
  *                     LAG + DAP1 tap + 1 fabric clocks after it
  *   0x10 DATA     rw  64-bit frame payload, low byte first
+ *   0x18 GO       wo  CTRL again, after DATA: the frame registers and their
+ *                     start in one auto-incrementing burst.  Its clear bit
+ *                     is safe there for the same reason as CTRL's: it is the
+ *                     last byte of the transfer.
  *   0x20 REPLY    ro  32 bits of the last reply, low byte first
  *   0x24 RCRC     ro  the six CRC bits that followed
  *   0x25 WAIT     ro  16-bit busy cycle count, low byte first
  *   0x27 ALIGN    ro  0 DAP2 carried the start bit too (wide mode alignment)
  *   0x40 FIFO     ro  pops one byte; does not auto-increment
+ *   0x50 FIFO2    ro  the reply FIFO over two lines, with a level prefix
+ *                     (spi_slave.v); does not auto-increment
+ *   0x51 TESTPUSH wo  pushes one byte into the reply FIFO (sequencer idle),
+ *                     for the host's self-test of 0x40/0x50
  *   0x43 WLEVEL   ro  16-bit bytes waiting in the write FIFO, low byte first
  *   0x48 WFIFO    wo  pushes one byte; does not auto-increment
  */
@@ -45,7 +53,8 @@
 `default_nettype none
 
 module dap_top #(
-    parameter integer FIFO_DEPTH  = 1088,  /* 1 kB block plus headroom */
+    /* Reply FIFO: 2**FIFO_AW bytes, one maximum block read at 10. */
+    parameter integer FIFO_AW     = 10,
     /* Half a block: Q_WFETCH stalls on empty, so the host refills mid-block. */
     parameter integer WFIFO_DEPTH = 512
 ) (
@@ -54,7 +63,7 @@ module dap_top #(
 
     /* ESP32 link */
     input  wire spi_sck,
-    input  wire spi_si,
+    inout  wire spi_si,     /* the second data line for 0x50 reads */
     output wire spi_so,
     input  wire spi_ss,
 
@@ -99,9 +108,12 @@ module dap_top #(
     reg        r_edge2   = 1'b0;
     /* SKEW [7:6]: the pad-to-sample latency beyond the tap, fast mode only. */
     reg [1:0]  r_lag     = 2'd0;
-    /* The receiver's whole latency, registered off the register file. */
-    reg [2:0]  rx_lag    = 3'd0;
-    always @(posedge clk) rx_lag <= {1'b0, r_lag} + {1'b0, r_skew1};
+    /*
+     * The receiver's whole latency, registered off the register file; the
+     * + 1 is the output pad registers' clock.
+     */
+    reg [2:0]  rx_lag    = 3'd1;
+    always @(posedge clk) rx_lag <= {1'b0, r_lag} + {1'b0, r_skew1} + 3'd1;
     /*
      * FLAGS bit 6: a bit every fabric clock.  The pad then makes DAP0 from
      * both clock edges: low for the first half of each cycle, high for the
@@ -125,7 +137,7 @@ module dap_top #(
 
     wire [6:0] reg_addr;
     wire [7:0] reg_wdata;
-    wire       reg_we, reg_re, reg_consume;
+    wire       reg_we, reg_re;
     reg        reg_re_d, reg_re_d2, reg_re_d3;
     reg  [7:0] reg_rdata;
     /* Read pipeline: per-group bytes, the control group split in two halves. */
@@ -136,31 +148,77 @@ module dap_top #(
     reg        q_port, q_port_d;
     reg        q_hi;
 
-    spi_slave u_spi (
+    /* The reply FIFO's read side, on SCK. */
+    wire [7:0]       fifo_head;
+    wire             fifo_rd_empty, fifo_pop, fifo_ahead;
+    wire [FIFO_AW:0] fifo_rd_level;
+
+    spi_slave #(.AW(FIFO_AW)) u_spi (
         .clk (clk), .rst (rst),
         .spi_sck (spi_sck), .spi_si (spi_si), .spi_so (spi_so), .spi_ss (spi_ss),
         .reg_addr (reg_addr), .reg_wdata (reg_wdata),
-        .reg_we (reg_we), .reg_re (reg_re), .reg_consume (reg_consume),
+        .reg_we (reg_we), .reg_re (reg_re),
         .reg_rdata (reg_rdata),
+        .fifo_head (fifo_head), .fifo_empty (fifo_rd_empty),
+        .fifo_level (fifo_rd_level), .fifo_pop (fifo_pop), .fifo_ahead (fifo_ahead),
+        .status ({s_busy, s_timed_out, s_overrun, r_block_pend}),
         .selected ()
     );
+
+    /*
+     * Register writes, a clock after the SPI bus.  The bus comes from the
+     * SPI slave's corner of the die; registered here, every write decode
+     * starts from flops beside the registers it feeds (timing).  A clock
+     * is nothing next to a byte on the wire.
+     */
+    reg        wr_we = 1'b0;
+    reg  [6:0] wr_addr;
+    reg  [7:0] wr_data;
+    always @(posedge clk) begin
+        wr_we   <= reg_we && !rst;
+        wr_addr <= reg_addr;
+        wr_data <= reg_wdata;
+    end
+    /* CTRL, or GO (0x18): the same register at the end of the frame burst. */
+    wire ctrl_we = wr_we && (wr_addr == 7'h01 || wr_addr == 7'h18);
+
+    /*
+     * The read side's copy of the address, for the same reason.  It costs
+     * the read pipeline nothing: its second stage is ready a clock before
+     * reg_re_d3 takes it, and a FIFO pop's new head reaches the first
+     * stage on that same clock either way.
+     */
+    reg  [6:0] rd_addr;
+    always @(posedge clk) rd_addr <= reg_addr;
 
     /* ------------------------------------------------------------------ */
     /* Reply FIFO                                                          */
     /* ------------------------------------------------------------------ */
 
-    reg [7:0]  fifo_mem [0:FIFO_DEPTH-1];
-    reg [11:0] fifo_wr, fifo_rd;
-    reg [11:0] fifo_count;
-    /* Registered flags, updated alongside the counter. */
-    reg        fifo_empty = 1'b1;
-    reg        fifo_full  = 1'b0;
+    localparam integer FIFO_DEPTH = 1 << FIFO_AW;
+
+    /* The writer's view: conservative, a pop shows up a few clocks late. */
+    wire [FIFO_AW:0] fifo_cnt;
+    wire [11:0]      fifo_count = fifo_cnt;
+    wire             fifo_empty, fifo_full;
     /* Space for a whole parcel with a cycle of slack (the sequencer's gate). */
-    reg        fifo_room  = 1'b1;
+    reg              fifo_room  = 1'b1;
 
     reg        fifo_push;
     reg [7:0]  fifo_din;
     reg        fifo_clear;
+
+    reply_fifo #(.AW(FIFO_AW)) u_fifo (
+        .clk (clk), .rst (rst), .clear (fifo_clear),
+        .push (fifo_push), .din (fifo_din),
+        .count (fifo_cnt), .empty (fifo_empty), .full (fifo_full),
+        .sck (spi_sck), .pop (fifo_pop), .ahead (fifo_ahead), .head (fifo_head),
+        .rd_empty (fifo_rd_empty), .rd_level (fifo_rd_level)
+    );
+
+    always @(posedge clk) begin
+        fifo_room <= (fifo_cnt < FIFO_DEPTH - 8);
+    end
 
     /* ------------------------------------------------------------------ */
     /* Write FIFO                                                          */
@@ -176,7 +234,7 @@ module dap_top #(
     reg        wfifo_clear;
     reg [7:0]  wfifo_head;
 
-    wire       wfifo_push = reg_we && (reg_addr == 7'h48) && !wfifo_full;
+    wire       wfifo_push = wr_we && (wr_addr == 7'h48) && !wfifo_full;
 
     /*
      * Pop combinationally from the state.  wfifo_head trails wfifo_rd by one
@@ -197,7 +255,7 @@ module dap_top #(
         end else begin
             case ({wfifo_push, wfifo_pop})
                 2'b10: begin
-                    wfifo_mem[wfifo_wr] <= reg_wdata;
+                    wfifo_mem[wfifo_wr] <= wr_data;
                     wfifo_wr    <= (wfifo_wr == WFIFO_DEPTH - 1) ? 12'd0
                                                                  : wfifo_wr + 1'b1;
                     wfifo_count <= wfifo_count + 1'b1;
@@ -212,69 +270,11 @@ module dap_top #(
                     wfifo_full  <= 1'b0;
                 end
                 2'b11: begin
-                    wfifo_mem[wfifo_wr] <= reg_wdata;
+                    wfifo_mem[wfifo_wr] <= wr_data;
                     wfifo_wr    <= (wfifo_wr == WFIFO_DEPTH - 1) ? 12'd0
                                                                  : wfifo_wr + 1'b1;
                     wfifo_rd    <= (wfifo_rd == WFIFO_DEPTH - 1) ? 12'd0
                                                                  : wfifo_rd + 1'b1;
-                end
-                default: ;
-            endcase
-        end
-    end
-
-    /*
-     * Reply FIFO pops as the byte is shifted out.  The port test is registered;
-     * 0x40 does not auto-increment, so a cycle-old answer is the same answer.
-     */
-    reg        at_port;
-    always @(posedge clk) begin
-        at_port <= (reg_addr == 7'h40);
-    end
-
-    wire       fifo_pop = reg_consume && at_port;
-
-    /*
-     * The byte at the read pointer, re-read every cycle so a push into an empty
-     * FIFO is seen.  fifo_rd_p1 keeps the increment out of the read address path.
-     */
-    reg  [11:0] fifo_rd_p1;
-    wire [11:0] fifo_rd_next = (fifo_pop && !fifo_empty) ? fifo_rd_p1 : fifo_rd;
-    reg  [7:0]  fifo_head;
-
-    always @(posedge clk) begin
-        fifo_head <= fifo_mem[fifo_rd_next];
-    end
-
-    always @(posedge clk) begin
-        fifo_room <= (fifo_count < FIFO_DEPTH - 8);
-        if (rst || fifo_clear) begin
-            fifo_wr    <= 12'd0;
-            fifo_rd    <= 12'd0;
-            fifo_rd_p1 <= 12'd1;
-            fifo_count <= 12'd0;
-            fifo_empty <= 1'b1;
-            fifo_full  <= 1'b0;
-        end else begin
-            if (fifo_push && !fifo_full) begin
-                fifo_mem[fifo_wr] <= fifo_din;
-                fifo_wr <= (fifo_wr == FIFO_DEPTH-1) ? 12'd0 : fifo_wr + 1'b1;
-            end
-            if (fifo_pop && !fifo_empty) begin
-                fifo_rd    <= fifo_rd_p1;
-                fifo_rd_p1 <= (fifo_rd_p1 == FIFO_DEPTH-1) ? 12'd0
-                                                           : fifo_rd_p1 + 1'b1;
-            end
-            case ({fifo_push && !fifo_full, fifo_pop && !fifo_empty})
-                2'b10: begin
-                    fifo_count <= fifo_count + 1'b1;
-                    fifo_empty <= 1'b0;
-                    fifo_full  <= (fifo_count + 1'b1 == FIFO_DEPTH[11:0]);
-                end
-                2'b01: begin
-                    fifo_count <= fifo_count - 1'b1;
-                    fifo_full  <= 1'b0;
-                    fifo_empty <= (fifo_count == 12'd1);
                 end
                 default: ;
             endcase
@@ -293,7 +293,6 @@ module dap_top #(
     wire [62:0] rx_payload;
     wire [5:0]  rx_crc;
     wire        rx_dap0, rx_oe;
-    wire        tx_dap0_next, rx_dap0_next, tx_dap0_d, rx_dap0_d;
 
     reg [6:0]   rx_bits;
     reg         rx_expect_crc;
@@ -313,16 +312,26 @@ module dap_top #(
     wire drive2 = tx_busy && tx_oe2;
 
     /*
-     * The pads.  DAP1 and DAP2 sample in the I/O cell on both clock edges;
-     * their outputs are unregistered, as plain fabric outputs were.  Every
-     * pad takes both clocks: DAP0 and DAP1 share an I/O tile, whose two
-     * cells must agree on them.  CLOCK_ENABLE is left open, as Lattice's
+     * The pads.  Every DAP output and output enable leaves from a register
+     * in its I/O cell, so DAP0, DAP1 and DAP2 share one clock-to-pad delay
+     * and their skew is the bank's (0.5 ns), not the placer's.  (Driven
+     * from fabric, DAP1's enable reached its pad 13.9 ns after the clock,
+     * later than fast mode's DAP0 edge at half a cycle, and moved with
+     * every seed.)  The pins therefore lag the engines by one clock, all
+     * of them alike; the receiver takes its bit a clock later to match
+     * (sample_late, and LAG + 1 in fast mode), so the line is sampled
+     * where it always was relative to the pins.
+     *
+     * DAP1 and DAP2 sample in the I/O cell on both clock edges.  Every pad
+     * takes both clocks: DAP0 and DAP1 share an I/O tile, whose two cells
+     * must agree on them.  CLOCK_ENABLE is left open, as Lattice's
      * technology library advises: tied to 1 it costs a LUT, and nextpnr
      * then lost about 4 MHz across the whole fabric.
      */
     wire dap1_p, dap1_n, dap2_p, dap2_n;
 
-    SB_IO #(.PIN_TYPE(6'b1010_00)) u_dap1_io (
+    /* PIN_OUTPUT_REGISTERED_ENABLE_REGISTERED, PIN_INPUT_DDR */
+    SB_IO #(.PIN_TYPE(6'b1101_00)) u_dap1_io (
         .PACKAGE_PIN   (dap1),
         .INPUT_CLK     (clk),
         .OUTPUT_CLK    (clk),
@@ -332,7 +341,7 @@ module dap_top #(
         .D_IN_1        (dap1_n)
     );
 
-    SB_IO #(.PIN_TYPE(6'b1010_00)) u_dap2_io (
+    SB_IO #(.PIN_TYPE(6'b1101_00)) u_dap2_io (
         .PACKAGE_PIN   (dap2),
         .INPUT_CLK     (clk),
         .OUTPUT_CLK    (clk),
@@ -344,24 +353,24 @@ module dap_top #(
 
     /*
      * DAP0 from the I/O cell's DDR output register: D_OUT_0 holds the first
-     * half of each cycle, D_OUT_1 the second.  Normal modes register the
-     * engines' next value into both halves, timing as before.  Fast mode
-     * holds the first half low and raises the second for every cycle with a
-     * bit, so DAP0 rises mid-cycle with half a clock of setup and of hold.
-     * Only one engine is ever busy and an idle one holds dap0 low.  The
-     * second half comes straight from a register, a copy of the engines'
-     * dap0: the falling-edge register leaves only half a clock (timing).
+     * half of each cycle, D_OUT_1 the second, both a clock behind the
+     * engines' dap0 like the other pins.  Normal modes put dap0 in both
+     * halves.  Fast mode holds the first half low and raises the second for
+     * every cycle with a bit, so DAP0 rises mid-cycle with half a clock of
+     * setup and of hold.  Only one engine is ever busy and an idle one holds
+     * dap0 low.  The second half comes straight from a register: the
+     * falling-edge register leaves only half a clock (timing).
      */
-    reg  dap0_now  = 1'b0;
-    always @(posedge clk) dap0_now <= tx_dap0_d | rx_dap0_d;
-    wire dap0_next = tx_dap0_next | rx_dap0_next;
+    wire dap0_eng = tx_dap0 | rx_dap0;
+    reg  dap0_hi  = 1'b0;
+    always @(posedge clk) dap0_hi <= dap0_eng;
 
     SB_IO #(.PIN_TYPE(6'b0100_00)) u_dap0_io (
         .PACKAGE_PIN   (dap0),
         .INPUT_CLK     (clk),
         .OUTPUT_CLK    (clk),
-        .D_OUT_0       (dap0_next & ~r_fast),
-        .D_OUT_1       (dap0_now)
+        .D_OUT_0       (dap0_eng & ~r_fast),
+        .D_OUT_1       (dap0_hi)
     );
 
     /*
@@ -376,12 +385,36 @@ module dap_top #(
     reg [3:1] dap1_sync, dap2_sync;
     wire [3:0] dap1_taps = {dap1_sync, dap1_s0};
     wire [3:0] dap2_taps = {dap2_sync, dap2_s0};
+    /*
+     * The falling-edge register has half a clock to reach the tap, so it
+     * goes through one LUT only: the select is decoded once (one-hot,
+     * registered) and everything else is ORed together ahead of it.
+     */
+    reg       fall1 = 1'b0, fall2 = 1'b0;     /* tap 0, falling edge */
+    reg       rise1 = 1'b1, rise2 = 1'b1;     /* tap 0, rising edge */
+    always @(posedge clk) begin
+        fall1 <= (r_skew1 == 2'd0) &&  r_edge1;
+        rise1 <= (r_skew1 == 2'd0) && !r_edge1;
+        fall2 <= (r_skew2 == 2'd0) &&  r_edge2;
+        rise2 <= (r_skew2 == 2'd0) && !r_edge2;
+    end
+    (* keep *) wire dap1_rest = (r_skew1 == 2'd0) ? (rise1 & dap1_p)
+                                                  : dap1_taps[r_skew1];
+    (* keep *) wire dap2_rest = (r_skew2 == 2'd0) ? (rise2 & dap2_p)
+                                                  : dap2_taps[r_skew2];
     reg       dap1_tap,  dap2_tap;
+    /*
+     * A copy of DAP1's sample for the receiver's decisions (start bit, busy
+     * count, clock budget), so they do not share the net that fans out to
+     * every payload and CRC bit (timing).  Kept: yosys would merge it.
+     */
+    (* keep *) reg dap1_ctl;
     always @(posedge clk) begin
         dap1_sync <= dap1_taps[2:0];
         dap2_sync <= dap2_taps[2:0];
-        dap1_tap  <= dap1_taps[r_skew1];
-        dap2_tap  <= dap2_taps[r_skew2];
+        dap1_tap  <= dap1_rest | (fall1 & dap1_n);
+        dap1_ctl  <= dap1_rest | (fall1 & dap1_n);
+        dap2_tap  <= dap2_rest | (fall2 & dap2_n);
     end
     assign dap1_in = dap1_tap;
     wire   dap2_in = dap2_tap;
@@ -400,7 +433,7 @@ module dap_top #(
         .data_bits (tx_dbits), .data (r_data[62:0]), .lead (r_lead),
         .wide (r_wide), .raw (r_raw | tx_parcel), .fast (r_fast),
         .busy (tx_busy), .done (tx_done),
-        .dap0 (tx_dap0), .dap0_d (tx_dap0_d), .dap0_next (tx_dap0_next),
+        .dap0 (tx_dap0),
         .dap1 (tx_dap1), .dat_oe (tx_oe),
         .dap2 (tx_dap2), .dat2_oe (tx_oe2)
     );
@@ -421,8 +454,8 @@ module dap_top #(
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
         .idle_high (rx_idle_high), .crc_ok (rx_crc_ok),
         .payload (rx_payload), .crc (rx_crc),
-        .dap0 (rx_dap0), .dap0_d (rx_dap0_d), .dap0_next (rx_dap0_next),
-        .dap1_in (dap1_in), .dap2_in (dap2_in), .dat_oe (rx_oe)
+        .dap0 (rx_dap0),
+        .dap1_in (dap1_in), .dap1_ctl (dap1_ctl), .dap2_in (dap2_in), .dat_oe (rx_oe)
     );
 
     /* ------------------------------------------------------------------ */
@@ -445,8 +478,46 @@ module dap_top #(
     reg       is_block;
     reg       is_bwrite;
     reg [8:0] parcels_left;
-    reg [1:0] store_byte;
+    /*
+     * parcels_left == 1 and == 2, kept beside the counter so no compare sits
+     * on the state changes that read them (timing).
+     */
+    reg       pl1, pl2;
     reg [31:0] store_word;
+
+    /*
+     * The pusher: a received parcel goes into the reply FIFO a byte a clock
+     * while the sequencer is already receiving the next one, so the DAP no
+     * longer waits four clocks per parcel, and the store is out of the
+     * sequencer's enables (timing).  TESTPUSH bytes go in here too, idle only.
+     */
+    reg        store_go = 1'b0;
+    reg        pushing  = 1'b0;
+    reg [1:0]  push_left;
+    reg [31:0] push_word;
+
+    always @(posedge clk) begin
+        fifo_push <= 1'b0;
+        if (rst) begin
+            pushing <= 1'b0;
+        end else if (store_go) begin
+            push_word <= store_word;
+            push_left <= 2'd3;
+            pushing   <= 1'b1;
+        end else if (pushing) begin
+            fifo_push <= 1'b1;
+            fifo_din  <= push_word[7:0];
+            push_word <= {8'd0, push_word[31:8]};
+            push_left <= push_left - 1'b1;
+            if (push_left == 2'd0)
+                pushing <= 1'b0;
+        end else if (q == Q_IDLE && wr_we && wr_addr == 7'h51) begin
+            /* TESTPUSH (0x51): a byte straight into the reply FIFO, so the
+             * host can prove its read paths with no target. */
+            fifo_push <= 1'b1;
+            fifo_din  <= wr_data;
+        end
+    end
 
     /* Bytes of the current block-write word taken from the write FIFO. */
     reg [1:0]  wbyte;
@@ -457,6 +528,8 @@ module dap_top #(
     reg start_frame_req, start_bwrite_req;
     /* CTRL bit 2: leave a block stalled on a full reply or empty write FIFO. */
     reg abort_req = 1'b0;
+    /* CTRL bit 1 written: queue a block read (decoded a clock early). */
+    reg pend_set  = 1'b0;
 
     /*
      * A block-read start written while the sequencer is busy is held and
@@ -469,13 +542,30 @@ module dap_top #(
     wire block_take   = (q == Q_IDLE) && r_block_pend;
     wire block_cancel = (q == Q_DONE) && (s_timed_out || s_overrun);
 
+    /*
+     * STATUS timed_out, kept out of the sequencer's case (timing): cleared
+     * as each frame's command goes out, set by a reply that timed out (one
+     * arrives only in Q_WACK, Q_RX or Q_PARCEL) or by an abort that ends a
+     * stalled block.  A reply that did not time out leaves it clear.
+     */
+    wire to_clear = (q == Q_TX) && tx_done;
+    wire to_abort = abort_req &&
+                    (q == Q_WFETCH || (q == Q_STORE && !fifo_room));
+    always @(posedge clk) begin
+        if (to_clear)
+            s_timed_out <= 1'b0;
+        else if ((rx_done && rx_timed_out) || to_abort)
+            s_timed_out <= 1'b1;
+    end
+
     always @(posedge clk) begin
         tx_start    <= 1'b0;
         rx_start    <= 1'b0;
-        fifo_push   <= 1'b0;
+        store_go    <= 1'b0;
         wfetch_wait <= 1'b0;
-        /* Busy through the idle cycle between chained blocks. */
-        s_busy      <= (q != Q_IDLE) || r_block_pend;
+        /* Busy through the idle cycle between chained blocks, and until the
+         * last parcel is in the FIFO. */
+        s_busy      <= (q != Q_IDLE) || r_block_pend || store_go || pushing;
 
         if (rst) begin
             q         <= Q_IDLE;
@@ -489,6 +579,8 @@ module dap_top #(
                         is_block      <= r_block_pend;
                         is_bwrite     <= start_bwrite_req;
                         parcels_left  <= {1'b0, r_parcels} + 9'd1;
+                        pl1           <= (r_parcels == 8'd0);
+                        pl2           <= (r_parcels == 8'd1);
                         /* At least one parcel always follows the command. */
                         wlast         <= 1'b0;
                         /* The reply flags are cleared in Q_TX. */
@@ -501,7 +593,6 @@ module dap_top #(
 
                 Q_TX: begin
                     if (tx_done) begin
-                        s_timed_out   <= 1'b0;
                         s_idle_high   <= 1'b0;
                         s_crc_ok      <= 1'b0;
                         s_aligned     <= 1'b0;
@@ -513,7 +604,7 @@ module dap_top #(
                         rx_bits       <= is_bwrite ? 7'd0
                                        : is_block  ? 7'd32 : r_rbits;
                         rx_expect_crc <= is_bwrite ? 1'b0
-                                       : is_block  ? (parcels_left == 9'd1)
+                                       : is_block  ? pl1
                                                    : 1'b1;
                         rx_start      <= 1'b1;
                         q             <= is_bwrite ? Q_WACK
@@ -529,7 +620,6 @@ module dap_top #(
                     if (rx_done) begin
                         /* Written on every ack; the last one leaves the result. */
                         s_wait      <= rx_wait;
-                        s_timed_out <= rx_timed_out;
                         s_crc_ok    <= ~rx_timed_out;
 
                         if (rx_timed_out || wlast) begin
@@ -548,7 +638,6 @@ module dap_top #(
                  */
                 Q_WFETCH: begin
                     if (abort_req) begin
-                        s_timed_out <= 1'b1;
                         q           <= Q_DONE;
                     end else if (wfetch_go) begin
                         wfetch_wait <= 1'b1;
@@ -564,7 +653,9 @@ module dap_top #(
                 Q_WPARCEL: begin
                     if (tx_done) begin
                         parcels_left  <= parcels_left - 1'b1;
-                        wlast         <= (parcels_left == 9'd1);
+                        pl1           <= pl2;
+                        pl2           <= (parcels_left == 9'd3);
+                        wlast         <= pl1;
                         rx_bits       <= 7'd0;
                         rx_expect_crc <= 1'b0;
                         rx_start      <= 1'b1;
@@ -577,7 +668,6 @@ module dap_top #(
                         s_reply     <= rx_payload[31:0];
                         s_crc       <= rx_crc;
                         s_wait      <= rx_wait;
-                        s_timed_out <= rx_timed_out;
                         s_idle_high <= rx_idle_high;
                         s_crc_ok    <= rx_crc_ok;
                         s_aligned   <= rx_aligned;
@@ -588,12 +678,10 @@ module dap_top #(
                 Q_PARCEL: begin
                     if (rx_done) begin
                         store_word  <= rx_payload[31:0];
-                        store_byte  <= 2'd0;
                         s_wait      <= rx_wait;
                         s_crc       <= rx_crc;
                         /* A timed-out parcel ends the block; no junk in the FIFO. */
                         if (rx_timed_out) begin
-                            s_timed_out <= 1'b1;
                             q           <= Q_DONE;
                         end else begin
                             s_crc_ok <= rx_crc_ok;
@@ -604,32 +692,28 @@ module dap_top #(
 
                 /*
                  * Flow control: a word is stored only with room for it (the
-                 * flag is a cycle old, hence the margin).  Waiting here stops
+                 * level is a few clocks old and the pusher may still hold the
+                 * last word, hence the margin of eight).  Waiting here stops
                  * DAP0 between parcels, which pauses the device; the host
                  * catches up and the block resumes.  An abort gives up.
                  */
                 Q_STORE: begin
-                    if (store_byte == 2'd0 && !fifo_room) begin
+                    if (!fifo_room) begin
                         if (abort_req) begin
                             s_overrun   <= 1'b1;
-                            s_timed_out <= 1'b1;
                             q           <= Q_DONE;
                         end
                     end else begin
-                        fifo_push <= 1'b1;
-                        fifo_din  <= store_word[7:0];
-                        store_word <= {8'd0, store_word[31:8]};
-                        if (store_byte == 2'd3) begin
-                            parcels_left <= parcels_left - 1'b1;
-                            if (parcels_left == 9'd1) begin
-                                q <= Q_DONE;
-                            end else begin
-                                rx_expect_crc <= (parcels_left == 9'd2);
-                                rx_start      <= 1'b1;
-                                q             <= Q_PARCEL;
-                            end
+                        store_go     <= 1'b1;
+                        parcels_left <= parcels_left - 1'b1;
+                        pl1          <= pl2;
+                        pl2          <= (parcels_left == 9'd3);
+                        if (pl1) begin
+                            q <= Q_DONE;
                         end else begin
-                            store_byte <= store_byte + 1'b1;
+                            rx_expect_crc <= pl2;
+                            rx_start      <= 1'b1;
+                            q             <= Q_PARCEL;
                         end
                     end
                 end
@@ -655,12 +739,13 @@ module dap_top #(
         fifo_clear      <= 1'b0;
         wfifo_clear     <= 1'b0;
 
-        abort_req <= !rst && reg_we && reg_addr == 7'h01 && reg_wdata[2];
+        abort_req <= !rst && ctrl_we && wr_data[2];
 
         if (rst || block_take || block_cancel || abort_req) begin
             r_block_pend <= 1'b0;
         end
-        if (!rst && reg_we && reg_addr == 7'h01 && reg_wdata[1]) begin
+        pend_set  <= !rst && ctrl_we && wr_data[1];
+        if (pend_set) begin
             r_block_pend <= 1'b1;
         end
 
@@ -685,47 +770,47 @@ module dap_top #(
                 r_data <= {31'd0, wfifo_head, r_data[32:9], 1'b1};
             end
 
-            if (reg_we) begin
-                case (reg_addr)
-                    7'h01: begin
-                        start_frame_req <= reg_wdata[0];
-                        start_bwrite_req <= reg_wdata[4];
-                        if (reg_wdata[3]) fifo_clear <= 1'b1;
-                        if (reg_wdata[5]) wfifo_clear <= 1'b1;
+            if (wr_we) begin
+                case (wr_addr)
+                    7'h01, 7'h18: begin
+                        start_frame_req <= wr_data[0];
+                        start_bwrite_req <= wr_data[4];
+                        if (wr_data[3]) fifo_clear <= 1'b1;
+                        if (wr_data[5]) wfifo_clear <= 1'b1;
                     end
-                    7'h02: r_div     <= reg_wdata;
-                    7'h03: r_cmd     <= reg_wdata[4:0];
-                    7'h04: r_len     <= reg_wdata[5:0];
-                    7'h05: r_dbits   <= reg_wdata[5:0];
-                    7'h06: r_rbits   <= reg_wdata[6:0];
-                    7'h07: r_trail   <= reg_wdata;
-                    7'h08: r_maxwait[7:0]  <= reg_wdata;
-                    7'h09: r_maxwait[15:8] <= reg_wdata;
-                    7'h0A: r_parcels <= reg_wdata;
-                    7'h0C: r_lead    <= reg_wdata[5:0];
+                    7'h02: r_div     <= wr_data;
+                    7'h03: r_cmd     <= wr_data[4:0];
+                    7'h04: r_len     <= wr_data[5:0];
+                    7'h05: r_dbits   <= wr_data[5:0];
+                    7'h06: r_rbits   <= wr_data[6:0];
+                    7'h07: r_trail   <= wr_data;
+                    7'h08: r_maxwait[7:0]  <= wr_data;
+                    7'h09: r_maxwait[15:8] <= wr_data;
+                    7'h0A: r_parcels <= wr_data;
+                    7'h0C: r_lead    <= wr_data[5:0];
                     7'h0B: begin
-                        trst      <= ~reg_wdata[0];      /* 1 = assert = drive low */
-                        r_no_hunt <=  reg_wdata[1];
-                        r_wide    <=  reg_wdata[2];
-                        r_raw     <=  reg_wdata[3];
-                        r_rx_wide <=  reg_wdata[5];
-                        r_fast    <=  reg_wdata[6];
+                        trst      <= ~wr_data[0];      /* 1 = assert = drive low */
+                        r_no_hunt <=  wr_data[1];
+                        r_wide    <=  wr_data[2];
+                        r_raw     <=  wr_data[3];
+                        r_rx_wide <=  wr_data[5];
+                        r_fast    <=  wr_data[6];
                     end
                     7'h0F: begin
-                        r_skew1 <= reg_wdata[1:0];
-                        r_skew2 <= reg_wdata[3:2];
-                        r_edge1 <= reg_wdata[4];
-                        r_edge2 <= reg_wdata[5];
-                        r_lag   <= reg_wdata[7:6];
+                        r_skew1 <= wr_data[1:0];
+                        r_skew2 <= wr_data[3:2];
+                        r_edge1 <= wr_data[4];
+                        r_edge2 <= wr_data[5];
+                        r_lag   <= wr_data[7:6];
                     end
-                    7'h10: r_data[7:0]   <= reg_wdata;
-                    7'h11: r_data[15:8]  <= reg_wdata;
-                    7'h12: r_data[23:16] <= reg_wdata;
-                    7'h13: r_data[31:24] <= reg_wdata;
-                    7'h14: r_data[39:32] <= reg_wdata;
-                    7'h15: r_data[47:40] <= reg_wdata;
-                    7'h16: r_data[55:48] <= reg_wdata;
-                    7'h17: r_data[63:56] <= reg_wdata;
+                    7'h10: r_data[7:0]   <= wr_data;
+                    7'h11: r_data[15:8]  <= wr_data;
+                    7'h12: r_data[23:16] <= wr_data;
+                    7'h13: r_data[31:24] <= wr_data;
+                    7'h14: r_data[39:32] <= wr_data;
+                    7'h15: r_data[47:40] <= wr_data;
+                    7'h16: r_data[55:48] <= wr_data;
+                    7'h17: r_data[63:56] <= wr_data;
                     default: ;
                 endcase
             end
@@ -737,12 +822,12 @@ module dap_top #(
              */
             q_ctrl_lo <= rd_ctrl_lo;
             q_ctrl_hi <= rd_ctrl_hi;
-            q_hi      <= reg_addr[3];
+            q_hi      <= rd_addr[3];
             q_dat    <= rd_dat;
             q_rep    <= rd_rep;
             q_fifo   <= rd_fifo;
-            q_grp    <= reg_addr[6:4];
-            q_port   <= (reg_addr[6:4] == 3'h4);
+            q_grp    <= rd_addr[6:4];
+            q_port   <= (rd_addr[6:4] == 3'h4);
 
             q_ctrl   <= q_hi ? q_ctrl_hi : q_ctrl_lo;
             q_dat_d  <= q_dat;
@@ -763,68 +848,67 @@ module dap_top #(
         end
     end
 
-    /* Read mux, grouped by address range to keep the LUT depth short. */
-    reg [7:0] rd_ctrl_lo, rd_ctrl_hi, rd_dat, rd_rep;
+    /*
+     * Read mux, grouped by address range to keep the LUT depth short.  The
+     * byte within a group is chosen by a one-hot select registered off the
+     * bus address alongside rd_addr, so each 8:1 is an AND-OR, two LUT levels
+     * (timing).
+     */
+    reg [7:0] rd_sel = 8'd1;
+    always @(posedge clk) rd_sel <= 8'd1 << reg_addr[2:0];
 
-    always @(*) begin
-        case (reg_addr[2:0])
-            3'h0: rd_ctrl_lo = {s_overrun, fifo_full, fifo_empty, s_crc_ok,
-                                s_idle_high, s_timed_out, s_done, s_busy};
-            3'h2: rd_ctrl_lo = r_div;
-            3'h3: rd_ctrl_lo = {3'd0, r_cmd};
-            3'h4: rd_ctrl_lo = {2'd0, r_len};
-            3'h5: rd_ctrl_lo = {2'd0, r_dbits};
-            3'h6: rd_ctrl_lo = {1'b0, r_rbits};
-            default: rd_ctrl_lo = r_trail;             /* 0x07 */
-        endcase
+    function [7:0] pick8(input [7:0] sel, input [63:0] v);   /* v: byte 7 .. byte 0 */
+        integer i;
+        begin
+            pick8 = 8'd0;
+            for (i = 0; i < 8; i = i + 1)
+                pick8 = pick8 | ({8{sel[i]}} & v[8*i +: 8]);
+        end
+    endfunction
 
-        case (reg_addr[2:0])
-            3'h0: rd_ctrl_hi = r_maxwait[7:0];         /* 0x08 */
-            3'h1: rd_ctrl_hi = r_maxwait[15:8];
-            3'h2: rd_ctrl_hi = r_parcels;
-            3'h3: rd_ctrl_hi = {1'b0, r_fast, r_rx_wide, 1'b0,
-                                r_raw, r_wide, r_no_hunt, ~trst};
-            3'h4: rd_ctrl_hi = {2'd0, r_lead};
-            3'h7: rd_ctrl_hi = {r_lag, r_edge2, r_edge1, r_skew2, r_skew1};
-            /* LEVEL: reply FIFO fill, so the host can drain during a block. */
-            3'h5: rd_ctrl_hi = fifo_count[7:0];
-            /* 0x0E: LEVEL high nibble, and a block start still queued. */
-            default: rd_ctrl_hi = {3'd0, r_block_pend, fifo_count[11:8]};
-        endcase
+    wire [7:0] rd_ctrl_lo = pick8(rd_sel, {
+        r_trail,                                        /* 0x07 */
+        {1'b0, r_rbits},
+        {2'd0, r_dbits},
+        {2'd0, r_len},
+        {3'd0, r_cmd},
+        r_div,
+        r_trail,                                        /* 0x01, CTRL: write only */
+        {s_overrun, fifo_full, fifo_empty, s_crc_ok,
+         s_idle_high, s_timed_out, s_done, s_busy}});   /* 0x00 */
 
-        case (reg_addr[2:0])
-            3'd0: rd_dat = r_data[7:0];
-            3'd1: rd_dat = r_data[15:8];
-            3'd2: rd_dat = r_data[23:16];
-            3'd3: rd_dat = r_data[31:24];
-            3'd4: rd_dat = r_data[39:32];
-            3'd5: rd_dat = r_data[47:40];
-            3'd6: rd_dat = r_data[55:48];
-            default: rd_dat = r_data[63:56];
-        endcase
+    wire [7:0] rd_ctrl_hi = pick8(rd_sel, {
+        {r_lag, r_edge2, r_edge1, r_skew2, r_skew1},    /* 0x0F */
+        /* 0x0E: LEVEL high nibble, and a block start still queued. */
+        {3'd0, r_block_pend, fifo_count[11:8]},
+        /* LEVEL: reply FIFO fill, so the host can drain during a block. */
+        fifo_count[7:0],
+        {2'd0, r_lead},
+        {1'b0, r_fast, r_rx_wide, 1'b0, r_raw, r_wide, r_no_hunt, ~trst},
+        r_parcels,
+        r_maxwait[15:8],
+        r_maxwait[7:0]});                               /* 0x08 */
 
-        case (reg_addr[2:0])
-            3'd0: rd_rep = s_reply[7:0];
-            3'd1: rd_rep = s_reply[15:8];
-            3'd2: rd_rep = s_reply[23:16];
-            3'd3: rd_rep = s_reply[31:24];
-            3'd4: rd_rep = {2'd0, s_crc};
-            3'd5: rd_rep = s_wait[7:0];
-            3'd6: rd_rep = s_wait[15:8];
-            /* 0x27 ALIGN.  Decoded here, not in the control group, for timing. */
-            default: rd_rep = {7'd0, s_aligned};
-        endcase
-    end
+    wire [7:0] rd_dat = pick8(rd_sel, r_data);
+
+    wire [7:0] rd_rep = pick8(rd_sel, {
+        /* 0x27 ALIGN.  Decoded here, not in the control group, for timing. */
+        {7'd0, s_aligned},
+        s_wait[15:8],
+        s_wait[7:0],
+        {2'd0, s_crc},
+        s_reply});                                      /* 0x20 .. 0x23 */
 
     /* FIFO port group: reply FIFO data and write FIFO level. */
     reg [7:0] rd_fifo;
 
     always @(*) begin
-        case (reg_addr[3:0])
+        case (rd_addr[3:0])
             /* WLEVEL: bytes waiting in the write FIFO (the host knows the depth). */
             4'h3:    rd_fifo = wfifo_count[7:0];
             4'h4:    rd_fifo = {4'd0, wfifo_count[11:8]};
-            default: rd_fifo = fifo_empty ? 8'h00 : fifo_head;
+            /* 0x40/0x50 data comes from the FIFO's SCK side directly. */
+            default: rd_fifo = 8'h00;
         endcase
     end
 endmodule

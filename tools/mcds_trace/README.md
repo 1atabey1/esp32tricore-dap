@@ -64,6 +64,12 @@ reload or a network drop only pauses drawing; a running trace carries on.
    value filter when a range holds one signal). The traced core defaults to
    the owner of the memory. Every session is recorded to the capture folder
    while the plots follow the newest data; *Stop after* ends it by itself.
+   The **Link** row picks wide mode (DAP2) and **Fast** (a DAP bit every
+   48 MHz fabric clock, default on; the probe calibrates it at start and
+   falls back to the clock beside it). The start message and the
+   **Capture** tab's statistics show what the session got (`wide, fast
+   48 MHz, two-line drain`), the probe's drain rate and buffer fill, and
+   the WiFi rate with how often LZ4 paid off.
    Values start from a memory snapshot the probe takes at start, so
    variables that never change show up and partial writes decode correctly.
 4. **Navigate** - mouse wheel zooms time around the pointer, drag pans,
@@ -83,9 +89,12 @@ reload or a network drop only pauses drawing; a running trace carries on.
 Compact mode records hit times per range instead of values. Gaps (lost
 paragraphs) are marked with red dashed lines; nothing is interpolated.
 
-Throughput: the probe reads the trace RAM at about 3.2 MB/s while tracing
-(wide DAP at 24 MHz); sources that write faster lap the 8 kB trace RAM and
-lose paragraphs (flagged). A 30 s trace of 27 members of a 20 kHz task
+Throughput: with wide fast mode the probe reads the trace RAM at about
+5.3 MB/s (3.2 MB/s at 24 MHz); sources that write faster lap the 8 kB trace
+RAM and lose paragraphs (flagged). WiFi then carries 2.1-2.8 MB/s: the
+stream is LZ4-framed (`?z=1`) and compressed only while that is faster than
+sending it raw, and the probe's 4 MB buffer absorbs bursts; once it is full
+the status line says *WiFi-limited* with the bytes dropped. A 30 s trace of 27 members of a 20 kHz task
 (2.2 MB/s) arrives without a gap. The application decodes and extracts about
 4 MB/s; if it ever falls behind, it skips ahead in the live view only - the
 file is always complete. After Stop, the whole file is loaded for review if

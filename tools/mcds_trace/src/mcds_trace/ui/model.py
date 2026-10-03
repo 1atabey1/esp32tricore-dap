@@ -104,8 +104,9 @@ class CaptureOptions:
     timestamps: str = 'hit'           # hit | ticks | none
     access: str = 'w'                 # w | r | rw
     masters: bool = False
-    dap_div: int = 0                  # 0: 24 MHz
+    dap_div: int = 0                  # 0: 24 MHz (with fast: for frames it cannot send)
     wide: bool = True
+    fast: bool = True                 # a DAP bit every fabric clock (48 MHz), calibrated per session
     duration: float = 0.0             # stop a live trace after this many seconds (0: manual)
     filters: list = field(default_factory=lambda: [SlotFilter(), SlotFilter()])
 
@@ -306,7 +307,7 @@ class Workspace:
         cpu = c.cpu if c.cpu >= 0 else owner_cpu([a for a, _ in plan.ranges])
         cfg = {'source': c.source, 'cpu': cpu, 'mode': c.mode, 'payload': c.payload,
                'timestamps': c.timestamps, 'masters': c.masters, 'dap_div': c.dap_div,
-               'wide': c.wide, 'slots': slots}
+               'wide': c.wide, 'fast': c.fast, 'slots': slots}
         return cfg, plan, warnings
 
     def trace_signals(self, plan: SlotPlan) -> list[Signal]:

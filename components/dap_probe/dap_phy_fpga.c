@@ -60,12 +60,25 @@ extern esp_err_t spi_release_xvc_bus(void);
 #define SKEW_TAPS        0x0Fu
 
 #define REG_DATA        0x10
+#define REG_GO          0x18    /* CTRL, at the end of the frame-register burst */
 #define REG_REPLY       0x20
 #define REG_RCRC        0x24
 #define REG_WAIT        0x25
 #define REG_FIFO        0x40
 #define REG_WLEVEL      0x43    /* 16-bit, bytes waiting in the write FIFO */
 #define REG_WFIFO       0x48    /* byte port into the write FIFO */
+/*
+ * The reply FIFO over two lines (half-duplex dual read: header on MOSI, eight
+ * dummy clocks, data on MOSI and MISO), opening with a two-byte prefix: the
+ * level when the header ended, and status; exactly that many FIFO bytes
+ * follow, anything clocked after them is zeros and pops nothing.
+ */
+#define REG_FIFO2       0x50
+#define PFX_BUSY         (1u << 7)  /* in the prefix's second byte */
+#define PFX_TIMED_OUT    (1u << 6)
+#define PFX_OVERRUN      (1u << 5)
+#define PFX_QUEUED       (1u << 4)
+#define REG_TESTPUSH    0x51    /* a byte straight into the reply FIFO (idle only) */
 
 #define CTRL_START_FRAME (1u << 0)
 #define CTRL_START_BLOCK (1u << 1)
@@ -244,9 +257,98 @@ static IRAM_ATTR bool ll_dma(const uint8_t *tx, uint8_t *rx, size_t n)
     return ok;
 }
 
+/*
+ * Dual-line reads of the reply FIFO (REG_FIFO2).  Half duplex: the header goes
+ * out as the command phase on MOSI, then s_dual_dummy dummy clocks (eight is
+ * the fabric's turnaround; a ninth samples a clock later, for a slow return),
+ * then the data phase on two lines.  Input sampling is the S3's din_mode /
+ * din_num, calibrated at init over test data (dual_calibrate); the full-duplex
+ * path keeps the driver's own setting, restored after each dual read.
+ */
+static bool     s_dual_ok;
+static uint8_t  s_dual_dummy = 8;
+static uint32_t s_din_mode_dual, s_din_num_dual;
+
+/* Reads n bytes (prefix included) into rx, by DMA when it is up. */
+static IRAM_ATTR bool ll_dual_read(uint8_t *rx, size_t n)
+{
+    const size_t bits = n * 8;
+    const uint32_t din_mode = s_hw->din_mode.val;
+    const uint32_t din_num  = s_hw->din_num.val;
+    const spi_line_mode_t dual = { .cmd_lines = 1, .addr_lines = 1, .data_lines = 2 };
+    const spi_line_mode_t one  = { .cmd_lines = 1, .addr_lines = 1, .data_lines = 1 };
+    volatile spi_dma_desc_t *drx = &s_desc_rx;
+    const bool use_dma = s_dma_ok && n > LL_CHUNK;
+    bool ok = true;
+
+    if (!use_dma && n > LL_CHUNK) {
+        return false;
+    }
+    spi_ll_set_half_duplex(s_hw, true);
+    spi_ll_set_command(s_hw, REG_FIFO2, 8, false);
+    spi_ll_set_command_bitlen(s_hw, 8);
+    spi_ll_set_dummy(s_hw, s_dual_dummy);
+    spi_ll_enable_mosi(s_hw, 0);
+    spi_ll_enable_miso(s_hw, 1);
+    spi_ll_master_set_line_mode(s_hw, dual);
+    s_hw->din_mode.val = s_din_mode_dual;
+    s_hw->din_num.val  = s_din_num_dual;
+
+    if (use_dma) {
+        drx->dw0.size    = (n + 3) & ~3u;
+        drx->dw0.length  = 0;
+        drx->dw0.suc_eof = 0;
+        drx->dw0.owner   = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        drx->buffer      = rx;
+        drx->next        = NULL;
+        gdma_ll_rx_reset_channel(&GDMA, s_dma_rx_ch);
+        spi_ll_dma_rx_fifo_reset(s_hw);
+        spi_ll_infifo_full_clr(s_hw);
+        spi_ll_dma_rx_enable(s_hw, true);
+        gdma_ll_rx_set_desc_addr(&GDMA, s_dma_rx_ch, (uint32_t)&s_desc_rx);
+        gdma_ll_rx_start(&GDMA, s_dma_rx_ch);
+    }
+    spi_ll_set_mosi_bitlen(s_hw, 0);
+    spi_ll_set_miso_bitlen(s_hw, bits);
+    spi_ll_clear_int_stat(s_hw);
+    spi_ll_apply_config(s_hw);
+    spi_ll_user_start(s_hw);
+    while (!spi_ll_usr_is_done(s_hw)) {
+    }
+    if (use_dma) {
+        int spins = 10000;
+        while (!drx->dw0.suc_eof && --spins > 0) {
+        }
+        ok = spins > 0;
+        spi_ll_dma_rx_enable(s_hw, false);
+    } else {
+        spi_ll_read_buffer(s_hw, rx, bits);
+    }
+
+    /* Back to what every other transfer expects. */
+    s_hw->din_mode.val = din_mode;
+    s_hw->din_num.val  = din_num;
+    spi_ll_master_set_line_mode(s_hw, one);
+    spi_ll_set_command_bitlen(s_hw, 0);
+    spi_ll_set_dummy(s_hw, 0);
+    spi_ll_enable_mosi(s_hw, 1);
+    spi_ll_set_half_duplex(s_hw, false);
+    return ok;
+}
+
 /* Link statistics, for benchmarking (dap_phy_fpga_stats). */
 static dap_fpga_stats_t s_stats;
 static uint64_t         s_xfer_cycles;      /* CPU cycles inside xfer() */
+
+/* The cycle counter is per core: a transfer the scheduler moved across cores
+ * reads as a wrap (seconds); leave it out rather than count it. */
+static inline void add_xfer_cycles(uint32_t c0)
+{
+    const uint32_t d = esp_cpu_get_cycle_count() - c0;
+    if (d < 100u * 1000u * 1000u) {
+        s_xfer_cycles += d;
+    }
+}
 
 /* Shadows of the registers the frame burst rewrites (fabric reset values). */
 static uint8_t  s_flags;
@@ -349,8 +451,39 @@ static IRAM_ATTR esp_err_t xfer(uint8_t header, const uint8_t *tx, uint8_t *rx, 
     }
     s_stats.xfers++;
     s_stats.xfer_bytes += len + lead;
-    s_xfer_cycles += esp_cpu_get_cycle_count() - c0;
+    add_xfer_cycles(c0);
     return err;
+}
+
+/*
+ * One dual read of the reply FIFO: asks for `want` bytes, delivers
+ * min(level, want) of them into dst (the rest of the transfer is the fabric's
+ * zeros, nothing popped).  level and the prefix status byte come back too.
+ */
+static IRAM_ATTR esp_err_t fifo2_read(uint8_t *dst, size_t want, size_t *got,
+                                      size_t *level, uint8_t *status)
+{
+    const uint32_t c0 = esp_cpu_get_cycle_count();
+
+    if (s_hw == NULL || want + 2 > sizeof(s_rx)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cs_low();
+    const bool ok = ll_dual_read(s_rx, want + 2);
+    cs_high();
+    s_stats.xfers++;
+    s_stats.xfer_bytes += want + 2;
+    add_xfer_cycles(c0);
+    if (!ok) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const size_t lvl = (size_t)s_rx[0] | ((size_t)(s_rx[1] & 0x07u) << 8);
+    const size_t n   = (lvl < want) ? lvl : want;
+    memcpy(dst, s_rx + 2, n);
+    *got    = n;
+    *level  = lvl;
+    *status = s_rx[1];
+    return ESP_OK;
 }
 
 static esp_err_t reg_write(uint8_t addr, const uint8_t *data, size_t len)
@@ -378,6 +511,118 @@ static uint8_t reg_read8(uint8_t addr)
         return 0;
     }
     return v;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Dual-line FIFO reads: self-test and input timing                          */
+/* ------------------------------------------------------------------------ */
+
+#define DUAL_TEST_BYTES 96
+
+/*
+ * Push a pattern through TESTPUSH and read it back over two lines in two
+ * reads, the first stopping short of the level: the bytes must continue
+ * across them, so a setting that clocks the fabric past what it samples (a
+ * ninth dummy clock) is caught losing the byte it half-clocked.
+ */
+static bool dual_check(const uint8_t *pat, size_t n)
+{
+    static WORD_ALIGNED_ATTR uint8_t back[DUAL_TEST_BYTES];
+    const size_t first = n * 5 / 12;
+    size_t  got = 0, got2 = 0, level = 0, level2 = 0;
+    uint8_t st  = 0;
+
+    if (reg_write8(REG_CTRL, CTRL_CLEAR_FIFO) != ESP_OK ||
+        reg_write(REG_TESTPUSH, pat, n) != ESP_OK ||
+        fifo2_read(back, first, &got, &level, &st) != ESP_OK ||
+        fifo2_read(back + first, n - first, &got2, &level2, &st) != ESP_OK) {
+        return false;
+    }
+    return level == n && got == first && level2 == n - first && got2 == n - first &&
+           memcmp(back, pat, n) == 0;
+}
+
+/*
+ * Sweep the S3's input timing for the two data lines - din_mode (0: none,
+ * 1/2: an APB clock edge) and din_num (1-4 APB clocks), and an extra dummy
+ * clock (sampling one SPI clock later) - roughly in order of delay, and take
+ * the middle of the longest passing run.  Each point must carry a pattern and
+ * its complement byte-exact, with the level the fabric reports.
+ */
+static void dual_calibrate(void)
+{
+    static const uint8_t points[][2] = {        /* {din_mode, din_num} */
+        {0, 0}, {1, 0}, {2, 0}, {1, 1}, {2, 1}, {1, 2}, {2, 2}, {1, 3}, {2, 3},
+    };
+    const size_t per = sizeof(points) / sizeof(points[0]);
+    uint8_t pat[DUAL_TEST_BYTES], inv[DUAL_TEST_BYTES];
+    bool    pass[2 * 9];
+    char    map[2 * 9 + 1];
+
+    for (size_t i = 0; i < DUAL_TEST_BYTES; i++) {
+        pat[i] = (uint8_t)((i * 37u + 11u) ^ ((i & 1u) ? 0xA5u : 0x00u));
+        inv[i] = (uint8_t)~pat[i];
+    }
+    const uint32_t mode0 = s_hw->din_mode.val & ~0x1000Fu;  /* din0/din1, hclk */
+    const uint32_t num0  = s_hw->din_num.val  & ~0xFu;
+
+    for (size_t k = 0; k < 2 * per; k++) {
+        const uint32_t m = points[k % per][0];
+        const uint32_t d = points[k % per][1];
+        s_dual_dummy    = (uint8_t)(8 + k / per);
+        s_din_mode_dual = mode0 | m | (m << 2) | (m ? (1u << 16) : 0u);
+        s_din_num_dual  = num0 | d | (d << 2);
+        pass[k] = dual_check(pat, sizeof(pat)) && dual_check(inv, sizeof(inv));
+        map[k]  = pass[k] ? '+' : '.';
+    }
+    map[2 * per] = '\0';
+    reg_write8(REG_CTRL, CTRL_CLEAR_FIFO);
+
+    size_t best = 0, best_at = 0;
+    for (size_t k = 0; k < 2 * per;) {
+        size_t run = 0;
+        while (k + run < 2 * per && pass[k + run]) {
+            run++;
+        }
+        if (run > best) {
+            best = run;
+            best_at = k;
+        }
+        k += run ? run : 1;
+    }
+    if (best == 0) {
+        s_dual_ok = false;
+        ESP_LOGE(TAG, "dual-line FIFO reads never read back (%s); one line only", map);
+        return;
+    }
+    const size_t k = best_at + best / 2;
+    const uint32_t m = points[k % per][0];
+    const uint32_t d = points[k % per][1];
+    s_dual_dummy    = (uint8_t)(8 + k / per);
+    s_din_mode_dual = mode0 | m | (m << 2) | (m ? (1u << 16) : 0u);
+    s_din_num_dual  = num0 | d | (d << 2);
+    s_dual_ok = dual_check(pat, sizeof(pat));
+    ESP_LOGI(TAG, "dual-line FIFO reads %s: window %s, using dummy %u din_mode %u din_num %u",
+             s_dual_ok ? "on" : "failed the recheck", map,
+             (unsigned)s_dual_dummy, (unsigned)m, (unsigned)d);
+    reg_write8(REG_CTRL, CTRL_CLEAR_FIFO);
+}
+
+bool dap_phy_fpga_dual_ok(void)
+{
+    return s_dual_ok;
+}
+
+void dap_phy_fpga_set_dual(bool enable)
+{
+    /* Only ever on when calibration found a window. */
+    if (!enable) {
+        s_dual_ok = false;
+    } else if (s_ready && s_hw != NULL) {
+        dap_lock();
+        dual_calibrate();
+        dap_unlock();
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -430,7 +675,8 @@ esp_err_t dap_phy_fpga_init(void)
     gpio_set_level(AEL_PIN_NUM_CS0, 1);
 
     gpio_set_direction(AEL_PIN_NUM_CLK,  GPIO_MODE_OUTPUT);
-    gpio_set_direction(AEL_PIN_NUM_MOSI, GPIO_MODE_OUTPUT);
+    /* MOSI is data line 0 of the dual reads: the peripheral turns it round. */
+    gpio_set_direction(AEL_PIN_NUM_MOSI, GPIO_MODE_INPUT_OUTPUT);
     gpio_set_direction(AEL_PIN_NUM_MISO, GPIO_MODE_INPUT);
 
     esp_rom_gpio_connect_out_signal(AEL_PIN_NUM_CLK,
@@ -439,6 +685,9 @@ esp_err_t dap_phy_fpga_init(void)
     esp_rom_gpio_connect_out_signal(AEL_PIN_NUM_MOSI,
                                     spi_periph_signal[FPGA_SPI_HOST].spid_out,
                                     false, false);
+    esp_rom_gpio_connect_in_signal(AEL_PIN_NUM_MOSI,
+                                   spi_periph_signal[FPGA_SPI_HOST].spid_in,
+                                   false);
     esp_rom_gpio_connect_in_signal(AEL_PIN_NUM_MISO,
                                    spi_periph_signal[FPGA_SPI_HOST].spiq_in,
                                    false);
@@ -511,6 +760,23 @@ esp_err_t dap_phy_fpga_init(void)
             ESP_LOGE(TAG, "the DMA path does not read back; CPU buffer only");
             s_dma_ok = false;
         }
+
+        /* The one-line FIFO port, through TESTPUSH (a bitstream without it
+         * reads zeros here: dual reads stay off with it). */
+        static const uint8_t probe[4] = { 0xA5, 0x5A, 0xC3, 0x3C };
+        uint8_t got[4] = {0};
+        reg_write8(REG_CTRL, CTRL_CLEAR_FIFO);
+        reg_write(REG_TESTPUSH, probe, sizeof(probe));
+        reg_read(REG_FIFO, got, sizeof(got));
+        if (memcmp(got, probe, sizeof(probe)) == 0) {
+            dual_calibrate();
+        } else {
+            ESP_LOGW(TAG, "no TESTPUSH read-back (%02X%02X%02X%02X): an older "
+                          "bitstream; FIFO reads stay on one line",
+                     got[0], got[1], got[2], got[3]);
+            s_dual_ok = false;
+        }
+        reg_write8(REG_CTRL, CTRL_CLEAR_FIFO);
     }
     ESP_LOGI(TAG, "FPGA DAP master answered on SPI2 at %d kHz", FPGA_SPI_HZ / 1000);
     return ESP_OK;
@@ -523,6 +789,7 @@ void dap_phy_fpga_invalidate(void)
     s_ready  = false;
     s_hw     = NULL;
     s_dma_ok = false;
+    s_dual_ok = false;
     shadows_reset();
     if (s_dev != NULL) {
         spi_device_release_bus(s_dev);
@@ -722,23 +989,25 @@ static esp_err_t wait_done(uint8_t *status_out)
 /*
  * CMD (0x03) through DATA (0x17) in one auto-incrementing burst.  The
  * registers in between are rewritten from their shadows; LEVEL (0x0D/0x0E)
- * is read-only and ignores the write.
+ * is read-only and ignores the write.  go >= 0: GO (0x18) follows with that
+ * CTRL value, so the frame starts in the same transfer.
  */
 static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
                                  size_t data_bits, size_t reply_bits, uint8_t parcels,
-                                 uint8_t lead);
+                                 uint8_t lead, int go);
 
 static esp_err_t load_frame_parcels(uint8_t cmd, uint8_t len_field, uint64_t data,
-                                    size_t data_bits, size_t reply_bits, uint8_t parcels)
+                                    size_t data_bits, size_t reply_bits, uint8_t parcels,
+                                    int go)
 {
-    return load_frame_lead(cmd, len_field, data, data_bits, reply_bits, parcels, s_lead);
+    return load_frame_lead(cmd, len_field, data, data_bits, reply_bits, parcels, s_lead, go);
 }
 
 static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
                                  size_t data_bits, size_t reply_bits, uint8_t parcels,
-                                 uint8_t lead)
+                                 uint8_t lead, int go)
 {
-    uint8_t  b[REG_DATA + 8 - REG_CMD];
+    uint8_t  b[REG_GO + 1 - REG_CMD];
     uint8_t  flags   = s_flags;
     uint16_t maxwait = s_maxwait;
 
@@ -772,13 +1041,14 @@ static esp_err_t load_frame_lead(uint8_t cmd, uint8_t len_field, uint64_t data,
     for (size_t i = 0; i < 8; i++) {
         b[REG_DATA - REG_CMD + i] = (uint8_t)(data >> (8 * i));
     }
-    return reg_write(REG_CMD, b, sizeof(b));
+    b[REG_GO - REG_CMD] = (uint8_t)go;
+    return reg_write(REG_CMD, b, (go >= 0) ? sizeof(b) : sizeof(b) - 1);
 }
 
 static esp_err_t load_frame(uint8_t cmd, uint8_t len_field,
-                            uint64_t data, size_t data_bits, size_t reply_bits)
+                            uint64_t data, size_t data_bits, size_t reply_bits, int go)
 {
-    return load_frame_parcels(cmd, len_field, data, data_bits, reply_bits, 0);
+    return load_frame_parcels(cmd, len_field, data, data_bits, reply_bits, 0, go);
 }
 
 static esp_err_t dap_phy_fpga_exchange_locked(uint8_t cmd, uint8_t len_field,
@@ -791,10 +1061,7 @@ static esp_err_t dap_phy_fpga_exchange_locked(uint8_t cmd, uint8_t len_field,
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (load_frame(cmd, len_field, data, data_bits, reply_bits) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    if (reg_write8(REG_CTRL, CTRL_START_FRAME) != ESP_OK) {
+    if (load_frame(cmd, len_field, data, data_bits, reply_bits, CTRL_START_FRAME) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -868,12 +1135,85 @@ void dap_phy_fpga_set_chain_lead(uint8_t clocks)
 
 static esp_err_t queue_block(const dap_fpga_block_t *b, bool first)
 {
-    if (load_frame_lead(0x0Au, (uint8_t)b->payload_bits, b->payload, b->payload_bits,
-                        0, (uint8_t)(b->count - 1), first ? s_lead : s_chain_lead) != ESP_OK) {
-        return ESP_FAIL;
+    /* One transfer: the frame, then GO (the clear is safe there: last byte). */
+    return load_frame_lead(0x0Au, (uint8_t)b->payload_bits, b->payload, b->payload_bits,
+                           0, (uint8_t)(b->count - 1), first ? s_lead : s_chain_lead,
+                           first ? (CTRL_CLEAR_FIFO | CTRL_START_BLOCK) : CTRL_START_BLOCK);
+}
+
+/*
+ * The same chain drained over two lines.  Each read carries its own prefix:
+ * the level when it started (so no separate LEVEL read, and no torn one),
+ * busy, the queued start and the error flags, and then exactly the bytes it
+ * counted.  The read is sized from the last level seen.  The level reaches the
+ * prefix a couple of SPI clocks behind the flags, so "idle and nothing left"
+ * is believed only when two reads in a row say it.
+ */
+static esp_err_t blockread_chain_dual(const dap_fpga_block_t *blocks, size_t n,
+                                      uint8_t *dst, size_t bytes)
+{
+    size_t        got = 0;
+    size_t        next = 1;                     /* the next block to queue */
+    size_t        ask = DRAIN_CHUNK;
+    int           idle_empty = 0;
+    const int64_t deadline = esp_timer_get_time() +
+                             (int64_t)OP_TIMEOUT_MS * 1000 * (int64_t)((n + 7) / 8);
+
+    for (;;) {
+        size_t want = bytes - got;
+        if (want > ask) {
+            want = ask;
+        }
+        size_t  took = 0, level = 0;
+        uint8_t st = 0;
+        if (fifo2_read(dst + got, want, &took, &level, &st) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        s_stats.polls++;
+        got += took;
+        if (got == bytes) {
+            return ESP_OK;
+        }
+
+        const bool queued = (st & PFX_QUEUED) != 0;
+        const bool failed = (st & (PFX_TIMED_OUT | PFX_OVERRUN)) != 0;
+        if (next < n && !queued && !failed) {
+            if (queue_block(&blocks[next], false) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            next++;
+        }
+
+        /* What was there and not taken, plus what arrives meanwhile. */
+        ask = (level > DRAIN_CHUNK) ? level : DRAIN_CHUNK;
+        if (ask > DRAIN_MAX) {
+            ask = DRAIN_MAX;
+        }
+
+        const bool idle = !(st & PFX_BUSY) && !queued;
+        idle_empty = (idle && level == 0) ? idle_empty + 1 : 0;
+        if (idle_empty >= 2 && (next == n || failed)) {
+            if (st & PFX_TIMED_OUT) {
+                ESP_LOGW(TAG, "a parcel timed out; the chain stopped after %u of "
+                              "%u bytes", (unsigned)got, (unsigned)bytes);
+                return ESP_ERR_TIMEOUT;
+            }
+            if (st & PFX_OVERRUN) {
+                ESP_LOGE(TAG, "the chain was aborted on a full FIFO after %u of %u bytes",
+                         (unsigned)got, (unsigned)bytes);
+                return ESP_ERR_NO_MEM;
+            }
+            ESP_LOGW(TAG, "the chain ended with %u of %u bytes",
+                     (unsigned)got, (unsigned)bytes);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            ESP_LOGE(TAG, "the chain never finished (prefix 0x%02X, %u of %u)",
+                     st, (unsigned)got, (unsigned)bytes);
+            reg_write8(REG_CTRL, CTRL_ABORT | CTRL_CLEAR_FIFO);
+            return ESP_ERR_TIMEOUT;
+        }
     }
-    return reg_write8(REG_CTRL, first ? (CTRL_CLEAR_FIFO | CTRL_START_BLOCK)
-                                      : CTRL_START_BLOCK);
 }
 
 static esp_err_t dap_phy_fpga_blockread_chain_locked(const dap_fpga_block_t *blocks,
@@ -891,6 +1231,9 @@ static esp_err_t dap_phy_fpga_blockread_chain_locked(const dap_fpga_block_t *blo
     }
     if (queue_block(&blocks[0], true) != ESP_OK) {
         return ESP_FAIL;
+    }
+    if (s_dual_ok) {
+        return blockread_chain_dual(blocks, n, (uint8_t *)words, bytes);
     }
 
     uint8_t      *dst  = (uint8_t *)words;
@@ -1042,10 +1385,8 @@ static esp_err_t dap_phy_fpga_block_write_locked(uint32_t address, const uint32_
     const uint64_t payload = ((uint64_t)(address >> 2) << 10) |
                              ((uint64_t)(count & 0xFFu) << 2);
 
-    if (load_frame_parcels(0x09u, 40, payload, 40, 0, (uint8_t)(count - 1)) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    if (reg_write8(REG_CTRL, CTRL_START_WRITE) != ESP_OK) {
+    if (load_frame_parcels(0x09u, 40, payload, 40, 0, (uint8_t)(count - 1),
+                           CTRL_START_WRITE) != ESP_OK) {
         return ESP_FAIL;
     }
 

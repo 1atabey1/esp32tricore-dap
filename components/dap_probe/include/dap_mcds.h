@@ -66,6 +66,8 @@ typedef struct {
     bool                  masters;      /* keep bus master/SVM in addresses */
     uint8_t               dap_div;      /* fabric clock divider while tracing */
     bool                  wide;         /* switch the DAP to wide mode while tracing */
+    bool                  fast;         /* fast mode: a bit every fabric clock, DIV for
+                                         * frames too long for it (dap_fast_enter) */
     dap_mcds_slot_t       slot[DAP_MCDS_SLOTS];
 } dap_mcds_config_t;
 
@@ -84,6 +86,7 @@ typedef struct {
     uint32_t emu_hz;           /* emulation (TSU) clock */
     uint32_t tsu_start;        /* TSUEMUCNT when tracing was armed */
     bool     wide;             /* the session runs in wide mode */
+    bool     fast;             /* ... and in fast mode */
     dap_mcds_snapshot_t snapshot[DAP_MCDS_SLOTS];
 } dap_mcds_info_t;
 
