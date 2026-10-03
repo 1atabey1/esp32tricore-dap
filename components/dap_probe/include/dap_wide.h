@@ -27,6 +27,16 @@ void dap_wide_exit(void);
 
 bool dap_wide_active(void);
 
+/*
+ * Fast mode (a bit every fabric clock) as a session, narrow or wide: find the
+ * receive timing (LAG, sampling edges, capture taps) against reference data
+ * in the trace RAM, trying the settings known to work first and stopping at
+ * the first that carries data three times running; a wrong LAG can desync the
+ * DAP, so the search is not exhaustive.  Leaves fast mode off on failure.
+ */
+esp_err_t dap_fast_enter(void);
+void      dap_fast_exit(void);
+
 #ifdef __cplusplus
 }
 #endif

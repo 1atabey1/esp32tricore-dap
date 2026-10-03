@@ -76,6 +76,10 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
 /* Put the IOClient in read/write mode (bus access, not COMDATA); required before memory access. */
 esp_err_t dap_probe_set_rw_mode(bool supervisor);
 
+/* IOCONF.FPI_PRIO for the next dap_probe_set_rw_mode: Cerberus's bus reads at
+ * high priority instead of the reset low one. */
+void dap_probe_set_bus_priority(bool high);
+
 /* Dump raw reply bits instead of decoding, for diagnosis.  0 turns it off. */
 void   dap_probe_set_raw_window(size_t bits);
 
@@ -140,7 +144,8 @@ esp_err_t dap_probe_read32_fast(uint32_t addr, uint32_t *value);
  * optionally wide, `chain` blocks per chained batch) and describe where the
  * time went in `out`. */
 esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
-                         int chain, int trail, int vreps, char *out, size_t outlen);
+                         int chain, int trail, int vreps, bool fast, int skew,
+                         int prio, char *out, size_t outlen);
 
 /*
  * Sweep bit rate, idle clocks before the first frame, TRST pulse and sync LEN,

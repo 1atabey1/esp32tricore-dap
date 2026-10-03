@@ -8,6 +8,7 @@ set(sources
     network/web_server.c
     network/flash_web.c
     network/dap_web.c
+    network/lz4_fast.c
     network/mcds_web.c
     network/network_mngr_ota.c
     network/descriptors.c

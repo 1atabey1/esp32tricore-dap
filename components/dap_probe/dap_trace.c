@@ -29,6 +29,16 @@ static const char *TAG = "DAP_TRACE";
 /* Paragraphs per chained read; the 8 kB TRAM holds 8, and a chain of 8 keeps
  * the fabric busy while the FIFO drains. */
 #define TRACE_CHAIN_PARS    8u
+/*
+ * FIFONOW is read after every this many paragraphs of a chain (and after its
+ * last), not after each: every read is a block of its own, and a one-word
+ * block costs about what a paragraph does in frame and queueing overhead.
+ * Each paragraph of a group is judged torn by the pointer read after the
+ * group, which is later than its own, so the test only gets stricter; four
+ * paragraphs take well under half a TRAM lap even at the source's full rate,
+ * so the pointer's step across a group is still unambiguous.
+ */
+#define TRACE_NOW_EVERY     4u
 
 /* Pointer registers hold a TRAM offset in bits [12:5]. */
 #define TRACE_PTR_MASK      0x1FE0u
@@ -265,7 +275,7 @@ esp_err_t dap_trace_finish(void)
  * self-test passes its own. */
 static esp_err_t drain_to(uint32_t now, uint32_t ovr)
 {
-    /* A chain's worth: each paragraph and the FIFONOW word read after it. */
+    /* A chain's worth: the paragraphs, and a FIFONOW word after each group. */
     static uint32_t words[TRACE_CHAIN_PARS * (TRACE_WORDS_PER_PAR + 1u)];
 
     const int64_t t0 = esp_timer_get_time();
@@ -328,17 +338,22 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
     while (i < to_read) {
         const uint32_t batch = (to_read - i < TRACE_CHAIN_PARS) ? to_read - i : TRACE_CHAIN_PARS;
         dap_block_req_t reqs[2 * TRACE_CHAIN_PARS];
+        size_t   nreq = 0;
         uint32_t par = s_next_par;
 
         for (uint32_t k = 0; k < batch; k++) {
-            reqs[2 * k].addr      = TRACE_TRAM_BASE + s_bot + par * TRACE_PARAGRAPH;
-            reqs[2 * k].count     = TRACE_WORDS_PER_PAR;
-            reqs[2 * k + 1].addr  = TRACE_FIFONOW;
-            reqs[2 * k + 1].count = 1;
+            reqs[nreq].addr  = TRACE_TRAM_BASE + s_bot + par * TRACE_PARAGRAPH;
+            reqs[nreq].count = TRACE_WORDS_PER_PAR;
+            nreq++;
+            if ((k + 1u) % TRACE_NOW_EVERY == 0u || k + 1u == batch) {
+                reqs[nreq].addr  = TRACE_FIFONOW;
+                reqs[nreq].count = 1;
+                nreq++;
+            }
             par = (par + 1u) % total_par;
         }
         const int64_t r0 = esp_timer_get_time();
-        if (dap_probe_blockread_many(reqs, 2 * batch, words) != ESP_OK) {
+        if (dap_probe_blockread_many(reqs, nreq, words) != ESP_OK) {
             s_stats.read_errors++;
             dap_probe_clear_error_state();
             s_pending_lost = lost;
@@ -347,26 +362,31 @@ static esp_err_t drain_to(uint32_t now, uint32_t ovr)
         s_stats.read_us += (uint32_t)(esp_timer_get_time() - r0);
         s_stats.read_paragraphs += batch;
 
-        for (uint32_t k = 0; k < batch; k++, i++) {
-            const uint32_t *pw = words + k * (TRACE_WORDS_PER_PAR + 1u);
-            const uint32_t  w  = pw[TRACE_WORDS_PER_PAR];
+        const uint32_t *pw = words;
+        for (uint32_t k = 0; k < batch && i < to_read;) {
+            const uint32_t group = (batch - k < TRACE_NOW_EVERY) ? batch - k : TRACE_NOW_EVERY;
+            const uint32_t w     = pw[group * TRACE_WORDS_PER_PAR];
 
-            /* Torn if the writer reached this paragraph while it was read. */
+            /* Torn if the writer reached a paragraph before the group's
+             * read was over (judged by the pointer after the group). */
             const uint32_t w_par = (((w & TRACE_PTR_MASK) - s_bot) % s_span) / TRACE_PARAGRAPH;
             moved += (w_par + total_par - prev_par) % total_par;
             prev_par = w_par;
-            if (moved >= margin + i) {
-                const uint32_t n = to_read - i;
-                lost += n;
-                s_stats.laps++;
-                s_stats.lost += n;
-                s_next_par = w_par;
-                i = to_read;
-                break;
+            for (uint32_t g = 0; g < group; g++, k++, i++) {
+                if (moved >= margin + i) {
+                    const uint32_t n = to_read - i;
+                    lost += n;
+                    s_stats.laps++;
+                    s_stats.lost += n;
+                    s_next_par = w_par;
+                    i = to_read;
+                    break;
+                }
+                publish(s_next_par, pw + g * TRACE_WORDS_PER_PAR, lost);
+                lost = 0;               /* the marker belongs to one record only */
+                s_next_par = (s_next_par + 1u) % total_par;
             }
-            publish(s_next_par, pw, lost);
-            lost = 0;                   /* the marker belongs to one record only */
-            s_next_par = (s_next_par + 1u) % total_par;
+            pw += group * TRACE_WORDS_PER_PAR + 1u;
         }
     }
     s_pending_lost = lost;
@@ -455,6 +475,7 @@ void dap_trace_get_stats(dap_trace_stats_t *out)
     }
     *out = s_stats;
     out->running = s_running;
+    out->queue_size = (uint32_t)s_ring_bytes;
 }
 
 /* ------------------------------------------------------------------------- */

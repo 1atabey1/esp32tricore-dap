@@ -9,5 +9,6 @@ set_io spi_ss   16   # <- ESP32 GPIO21 (its CS0)
 set_io spi_si   17   # <- ESP32 GPIO14 (its MOSI)
 set_io spi_so   14   # -> ESP32 GPIO39 (its MISO)
 
-set_frequency clk 48
+# HFOSC is 48 MHz +-10%: constrain the fast corner (see the Makefile).
+set_frequency clk 53
 set_frequency spi_sck 40

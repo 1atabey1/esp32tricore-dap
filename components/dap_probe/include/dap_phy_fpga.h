@@ -61,6 +61,30 @@ esp_err_t dap_phy_fpga_set_rx_wide(bool enable);
 /* Per-line sample tap in the bit window, 0..3 fabric clocks (0/0 = narrow default). */
 esp_err_t dap_phy_fpga_set_skew(uint8_t dap1_tap, uint8_t dap2_tap);
 
+/*
+ * Fast mode: a bit every fabric clock, a 48 MHz DAP clock, DIV ignored.  The
+ * frames go out raw, built here; one too long for that (over 44 data bits
+ * narrow, 40 wide) is sent at DIV instead, so keep DIV fast too.
+ */
+esp_err_t dap_phy_fpga_set_fast(bool enable);
+bool      dap_phy_fpga_is_fast(void);
+
+/*
+ * Dual-line reply FIFO reads (block-read drain over MOSI and MISO, the level
+ * in each read's prefix).  Turned on at init when the input-timing
+ * calibration finds a window; set_dual(true) re-runs it, (false) turns the
+ * drain back to one line.
+ */
+bool dap_phy_fpga_dual_ok(void);
+void dap_phy_fpga_set_dual(bool enable);
+
+/*
+ * Fast-mode receive timing.  LAG (0..3): a DAP0 clock's bit is sampled LAG +
+ * DAP1 tap + 1 fabric clocks later; wrong, it shifts block-read parcels by a
+ * bit.  edge1/edge2: sample that line on the falling edge, half a clock later.
+ */
+esp_err_t dap_phy_fpga_set_fast_timing(uint8_t lag, bool edge1, bool edge2);
+
 /* Words per client_blockwrite (write FIFO depth), and per SPI fill burst. */
 #define DAP_FPGA_BLOCK_WORDS  128
 #define DAP_FPGA_BURST_WORDS  128
@@ -116,6 +140,9 @@ void dap_phy_fpga_stats(dap_fpga_stats_t *out, bool reset);
 
 /* Time a 7-byte and a 1 KB register read (ns each), and report the SPI clock. */
 void dap_phy_fpga_link_timing(uint32_t *ns_short, uint32_t *ns_long, int *clock_khz);
+
+/* WAIT: busy clocks before the last reply's start bit (a block's last parcel). */
+uint16_t dap_phy_fpga_last_wait(void);
 
 /*
  * Attach the target through the fabric (sync, LEN-48 DAPISC, error clear,

@@ -35,7 +35,16 @@ module tb_dap_rx;
     wire [15:0] wait_cycles;
     wire [62:0] payload;
     wire [5:0]  crc;
-    wire        dap0, dat_oe, start_aligned;
+    wire        dap0_eng, dat_oe_eng, start_aligned;
+
+    /* The pins: dap_top registers DAP0 and the enable in their I/O cells,
+     * a clock behind the engine, and the engine allows for that. */
+    reg         dap0   = 1'b0;
+    reg         dat_oe = 1'b1;
+    always @(posedge clk) begin
+        dap0   <= dap0_eng;
+        dat_oe <= dat_oe_eng;
+    end
 
     reg         target_bit  = 1'b1;
     reg         target_bit2 = 1'b1;
@@ -49,13 +58,15 @@ module tb_dap_rx;
         .clk (clk), .rst (rst), .div (8'd1),
         .start (start), .reply_bits (reply_bits),
         .max_wait (max_wait), .trail_clocks (trail), .expect_crc (expect_crc),
-        .no_hunt (1'b0), .wide (wide),
+        .no_hunt (1'b0), .wide (wide), .fast (1'b0), .lag (3'd0),
+        .stream (1'b0), .parcels (9'd0), .room (1'b0), .pdone (),
         .busy (busy), .done (done),
         .wait_cycles (wait_cycles), .timed_out (timed_out),
         .idle_high (idle_high), .crc_ok (crc_ok),
         .payload (payload), .crc (crc),
         .start_aligned (start_aligned),
-        .dap0 (dap0), .dap1_in (dap1), .dap2_in (dap2), .dat_oe (dat_oe)
+        .dap0 (dap0_eng), .dap1_in (dap1), .dap1_ctl (dap1), .dap2_in (dap2),
+        .dat_oe (dat_oe_eng)
     );
 
     /* ---- the fake target -------------------------------------------------
@@ -191,7 +202,8 @@ module tb_dap_rx;
         check("crc residue ok",     crc_ok === 1'b1);
         check("not idle high",      idle_high === 1'b0);
         check("not timed out",      timed_out === 1'b0);
-        check("line handed back",   dat_oe === 1'b1);
+        /* The engine's enable; its pin follows a clock later. */
+        check("line handed back",   dat_oe_eng === 1'b1);
 
         /* ---- busy stuffing: the same reply, arriving late ---- */
         $display("the same reply after 17 busy cycles");

@@ -29,6 +29,7 @@ import struct
 from . import capfile
 from .capfile import REC_HEADER, REC_MAGIC, write_header
 from .session import Probe, RecordStream, SessionStats, _Pipeline
+from .zframe import QUERY, unframe
 
 BATCH_S = 0.05                # how often samples go to the UI
 QUIET_S = 1.5                 # after stop: the stream has ended once it is quiet this long
@@ -163,7 +164,9 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
         # Connect and handshake get seconds: over Wi-Fi, with the probe's one
         # HTTP task serving other requests, 0.2 s was often not enough ("trace
         # stream: timed out").  Only the drain of leftovers below is short.
-        ws = websocket.create_connection('ws://%s/ws/trace' % host, header=hdr, timeout=5)
+        # LZ4-compressed frames (zframe): Wi-Fi limits a fast trace, not the DAP.
+        ws = websocket.create_connection('ws://%s/ws/trace%s' % (host, QUERY), header=hdr,
+                                         timeout=5)
         ws.settimeout(0.2)
         quiet_since, t0 = time.monotonic(), time.monotonic()
         while time.monotonic() - quiet_since < 0.3 and time.monotonic() - t0 < 5:
@@ -218,6 +221,7 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                     break
                 now = time.monotonic()
                 if frame and not isinstance(frame, str):
+                    frame = unframe(frame)
                     with lock:
                         if begun[0]:
                             take(frame)

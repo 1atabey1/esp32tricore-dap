@@ -6,7 +6,8 @@
  *   write burst     a header plus three bytes lands in three consecutive
  *                   registers, so auto-increment works
  *   read burst      the same three come back in one transaction
- *   port address    an address at or above AUTOINC_STOP does not advance, so
+ *   port address    an address at or above AUTOINC_STOP (0x43 here; the FIFO
+ *                   ports 0x40/0x50 are tb_dap_top's) does not advance, so
  *                   a burst read of it drains a FIFO rather than walking off
  *                   into whatever is next
  *   back to back    a second transaction after deselect starts clean
@@ -30,17 +31,22 @@ module tb_spi_slave;
     reg  si  = 1'b0;
     reg  ss  = 1'b1;
     wire so;
+    /* SI is bidirectional now; this bench only ever drives it. */
+    wire si_pin = si;
 
     wire [6:0] reg_addr;
     wire [7:0] reg_wdata;
     wire       reg_we, reg_re;
     reg  [7:0] reg_rdata;
 
+    /* The reply FIFO ports (0x40/0x50) are covered by tb_dap_top. */
     spi_slave dut (
         .clk (clk), .rst (rst),
-        .spi_sck (sck), .spi_si (si), .spi_so (so), .spi_ss (ss),
+        .spi_sck (sck), .spi_si (si_pin), .spi_so (so), .spi_ss (ss),
         .reg_addr (reg_addr), .reg_wdata (reg_wdata),
         .reg_we (reg_we), .reg_re (reg_re), .reg_rdata (reg_rdata),
+        .fifo_head (8'h00), .fifo_empty (1'b1), .fifo_level (11'd0),
+        .fifo_pop (), .fifo_ahead (), .status (4'd0),
         .selected ()
     );
 
@@ -134,15 +140,17 @@ module tb_spi_slave;
         spi_deselect;
 
         /* ---- the non-incrementing port ---- */
-        $display("burst read of the port address 0x40");
+        /* 0x43: above AUTOINC_STOP but not a FIFO port (0x40 and 0x50 read
+         * the reply FIFO's SCK side, not the register file). */
+        $display("burst read of the port address 0x43");
         spi_select;
-        spi_byte(8'h40, got);          /* read, addr 0x40 */
+        spi_byte(8'h43, got);          /* read, addr 0x43 */
         spi_byte(8'h00, got);          /* the dummy */
         spi_byte(8'h00, got); check("port byte 1", got, 8'hA0);
         spi_byte(8'h00, got); check("port byte 2", got, 8'hA1);
         spi_byte(8'h00, got); check("port byte 3", got, 8'hA2);
         spi_deselect;
-        check("address did not walk", reg_addr, 8'h40);
+        check("address did not walk", reg_addr, 8'h43);
 
         /* ---- a second transaction must start clean ---- */
         $display("back to back transactions");

@@ -98,8 +98,9 @@ void dap_mcds_default_config(dap_mcds_config_t *cfg)
     cfg->mode       = DAP_MCDS_MODE_FULL;
     cfg->payload    = DAP_MCDS_PAYLOAD_ADDR_DATA;
     cfg->timestamps = DAP_MCDS_TS_HIT;
-    cfg->dap_div    = 0;                     /* 24 MHz */
+    cfg->dap_div    = 0;                     /* 24 MHz, for frames fast mode cannot send */
     cfg->wide       = true;                  /* two data lines when available */
+    cfg->fast       = true;                  /* a bit every fabric clock when it calibrates */
     for (int j = 0; j < DAP_MCDS_SLOTS; j++) {
         cfg->slot[j].size = 4;
         cfg->slot[j].wr = true;
@@ -337,6 +338,7 @@ static void restore_link(void)
     if (!dap_phy_fpga_in_use()) {
         return;
     }
+    dap_fast_exit();
     if (s_wide) {
         dap_wide_exit();
         s_wide = false;
@@ -436,6 +438,7 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
     }
     dap_lock();
     info->wide = false;
+    info->fast = false;
     if (dap_phy_fpga_in_use()) {
         /* Calibrated at the session's clock; narrow at that clock otherwise. */
         if (cfg->wide) {
@@ -445,6 +448,13 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
             }
         }
         dap_phy_fpga_set_div(cfg->dap_div);
+        /* Then fast mode on top, calibrated narrow or wide as it came out. */
+        if (cfg->fast) {
+            info->fast = dap_fast_enter() == ESP_OK;
+            if (!info->fast) {
+                ESP_LOGW(TAG, "fast mode unavailable; tracing at div %u", (unsigned)cfg->dap_div);
+            }
+        }
     }
     s_wide = info->wide;
     err = dap_probe_enable_ocds();
@@ -472,9 +482,11 @@ esp_err_t dap_mcds_start(const dap_mcds_config_t *cfg, dap_mcds_info_t *info)
         return err;
     }
     s_running = true;
-    ESP_LOGI(TAG, "tracing: mode %s, emulation clock %" PRIu32 " Hz, DAP %s at div %u",
+    ESP_LOGI(TAG, "tracing: mode %s, emulation clock %" PRIu32 " Hz, DAP %s %s, "
+                  "FIFO drain over %s",
              cfg->mode == DAP_MCDS_MODE_COMPACT ? "compact" : "full", info->emu_hz,
-             info->wide ? "wide" : "narrow", (unsigned)cfg->dap_div);
+             info->wide ? "wide" : "narrow", info->fast ? "fast" : "at div",
+             dap_phy_fpga_dual_ok() ? "two lines" : "one line");
     return ESP_OK;
 }
 

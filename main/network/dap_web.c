@@ -29,6 +29,8 @@
 #include "dap_probe.h"
 #include "dap_trace.h"
 #include "dap_phy_fpga.h"
+#include "lz4_fast.h"
+#include "trace_ws.h"
 #include "tricore.h"
 #include "tricore_bmp.h"
 
@@ -349,6 +351,26 @@ static esp_err_t dap_trace_stream_handler(httpd_req_t *req)
 /* 16 kB frames keep per-frame overhead low at MB/s rates.  Idle wait is one
  * tick (10 ms at CONFIG_FREERTOS_HZ=100); the 1 MB drain ring covers it. */
 #define TRACE_WS_CHUNK   16384
+
+/*
+ * Compressed stream (/ws/trace?z=1): WiFi, not the DAP, limits a fast trace,
+ * so each frame goes LZ4-compressed (1.4x on real traces) behind an 8-byte
+ * header, "DTRZ" and the u32 raw length; its top bit set means the data
+ * follows stored (it did not shrink).  Frames are independent.  A client that
+ * does not ask gets the raw stream as before.
+ */
+#define TRACE_WS_ZMAGIC  "DTRZ"
+#define TRACE_WS_ZHDR    8
+#define TRACE_WS_STORED  0x80000000u
+static bool           s_trace_ws_z;
+
+/* The sender's counters, for /api/mcds/config (single writer: the sender). */
+static trace_ws_stats_t s_ws_stats;
+
+void trace_ws_get_stats(trace_ws_stats_t *out)
+{
+    *out = s_ws_stats;
+}
 #define TRACE_WS_IDLE_MS 10
 #define TRACE_WS_END_US  1000000        /* drained and not running this long: the end */
 
@@ -397,7 +419,49 @@ static void trace_ws_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "trace ws: streaming to fd %d", s_trace_ws_fd);
+    /* Compression scratch: the output frame and the match table. */
+    uint8_t  *zbuf  = NULL;
+    uint16_t *table = NULL;
+    if (s_trace_ws_z) {
+        table = heap_caps_malloc(LZ4_FAST_TABLE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        zbuf  = heap_caps_malloc(TRACE_WS_ZHDR + TRACE_WS_CHUNK,
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (zbuf == NULL) {
+            zbuf = heap_caps_malloc(TRACE_WS_ZHDR + TRACE_WS_CHUNK,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (zbuf == NULL || table == NULL) {
+            ESP_LOGE(TAG, "trace ws: no compression buffers");
+            free(zbuf);
+            free(table);
+            free(buf);
+            trace_ws_close();
+            s_trace_ws_task = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    uint64_t z_in = 0, z_out = 0;
+
+    /*
+     * Compression pays only when the link, not the CPU, is what limits: per
+     * frame, n/C + n/(r*L) < n/L, with C the compressor's speed, r its ratio
+     * and L the wire rate, all measured as the stream runs (L from blocking
+     * send times, so it is real only when the sender is behind, which is when
+     * it matters).  On the probe's own WiFi the CPU was the limit (2.0 MB/s
+     * of trace compressed, 2.9 raw), on a weak link it is the other way.
+     * While off, every Z_PROBE-th frame is compressed anyway to keep C and r
+     * current.  Stored frames carry the header too, so the host is unaware.
+     */
+#define Z_PROBE 16
+    float    z_c = 0.0f, z_r = 0.0f, z_l = 0.0f;   /* bytes/us, ratio, bytes/us */
+    uint32_t z_frames = 0, z_packed = 0;
+
+    ESP_LOGI(TAG, "trace ws: streaming to fd %d%s", s_trace_ws_fd,
+             s_trace_ws_z ? ", LZ4 where it pays" : "");
+    memset(&s_ws_stats, 0, sizeof(s_ws_stats));
+    s_ws_stats.framed    = zbuf != NULL;
+    s_ws_stats.streaming = true;
 
     /* The client connects before it starts the trace, so an idle stream is
      * fine; one whose trace ran and has ended (stopped by the host, a flash
@@ -437,9 +501,51 @@ static void trace_ws_task(void *arg)
             .payload = buf,
             .len     = n,
         };
+        if (zbuf != NULL) {
+            /* Compress when the estimates say it is quicker overall (or to
+             * measure); stored unless it comes out smaller. */
+            const bool measure = z_c <= 0.0f || z_l <= 0.0f || (z_frames % Z_PROBE) == 0;
+            const bool pays    = z_r > 1.0f && 1.0f / z_c < (1.0f - 1.0f / z_r) / z_l;
+            size_t     c       = 0;
+            z_frames++;
+            if (measure || pays) {
+                const int64_t t0 = esp_timer_get_time();
+                c = lz4_fast_compress(buf, n, zbuf + TRACE_WS_ZHDR, n - 1, table);
+                const float us = (float)(esp_timer_get_time() - t0) + 1.0f;
+                const float r  = c ? (float)n / (float)c : 1.0f;
+                z_c = (z_c > 0.0f) ? 0.8f * z_c + 0.2f * ((float)n / us) : (float)n / us;
+                z_r = (z_r > 0.0f) ? 0.8f * z_r + 0.2f * r : r;
+                z_packed += (c != 0);
+            }
+            uint32_t len = (uint32_t)n;
+            if (c == 0) {
+                memcpy(zbuf + TRACE_WS_ZHDR, buf, n);
+                c = n;
+                len |= TRACE_WS_STORED;
+            }
+            memcpy(zbuf, TRACE_WS_ZMAGIC, 4);
+            memcpy(zbuf + 4, &len, 4);          /* little-endian, as the S3 is */
+            pkt.payload = zbuf;
+            pkt.len     = TRACE_WS_ZHDR + c;
+            z_in  += n;
+            z_out += TRACE_WS_ZHDR + c;
+        }
 
+        const int64_t   ts  = esp_timer_get_time();
         const esp_err_t err = httpd_ws_send_frame_async(s_trace_ws_hd,
                                                         s_trace_ws_fd, &pkt);
+        {
+            const float us = (float)(esp_timer_get_time() - ts) + 1.0f;
+            z_l = (z_l > 0.0f) ? 0.8f * z_l + 0.2f * ((float)pkt.len / us)
+                               : (float)pkt.len / us;
+        }
+        s_ws_stats.frames++;
+        s_ws_stats.packed     = z_packed;
+        s_ws_stats.raw_bytes += n;
+        s_ws_stats.wire_bytes += pkt.len;
+        s_ws_stats.comp_kbps  = (uint32_t)(z_c * 1000.0f);
+        s_ws_stats.comp_pct   = z_r > 0.0f ? (uint32_t)(100.0f / z_r) : 0u;
+        s_ws_stats.wire_kbps  = (uint32_t)(z_l * 1000.0f);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "trace ws: send failed (%s); closing",
                      esp_err_to_name(err));
@@ -447,7 +553,18 @@ static void trace_ws_task(void *arg)
         }
     }
 
+    if (zbuf != NULL && z_out != 0) {
+        ESP_LOGI(TAG, "trace ws: %llu bytes sent as %llu (%u%%); %u of %u frames "
+                      "compressed; compressor %u kB/s at %u%% , wire %u kB/s",
+                 (unsigned long long)z_in, (unsigned long long)z_out,
+                 (unsigned)(z_out * 100u / z_in), (unsigned)z_packed, (unsigned)z_frames,
+                 (unsigned)(z_c * 1000.0f), (unsigned)(100.0f / (z_r > 0.0f ? z_r : 1.0f)),
+                 (unsigned)(z_l * 1000.0f));
+    }
+    s_ws_stats.streaming = false;
     ESP_LOGI(TAG, "trace ws: stopped");
+    free(zbuf);
+    free(table);
     free(buf);
     trace_ws_close();
     s_trace_ws_task = NULL;
@@ -471,6 +588,11 @@ static esp_err_t trace_ws_handler(httpd_req_t *req)
                      s_trace_ws_fd);
             return ESP_FAIL;      /* refuse rather than split the stream */
         }
+        /* ?z=1: the client takes LZ4-compressed frames. */
+        char query[32], val[8];
+        s_trace_ws_z = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+                       httpd_query_key_value(query, "z", val, sizeof(val)) == ESP_OK &&
+                       atoi(val) == 1;
         s_trace_ws_gen++;
         req->sess_ctx  = (void *)(uintptr_t)s_trace_ws_gen;
         req->free_ctx  = trace_ws_session_gone;
@@ -706,7 +828,9 @@ static esp_err_t dap_fpga_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /api/dap_bench?addr=&n=&words=&div=&wide=&chain= - block-read benchmark. */
+/* GET /api/dap_bench?addr=&n=&words=&div=&wide=&chain=&trail=&vrep=&fast=&skew=&prio= -
+ * block-read benchmark; fast=1 measures at 48 MHz, skew= sets SKEW outright,
+ * prio=0/1 sets IOCONF.FPI_PRIO for the run. */
 static esp_err_t dap_bench_handler(httpd_req_t *req)
 {
     if (check_auth(req) != ESP_OK) return ESP_OK;
@@ -714,6 +838,7 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
     char query[128] = "", val[16];
     uint32_t addr = 0x70000000u;
     int n = 64, words = 256, div = 0, wide = 0, chain = 1, trail = 1, vreps = 8;
+    int fast = 0, skew = -1, prio = -1;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "addr", val, sizeof(val)) == ESP_OK) addr = strtoul(val, NULL, 0);
         if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) n = atoi(val);
@@ -723,11 +848,15 @@ static esp_err_t dap_bench_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "chain", val, sizeof(val)) == ESP_OK) chain = atoi(val);
         if (httpd_query_key_value(query, "trail", val, sizeof(val)) == ESP_OK) trail = atoi(val);
         if (httpd_query_key_value(query, "vrep", val, sizeof(val)) == ESP_OK) vreps = atoi(val);
+        if (httpd_query_key_value(query, "fast", val, sizeof(val)) == ESP_OK) fast = atoi(val);
+        if (httpd_query_key_value(query, "skew", val, sizeof(val)) == ESP_OK) skew = (int)strtol(val, NULL, 0);
+        if (httpd_query_key_value(query, "prio", val, sizeof(val)) == ESP_OK) prio = atoi(val);
     }
-    char out[640];
+    char out[768];
     dap_capture_begin();
     const esp_err_t err = dap_fpga_bench(addr, n, (size_t)words, (uint8_t)div, wide != 0,
-                                         chain, trail, vreps, out, sizeof(out));
+                                         chain, trail, vreps, fast != 0, skew,
+                                         prio, out, sizeof(out));
     ESP_LOGW(TAG, "%s", out);
     dap_capture_end(req, err == ESP_OK ? "\n=== bench done ===\n" : "\n=== bench had errors ===\n");
     return ESP_OK;

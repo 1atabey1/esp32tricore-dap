@@ -51,6 +51,7 @@ typedef struct {
     uint32_t read_us;        /* time inside the chained paragraph reads */
     uint32_t read_paragraphs;/* paragraphs those reads fetched (torn ones included) */
     uint32_t passes;         /* drain passes that found paragraphs waiting */
+    uint32_t queue_size;     /* the ring's size, for its fill */
 } dap_trace_stats_t;
 
 /* Start draining the trace FIFO.  Needs OCDS enabled and the miniMCDS

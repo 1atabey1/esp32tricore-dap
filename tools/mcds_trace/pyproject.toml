@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib>=3.8",
     "pillow>=10",
     "websocket-client>=1.7",
+    "lz4>=4.3",
     "flet[all]>=1.0.1",
     "pyelftools>=0.33",
     "pyarrow>=25.0.1",
