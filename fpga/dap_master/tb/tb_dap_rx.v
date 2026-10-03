@@ -59,6 +59,7 @@ module tb_dap_rx;
         .start (start), .reply_bits (reply_bits),
         .max_wait (max_wait), .trail_clocks (trail), .expect_crc (expect_crc),
         .no_hunt (1'b0), .wide (wide), .fast (1'b0), .lag (3'd0),
+        .stream (1'b0), .parcels (9'd0), .room (1'b0), .pdone (),
         .busy (busy), .done (done),
         .wait_cycles (wait_cycles), .timed_out (timed_out),
         .idle_high (idle_high), .crc_ok (crc_ok),

@@ -308,11 +308,19 @@ esp_err_t dap_probe_client_write(uint8_t io_instruction, uint8_t size_exponent,
     return dap_probe_exchange(&f, 0, out);
 }
 
+static bool s_fpi_prio;
+
+void dap_probe_set_bus_priority(bool high)
+{
+    s_fpi_prio = high;
+}
+
 static esp_err_t dap_probe_set_rw_mode_locked(bool supervisor)
 {
     dap_exchange_t x;
     const uint16_t conf = DAP_IOCONF_MODE_RW |
-                          (uint16_t)(supervisor ? DAP_IOCONF_SVM : 0u);
+                          (uint16_t)(supervisor ? DAP_IOCONF_SVM : 0u) |
+                          (uint16_t)(s_fpi_prio ? DAP_IOCONF_FPI_PRIO : 0u);
 
     const esp_err_t err = dap_probe_client_write(DAP_IO_CONF, 4, conf,
                                                 DAP_IOCONF_BITS, &x);

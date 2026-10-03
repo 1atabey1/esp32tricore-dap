@@ -167,8 +167,8 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   switches on by itself. `tools/mcds_trace` asks for the framing; the web pages take the raw
   stream. The sender logs C, r, L and how many frames it compressed when it stops.
 - Measured (TC387, CPU2 watches on the mlpc PXROS application, 4.4-5.5 MB/s sources), against
-  the previous firmware on the same board: the drain reads 5.15-5.3 MB/s (186-190 µs per
-  paragraph), was 3.06 MB/s (319 µs; wide at 24 MHz, one-line FIFO reads). FIFONOW is read after
+  the previous firmware on the same board: the drain reads 5.58 MB/s (175 µs per
+  paragraph; 5.15-5.3 before block-read parcels streamed), was 3.06 MB/s (319 µs; wide at 24 MHz, one-line FIFO reads). FIFONOW is read after
   every fourth paragraph (`TRACE_NOW_EVERY`), not after each, and a block's frame and its start go
   in one transfer (GO). What the session keeps is now set by WiFi: 2.1-2.8 MB/s of raw trace
   delivered (it varies with the link), the 4 MB ring covering bursts at the drain's rate for 1-2 s;
@@ -198,8 +198,23 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   clock (the next one prefetched): popping on the first lost a byte per read on hardware, and the
   calibration now reads each pattern in two parts to catch exactly that.
 - Measured on the board, 1 kB blocks chained, data verified, previous firmware in brackets:
-  narrow 24 MHz 2.43 MB/s (2.37), wide 24 MHz 4.19 (3.89), fast narrow 4.28 (3.88), fast wide
-  6.28 MB/s (3.93). read32_fast 22 µs at 24 MHz (27), 32 µs fast (36).
+  narrow 24 MHz 2.57 MB/s (2.37), wide 24 MHz 4.59 (3.89), fast narrow 5.07 (3.88), fast wide
+  6.33 MB/s (3.93). read32_fast 22 µs at 24 MHz (27), 32 µs fast (36).
+- Block-read parcels stream: while another parcel follows and the FIFO has room for two more
+  words, the receiver does not end the reply after a parcel. DAP0 keeps running (those clocks are
+  the next parcel's busy bits) and the start-bit hunt resumes at the next sample, with its own
+  timeout. Before, every parcel cost 7-9 clocks with DAP0 stopped (LAG 0-2): the receiver waited
+  for the last bit's round trip, then the sequencer stored the word and restarted it. What is
+  left per parcel is its start bit and the device's busy bits: 3 clocks (WAIT, now reported by
+  `/api/dap_bench`) at 24 and 48 MHz, narrow and wide, from DSPR and from the trace RAM, with
+  IOCONF.FPI_PRIO low or high (`prio=`). Constant in DAP clocks, so not bus latency: Cerberus
+  (`client_set(1)`, at attach) reads the next word ahead while the current one shifts out, and
+  that hides the fetch already. The TC3xx manual's 30 MB/s for wide block reads at 160 MHz is
+  the same budget (16 + 1 + ~3-4 clocks a word). FPI_PRIO stays low: no gain. Fast narrow went from 233 to 197 µs a block (7 clocks a parcel,
+  as predicted), the 24 MHz modes from 410/239 to 389/218 µs. Fast wide stayed at 158 µs: the
+  two-line drain limits it now (140 µs of each block inside SPI transfers at 40 MHz), and so the
+  trace drain, 5.58 MB/s (175 µs a paragraph, was 186-190). A parcel seen without room ends the
+  reply as before, and the sequencer restarts the receiver once the host has drained.
 - Block reads chain: a CTRL start written while the sequencer is busy is queued (LEVEL high byte
   bit 4) and taken on idle, so blocks run back to back while the host drains. With the reply FIFO
   full the fabric pauses between parcels (DAP0 stopped, DAP1 released) instead of overrunning;
@@ -227,8 +242,10 @@ Spec extract: `docs/minimcds_trace_spec.md`. Host tool: `tools/mcds_trace`.
   - Single-word reads are ~10 µs slower than at 24 MHz (read32_fast 36 vs 26 µs), not from
     MAXWAIT (doubled for fast frames); cause not found.
   - Timing closes at 53 MHz, the HFOSC's +10% corner (48 MHz +-10% commercial), not just the
-    nominal 48: 57.7 MHz on the pinned seed, which also covers the industrial +20% corner (57.6),
-    built without `--timing-allow-fail`. Seeds 1-48 span 46.9-57.7 (median 51.1, 12 pass 53).
+    nominal 48: 54.3 MHz on the pinned seed (the commercial corner; not the industrial +20% one,
+    57.6), built without `--timing-allow-fail`. Seeds 1-96 span 47.9-54.3 (median 50.8, 6 pass
+    53), the best limited by the register write path. Before parcels streamed: median 51.1 over
+    48 seeds, and an outlying 57.7 that did cover the industrial corner.
     Before: 46.7 MHz on the best of 120, median 44.5. The remaining critical paths are the
     receiver's start-bit decisions and the transmitter's field ends.
   - Every DAP output and output enable now leaves from a register in its I/O cell. Driven from

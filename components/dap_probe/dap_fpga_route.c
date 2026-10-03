@@ -142,7 +142,7 @@ void dap_fpga_block_read_sweep(const char *label)
  */
 esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool wide,
                          int chain, int trail, int vreps, bool fast, int skew,
-                         char *out, size_t outlen)
+                         int prio, char *out, size_t outlen)
 {
     dap_fpga_stats_t st;
     dap_block_req_t  reqs[16];
@@ -182,6 +182,11 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
     }
     for (uint32_t i = 0; i < 256 && err == ESP_OK; i++) {
         err = dap_probe_write32(VERIFY_ADDR + 4u * i, ref[i]);
+    }
+    /* prio >= 0: IOCONF.FPI_PRIO for this run (restored to low at the end). */
+    if (err == ESP_OK && prio >= 0) {
+        dap_probe_set_bus_priority(prio != 0);
+        err = dap_probe_set_rw_mode(true);
     }
     if (err == ESP_OK && wide) {
         err = dap_wide_enter(div);
@@ -274,6 +279,7 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
     }
     const int64_t us = esp_timer_get_time() - t0;
     dap_phy_fpga_stats(&st, true);
+    const unsigned busy = dap_phy_fpga_last_wait();
 
     /* Single-word reads, for comparison: read32 and the fast polling read. */
     uint32_t w = 0;
@@ -320,6 +326,10 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
         dap_wide_exit();
     }
     dap_phy_fpga_set_div(5);
+    if (prio >= 0) {
+        dap_probe_set_bus_priority(false);
+        dap_probe_set_rw_mode(true);
+    }
     dap_unlock();
     free(buf);
 
@@ -332,7 +342,8 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
              "  verify: %d of %d trace-RAM blocks differ from the pattern written; "
              "block write: %d of 128 words wrong (-1: failed)\n"
              "  read32: %lld us, read32_fast: %lld us, write32+read32 failures %d/16\n"
-             "  link: SCK %d kHz, 7-byte read %.2f us, 1 KB read %.1f us (%.0f kB/s)\n",
+             "  link: SCK %d kHz, 7-byte read %.2f us, 1 KB read %.1f us (%.0f kB/s)\n"
+             "  busy: %u clocks before the last parcel; FPI_PRIO %s\n",
              addr, div, (unsigned)(48000u / (2u * (div + 1u))), fast ? " FAST 48 MHz" : "",
              wide ? "wide" : "narrow", (unsigned)(skew < 0 ? 0 : skew), ok, n, (unsigned)words, chain, kbps, (double)us / n,
              (double)st.xfers / n, (double)st.xfer_bytes / n, (double)st.xfer_us / n,
@@ -340,7 +351,8 @@ esp_err_t dap_fpga_bench(uint32_t addr, int n, size_t words, uint8_t div, bool w
              mismatch, vreps * chain, bw_bad,
              (long long)read_us, (long long)fast_us, wr_bad,
              sck_khz, ns_short / 1000.0, ns_long / 1000.0,
-             ns_long ? 1024.0 * 1e6 / 1024.0 / ns_long * 1000.0 : 0.0);
+             ns_long ? 1024.0 * 1e6 / 1024.0 / ns_long * 1000.0 : 0.0,
+             busy, prio < 0 ? "low (reset)" : prio ? "high" : "low");
     return bad ? ESP_FAIL : ESP_OK;
 }
 

@@ -52,6 +52,8 @@ extern "C" {
  */
 #define DAP_IOCONF_MODE_RW     0x0001u
 #define DAP_IOCONF_SVM         0x0080u
+/* FPI_PRIO (bit 6): high DMA bus switch priority for RW-mode transfers. */
+#define DAP_IOCONF_FPI_PRIO    0x0040u
 
 /*
  * IOCONF must be written with exactly 12 bits: fewer cancels the write, more

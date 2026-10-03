@@ -141,6 +141,9 @@ void dap_phy_fpga_stats(dap_fpga_stats_t *out, bool reset);
 /* Time a 7-byte and a 1 KB register read (ns each), and report the SPI clock. */
 void dap_phy_fpga_link_timing(uint32_t *ns_short, uint32_t *ns_long, int *clock_khz);
 
+/* WAIT: busy clocks before the last reply's start bit (a block's last parcel). */
+uint16_t dap_phy_fpga_last_wait(void);
+
 /*
  * Attach the target through the fabric (sync, LEN-48 DAPISC, error clear,
  * resync, client select, CLIENT_ID; retried) and route exchanges to it.

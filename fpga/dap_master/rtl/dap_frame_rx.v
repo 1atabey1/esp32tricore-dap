@@ -44,6 +44,20 @@ module dap_frame_rx #(
      */
     input  wire [2:0]            lag,
 
+    /*
+     * Block read, streamed: parcels counts this one and those after it.
+     * While another follows and `room` says the FIFO takes two more words,
+     * a parcel does not end the reply: DAP0 keeps running, its clocks
+     * becoming the next parcel's busy bits, and the hunt starts again at the
+     * next sample.  pdone then marks the payload complete for this cycle
+     * only.  A parcel seen without room ends the reply as before (done), and
+     * the sequencer restarts the receiver once the FIFO has drained.
+     */
+    input  wire                  stream,
+    input  wire [8:0]            parcels,
+    input  wire                  room,
+    output reg                   pdone,
+
     output reg                   busy,
     output reg                   done,
 
@@ -278,14 +292,15 @@ module dap_frame_rx #(
     reg  [8:0] pulses_left;
     reg        counting;
     /*
-     * The budget's decisions, registered (timing): pi_gt1 is pulse_init > 1;
-     * go_r is whether to clock next cycle.  Everything up to pulse_init is
-     * fixed for the whole reply, so it is pipelined, one operation a stage:
-     * after_r, then the two differences, then pulse_init and pi_gt1.  The
+     * The budget's decisions, registered (timing): pi_go is pulse_init > 1,
+     * or a streamed parcel (no budget); go_r is whether to clock next cycle.
+     * Everything up to pulse_init is fixed for the whole reply, so it is
+     * pipelined, one operation a stage: after_r, then the two differences,
+     * then pulse_init and pi_go.  The
      * first sample is lag + 1 clocks after the first clock, and lag counts
      * the pads' clock, so they are ready in time.
      */
-    reg        pi_gt1, go_r;
+    reg        pi_go, go_r;
     wire [8:0] after_all = ((nbits_r == 7'd0) ? 9'd0 : {2'd0, nbits_last} + 9'd1)
                          + (crc_r ? {2'd0, crc_last} + 9'd1 : 9'd0)
                          + (has_trail ? {1'b0, trail_r} : 9'd0);
@@ -295,6 +310,28 @@ module dap_frame_rx #(
     /* after_r - in_flight and after_r - (in_flight + 1), sign in bit 9 */
     reg  [9:0] left0, left1;
     wire       start_seen = sample_take && (state == S_HUNT) && dap1_ctl;
+
+    /*
+     * Streaming.  cnt_r: parcels from the current one on.  The decision at
+     * a start bit reads only cont_ok, registered two stages back from
+     * cnt_r and room (timing: start_seen is on the critical path); the
+     * bookkeeping follows a clock later (ss_cont), at least a payload
+     * before anything reads it again.  cont_r: the current parcel streams
+     * into the next.
+     */
+    reg        stream_r;
+    reg  [8:0] cnt_r;
+    reg        more_r, last_nx, cont_ok, cont_r, ss_cont;
+    /* What the start bit loads into the budget, cont_ok already folded in,
+     * so that mux keeps the inputs it had without streaming (timing). */
+    reg        nc_r;
+    always @(posedge clk) begin
+        more_r  <= stream_r && (cnt_r > 9'd1);
+        last_nx <= (cnt_r == 9'd2);
+        cont_ok <= more_r && room;
+        nc_r    <= !(more_r && room);
+        ss_cont <= start_seen && cont_ok;
+    end
 
     /*
      * DAP0's next value.  Normal mode: high in the second half of the
@@ -322,6 +359,7 @@ module dap_frame_rx #(
     always @(posedge clk) begin
         crc_rst <= 1'b0;
         done    <= 1'b0;
+        pdone   <= 1'b0;
         hunting <= (state == S_HUNT);
         dap0    <= dap0_d;
         sample_take <= !rst && state != S_IDLE && (fast_r ? leaving : sample_now);
@@ -332,7 +370,7 @@ module dap_frame_rx #(
         left0      <= {1'b0, after_r} - {1'b0, in_flight};
         left1      <= {1'b0, after_r} - {1'b0, in_flight1};
         pulse_init <= left0[9] ? 9'd0 : left0[8:0];
-        pi_gt1     <= !left1[9] && (left1 != 10'd0);
+        pi_go      <= (!left1[9] && (left1 != 10'd0)) || (more_r && room);
         /* A new reply starts with nothing in flight. */
         clk_hist <= (state == S_IDLE) ? 8'd0 : {clk_hist[6:0], dap0};
         if (state == S_IDLE) begin
@@ -340,9 +378,11 @@ module dap_frame_rx #(
             pulses_left <= 9'd0;
             go_r        <= 1'b1;
         end else if (fast_r && start_seen) begin
-            counting    <= 1'b1;
+            /* A streamed parcel has no budget: the clocks just go on.
+             * cont_ok enters as data, not into the enable (timing). */
+            counting    <= nc_r;
             pulses_left <= pulse_init;
-            go_r        <= pi_gt1;
+            go_r        <= pi_go;
         end else begin
             /*
              * Counted down without an enable (timing): once go_r has
@@ -399,6 +439,9 @@ module dap_frame_rx #(
             tick_done   <= fast | (div == {DIV_WIDTH{1'b0}});
             phase       <= fast;          /* fast: nothing has landed */
             all_ones    <= 1'b1;
+            stream_r    <= stream & ~no_hunt;
+            cnt_r       <= parcels;
+            cont_r      <= 1'b0;
             /* What the last reply reported stays until the next starts. */
             if (start) begin
                 /* Hand the line over before the first clock. */
@@ -414,6 +457,20 @@ module dap_frame_rx #(
                 start_aligned <= 1'b0;
             end
         end else begin
+            /*
+             * A parcel that streams on: the next one is counted, and whether
+             * it is the block's last (CRC, trailing clocks, a budget) is set
+             * now, well before its start bit, so the budget's pipeline above
+             * has settled by then.
+             */
+            if (ss_cont) begin
+                cont_r <= 1'b1;
+                cnt_r  <= cnt_r - 1'b1;
+                crc_r  <= last_nx;
+            end else if (pdone) begin
+                cont_r <= 1'b0;
+            end
+
             if (!tick_done) begin
                 tick      <= tick - 1'b1;
                 tick_done <= (tick == TICK_ONE);
@@ -457,7 +514,15 @@ module dap_frame_rx #(
                     S_DATA: begin
                         /* The bits themselves: take_data, above. */
                         all_ones <= all_ones & dap1_in & (dap2_in | ~wide_r);
-                        if (at_last) begin
+                        if (at_last && cont_r) begin
+                            /* Streamed: hunt for the next parcel's start
+                             * bit from the very next sample.  Its capture
+                             * needs no clear: a full field shifts every old
+                             * bit out. */
+                            state       <= S_HUNT;
+                            pdone       <= 1'b1;
+                            crc_rst     <= 1'b1;
+                        end else if (at_last) begin
                             state <= crc_r ? S_CRC
                                    : (has_trail ? S_TRAIL : S_END);
                         end
@@ -508,6 +573,18 @@ module dap_frame_rx #(
                     wait_left   <= wait_left - 1'b1;
                     at_limit    <= (wait_left == 16'd1);
                 end
+            end
+
+            /*
+             * A streamed parcel's hunt gets its own timeout, as the device's
+             * does.  Re-armed a clock after its start bit, during the
+             * payload, where nothing counts (off the sample path: timing).
+             * WAIT then reports the last parcel's busy clocks.
+             */
+            if (ss_cont) begin
+                wait_cycles <= 16'd0;
+                wait_left   <= wait_left0;
+                at_limit    <= wait_none;
             end
 
             if (state == S_END) begin

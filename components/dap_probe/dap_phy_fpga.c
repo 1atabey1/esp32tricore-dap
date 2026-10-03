@@ -395,6 +395,15 @@ void dap_phy_fpga_link_timing(uint32_t *ns_short, uint32_t *ns_long, int *clock_
     *clock_khz = hz;
 }
 
+uint16_t dap_phy_fpga_last_wait(void)
+{
+    uint8_t b[2] = {0};
+    dap_lock();
+    reg_read(REG_WAIT, b, sizeof(b));
+    dap_unlock();
+    return (uint16_t)(b[0] | (b[1] << 8));
+}
+
 void dap_phy_fpga_stats(dap_fpga_stats_t *out, bool reset)
 {
     *out = s_stats;

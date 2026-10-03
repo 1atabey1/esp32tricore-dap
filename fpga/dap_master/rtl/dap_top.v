@@ -216,8 +216,15 @@ module dap_top #(
         .rd_empty (fifo_rd_empty), .rd_level (fifo_rd_level)
     );
 
+    /*
+     * Room to stream a parcel on, decided at its start bit: its own word, the
+     * next one, the one the pusher may still hold, and the count's lag.
+     */
+    reg              rx_room = 1'b1;
+
     always @(posedge clk) begin
         fifo_room <= (fifo_cnt < FIFO_DEPTH - 8);
+        rx_room   <= (fifo_cnt < FIFO_DEPTH - 20);
     end
 
     /* ------------------------------------------------------------------ */
@@ -289,6 +296,9 @@ module dap_top #(
     wire        tx_busy, tx_done, tx_dap0, tx_dap1, tx_oe, tx_dap2, tx_oe2;
     wire        rx_aligned;
     wire        rx_busy, rx_done, rx_timed_out, rx_idle_high, rx_crc_ok;
+    /* Block-read streaming (dap_frame_rx); assigned by the sequencer. */
+    wire        rx_pdone, rx_stream;
+    wire [8:0]  rx_parcels;
     wire [15:0] rx_wait;
     wire [62:0] rx_payload;
     wire [5:0]  rx_crc;
@@ -449,6 +459,8 @@ module dap_top #(
         .expect_crc (rx_expect_crc),
         .no_hunt (r_no_hunt),
         .wide (rx_wide_any), .fast (r_fast), .lag (rx_lag),
+        .stream (rx_stream), .parcels (rx_parcels),
+        .room (rx_room), .pdone (rx_pdone),
         .start_aligned (rx_aligned),
         .busy (rx_busy), .done (rx_done),
         .wait_cycles (rx_wait), .timed_out (rx_timed_out),
@@ -484,6 +496,9 @@ module dap_top #(
      */
     reg       pl1, pl2;
     reg [31:0] store_word;
+
+    assign rx_stream  = is_block && !is_bwrite;
+    assign rx_parcels = parcels_left;
 
     /*
      * The pusher: a received parcel goes into the reply FIFO a byte a clock
@@ -676,6 +691,19 @@ module dap_top #(
                 end
 
                 Q_PARCEL: begin
+                    /*
+                     * A streamed parcel: the receiver is already hunting for
+                     * the next one, and it checked the FIFO's room before it
+                     * let this one run on, so the word goes straight to the
+                     * pusher.
+                     */
+                    if (rx_pdone) begin
+                        store_word   <= rx_payload[31:0];
+                        store_go     <= 1'b1;
+                        parcels_left <= parcels_left - 1'b1;
+                        pl1          <= pl2;
+                        pl2          <= (parcels_left == 9'd3);
+                    end
                     if (rx_done) begin
                         store_word  <= rx_payload[31:0];
                         s_wait      <= rx_wait;
