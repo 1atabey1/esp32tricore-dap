@@ -3,6 +3,7 @@
     mcds-trace capture HOST OUT.mcds --watch ADDR:SIZE[:ACCESS[:NAME]] [--cpu N] [--seconds N]
     mcds-trace capture HOST OUT.mcds --config CFG.json [--seconds N]
     mcds-trace capture HOST OUT.mcds --start          # config already on the probe
+    mcds-trace capture tdm OUT.mcds --watch ...       # tricore-debug-machine on USB
     mcds-trace decode FILE.mcds [--csv OUT] [--plot [PNG]] [--elf APP.elf] [--signed]
 """
 
@@ -52,7 +53,7 @@ def _build_config(a) -> dict | None:
     if a.config:
         with open(a.config) as f:
             cfg = json.load(f)
-    for key in ('source', 'cpu', 'mode', 'payload', 'timestamps', 'dap_div'):
+    for key in ('source', 'cpu', 'mode', 'payload', 'timestamps', 'dap_div', 'wide', 'fast'):
         val = getattr(a, key)
         if val is not None:
             cfg[key] = val
@@ -66,6 +67,15 @@ def _build_config(a) -> dict | None:
 
 def cmd_capture(a) -> int:
     cfg = _build_config(a)
+    from .tdm import TdmError, is_tdm
+    if is_tdm(a.host):
+        try:
+            res = capture.capture_tdm(a.host, a.out, cfg, a.seconds)
+        except (RuntimeError, TdmError, OSError) as e:
+            print('error:', e, file=sys.stderr)
+            return 1
+        print('%(bytes)d bytes in %(frames)d frames, %(seconds).1f s; probe: %(probe)s' % res)
+        return 0
     if cfg is not None:
         try:
             applied = capture.post_config(a.host, a.auth, cfg)
@@ -129,7 +139,8 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest='cmd', required=True)
 
     c = sub.add_parser('capture', help='stream /ws/trace into a capture file')
-    c.add_argument('host')
+    c.add_argument('host', help='esp32jtag address, or tdm (tdm:SERIAL) for the '
+                   'tricore-debug-machine on USB')
     c.add_argument('out')
     c.add_argument('--auth', default='admin:admin')
     c.add_argument('--seconds', type=float)
@@ -145,6 +156,9 @@ def main(argv=None) -> int:
     g.add_argument('--payload', choices=['addr_data', 'data', 'addr'])
     g.add_argument('--timestamps', choices=['hit', 'ticks', 'none'])
     g.add_argument('--dap-div', dest='dap_div', type=int, help='DAP clock divider (0 = 24 MHz)')
+    g.add_argument('--wide', action=argparse.BooleanOptionalAction, help='DAP wide mode (default on)')
+    g.add_argument('--fast', action=argparse.BooleanOptionalAction,
+                   help='fast mode: a DAP bit every 48 MHz fabric clock (default on)')
     c.set_defaults(fn=cmd_capture)
 
     d = sub.add_parser('decode', help='decode (and plot) a capture file')

@@ -28,7 +28,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from .capfile import REC_HEADER, REC_MAGIC, Record
-from .decode import KIND_CODE, KINDS, DecodeStats, Decoder
+from .decode import KIND_CODE, KINDS, DecodeStats
+from .fastdecode import HAVE_NUMBA, make_decoder
 from .signals import ExtractStats, Extractor, Signal, SignalStore
 
 _KIND_CODE = KIND_CODE
@@ -73,6 +74,18 @@ class EventLog:
         if len(self._pending) >= 65536:
             self._flush()
 
+    def add_columns(self, cols) -> None:
+        """Decoder columns (fastdecode.Columns)."""
+        if not cols.n:
+            return
+        self._flush()
+        self.n += cols.n
+        self._chunks.append({
+            'cycles': cols.cycles.copy(), 'kind': cols.kind.copy(), 'addr': cols.addr.copy(),
+            'value': cols.value.copy(), 'size': cols.size.copy(),
+            'wp': cols.wp.astype(np.int32), 'count': cols.count.astype(np.int32)})
+        self._trim()
+
     def _flush(self) -> None:
         if not self._pending:
             return
@@ -83,6 +96,9 @@ class EventLog:
             'size': np.array(cols[4], dtype=np.uint8), 'wp': np.array(cols[5], dtype=np.int32),
             'count': np.array(cols[6], dtype=np.int32)})
         self._pending = []
+        self._trim()
+
+    def _trim(self) -> None:
         if self.limit:
             while len(self._chunks) > 1 and self.n - self.dropped > self.limit:
                 ch = self._chunks.pop(0)
@@ -123,6 +139,21 @@ class EventLog:
             if len(c):
                 return int(c[0])
         return None
+
+    def columns(self, batch: int = 1 << 18):
+        """Every event again, as fastdecode.Columns - what Extractor.feed_columns takes."""
+        from .fastdecode import Columns
+        self._flush()
+        for ch in self._chunks:
+            n = len(ch['kind'])
+            for i in range(0, n, batch):
+                k = min(batch, n - i)
+                yield Columns(k, {
+                    'cycles': ch['cycles'][i:i + k], 'kind': ch['kind'][i:i + k],
+                    'addr': ch['addr'][i:i + k], 'value': ch['value'][i:i + k],
+                    'size': ch['size'][i:i + k], 'wp': ch['wp'][i:i + k].astype(np.int64),
+                    'count': ch['count'][i:i + k].astype(np.int64),
+                    'core': np.zeros(k, dtype=np.uint8), 'master': np.full(k, -1, dtype=np.int8)})
 
     def raw_rows(self, batch: int = 16384):
         """Every event again, as lists of (cycles, kind, addr, value, size, wp,
@@ -213,7 +244,7 @@ class _Pipeline:
     def __init__(self, config: dict, signals: list[Signal], log_limit: int | None = None):
         self.config = config
         self.tick_mode = config.get('timestamps') == 'ticks'
-        self.decoder = Decoder(tick_mode=self.tick_mode)
+        self.decoder = make_decoder(tick_mode=self.tick_mode)
         self.log = EventLog(log_limit)
         self.store = SignalStore()
         self.extractor = Extractor(signals, self.store, config.get('emu_hz') or 0, config)
@@ -226,18 +257,27 @@ class _Pipeline:
             self._records_in(recs, forced_gap, last_is_final)
 
     def _records_in(self, recs, forced_gap: bool, last_is_final: bool = False) -> None:
-        rows: list[tuple] = []
-        decode = self.decoder.rows
+        payloads, gaps, finals = [], [], []
         for rec in recs:
-            gap = forced_gap or rec.gap or (self.prev_seq is not None and rec.seq != self.prev_seq + 1)
+            gaps.append(forced_gap or rec.gap
+                        or (self.prev_seq is not None and rec.seq != self.prev_seq + 1))
             forced_gap = False
             self.prev_seq = rec.seq
             self.records += 1
-            final = rec.final or (last_is_final and rec is recs[-1])
-            rows += decode(rec.payload, rec.seq, gap, final)
-        if rows:
-            self.log.add_rows(rows)
-            self.extractor.feed_rows(rows)
+            finals.append(rec.final or (last_is_final and rec is recs[-1]))
+            payloads.append(rec.payload)
+        if not HAVE_NUMBA:                  # the reference path, rows throughout
+            rows: list[tuple] = []
+            for p, g, f in zip(payloads, gaps, finals):
+                rows += self.decoder.rows(p, 0, g, f)
+            if rows:
+                self.log.add_rows(rows)
+                self.extractor.feed_rows(rows)
+            return
+        cols = self.decoder.decode(payloads, gaps, finals)
+        if cols.n:
+            self.log.add_columns(cols)
+            self.extractor.feed_columns(cols)
 
     def reselect(self, signals: list[Signal]) -> SignalStore:
         """Rebuild every series for a new selection from the event log."""
@@ -255,8 +295,8 @@ class _Pipeline:
                     initial_t = (first - t0) / hz if hz else float(first - t0)
             ex = Extractor(signals, store, hz, self.config, t0=t0, memory=memory,
                            initial_t=initial_t)
-            for batch in self.log.raw_rows():
-                ex.feed_rows(batch)
+            for cols in self.log.columns():
+                ex.feed_columns(cols)
             store.gaps = list(self.store.gaps)
             if self.store.t_end > store.t_end:
                 store.t_end = self.store.t_end
@@ -293,6 +333,13 @@ class Probe:
         except (ValueError, http.client.InvalidURL) as e:     # e.g. 'host:abc'
             raise ProbeError('%r is not a valid probe address (%s)' % (self.host, e)) from None
 
+    def stream_spec(self) -> tuple:
+        """What the trace worker connects to (worker.open_stream)."""
+        return ('ws', self.host, self.auth)
+
+    def bind(self, remote) -> None:
+        """The worker of a live session (the esp32jtag's commands stay HTTP)."""
+
     def status(self) -> str:
         return self._req('/api/dap_gdb/status', timeout=4).decode(errors='replace').strip()
 
@@ -307,6 +354,15 @@ class Probe:
 
     def stop(self) -> str:
         return self._req('/api/mcds/stop', timeout=60).decode(errors='replace').strip()
+
+
+def open_probe(host: str, auth: str = 'admin:admin'):
+    """The probe the address names: 'tdm' / 'usb' / 'tdm:SERIAL' for the
+    tricore-debug-machine on USB (tdm.TdmSource), else an esp32jtag's host."""
+    from .tdm import TdmSource, is_tdm
+    if is_tdm(host):
+        return TdmSource(host)
+    return Probe(host, auth)
 
 
 # -- workers ------------------------------------------------------------------
@@ -377,7 +433,7 @@ class _Remote:
                     store.trimmed = self.store.trimmed
                     self.store = store
                     self._replies.put(('store', store))
-                elif kind in ('addresses', 'failed'):
+                elif kind in ('addresses', 'failed', 'ctl'):
                     self._replies.put(msg)
                 elif kind == 'progress':
                     if self.on_progress:
@@ -473,8 +529,9 @@ class LiveSession:
     MAX_BACKLOG = 8 << 20          # bytes queued before the live view skips ahead
     LOG_LIMIT = 6_000_000          # events kept for re-selection (~35 bytes each)
 
-    def __init__(self, probe: Probe, config: dict, signals: list[Signal], out_path: str,
+    def __init__(self, probe, config: dict, signals: list[Signal], out_path: str,
                  in_process: bool = False):
+        """probe: a Probe (esp32jtag) or tdm.TdmSource (see open_probe)."""
         self.probe = probe
         self.request = config
         self.signals = signals
@@ -501,14 +558,10 @@ class LiveSession:
 
     def start(self) -> None:
         from . import worker
-        try:
-            applied = self.probe.post_config(self.request)
-        except ProbeError as e:
-            self._error = str(e)
-            raise
-        # The stream is connected before the trace starts (see worker.live_main).
+        # The stream is connected before the trace starts (see worker.live_main);
+        # a tdm probe is then owned by the worker, so its commands go there.
         self.pipe = _Remote(worker.live_main,
-                            (self.probe.host, self.probe.auth, self.out_path, self.signals,
+                            (self.probe.stream_spec(), self.out_path, self.signals,
                              self.LOG_LIMIT, self.MAX_BACKLOG),
                             self.in_process)
         self.pipe.on_stats = self._on_stats
@@ -517,8 +570,10 @@ class LiveSession:
             self.pipe.close(timeout=2)
             self._error = msg[1] if len(msg) > 1 else 'the trace worker ended'
             raise ProbeError(self._error)
+        self.probe.bind(self.pipe)
         started = False
         try:
+            applied = self.probe.post_config(self.request)
             reply = self.probe.start()
             if not reply.startswith('started'):
                 raise ProbeError('the probe did not start the trace: %s' % reply)

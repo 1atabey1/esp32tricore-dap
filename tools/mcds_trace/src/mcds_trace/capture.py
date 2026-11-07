@@ -99,3 +99,54 @@ def capture(host: str, out_path: str, auth: str = 'admin:admin',
         ws.close()
     return {'bytes': count['bytes'], 'frames': count['frames'],
             'seconds': time.monotonic() - t0}
+
+
+def capture_tdm(host: str, out_path: str, config: dict | None = None,
+                seconds: float | None = None) -> dict:
+    """The same for the tdm probe on USB (host 'tdm' or 'tdm:SERIAL'): post
+    `config` (else the probe's stored one is used), start, record until
+    Ctrl-C or `seconds`, stop, and record until the stream goes quiet."""
+    from .tdm import TdmProbe, serial_of
+    stop = {'flag': False}
+    old = signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
+    count = {'bytes': 0, 'frames': 0}
+    t0 = time.monotonic()
+    try:
+        with TdmProbe(serial_of(host)) as p:
+            p.drain()
+            applied = p.post_config(config) if config else None
+            reply = p.start()
+            if not reply.startswith('started'):
+                raise RuntimeError('the probe did not start the trace: %s' % reply)
+            cfg = p.config()
+            if applied:
+                cfg.setdefault('slots', applied.get('slots', []))
+            t0 = time.monotonic()
+            with open(out_path, 'wb') as f:
+                write_header(f, cfg)
+
+                def pump(idle_limit: float | None) -> None:
+                    last = time.monotonic()
+                    while True:
+                        if idle_limit is None:
+                            if stop['flag'] or (seconds is not None
+                                                and time.monotonic() - t0 >= seconds):
+                                return
+                        elif time.monotonic() - last >= idle_limit:
+                            return
+                        b = p.read(200)
+                        if b:
+                            f.write(b)
+                            count['bytes'] += len(b)
+                            count['frames'] += 1
+                            last = time.monotonic()
+
+                try:
+                    pump(None)
+                finally:
+                    stats = p.stop()
+                    pump(1.5)
+    finally:
+        signal.signal(signal.SIGINT, old)
+    return {'bytes': count['bytes'], 'frames': count['frames'],
+            'seconds': time.monotonic() - t0, 'probe': stats}

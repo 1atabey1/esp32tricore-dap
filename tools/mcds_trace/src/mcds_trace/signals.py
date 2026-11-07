@@ -306,6 +306,25 @@ class Shadow:
             new.append((a, data, known))
         self.ranges = new
 
+    def flatten(self) -> None:
+        """Put every range into one buffer (data, then known), so the compiled
+        extractor works on the same bytes: `flat_data`/`flat_known` are numpy
+        views of it, `offsets` each range's start in them."""
+        total = sum(len(d) for _, d, _ in self.ranges)
+        self._flat = bytearray(2 * total)
+        mv = memoryview(self._flat)
+        ranges, self.offsets, off = [], [], 0
+        for base, d, k in self.ranges:
+            n = len(d)
+            mv[off:off + n] = d
+            mv[total + off:total + off + n] = k
+            ranges.append((base, mv[off:off + n], mv[total + off:total + off + n]))
+            self.offsets.append(off)
+            off += n
+        self.ranges = ranges
+        arr = np.frombuffer(self._flat, dtype=np.uint8) if total else np.zeros(0, np.uint8)
+        self.flat_data, self.flat_known = arr[:total], arr[total:]
+
     def write(self, addr: int, raw: bytes) -> None:
         for base, data, known in self.ranges:
             lo = max(addr, base)
@@ -354,7 +373,9 @@ class Extractor:
         self.hits = {s.slot: s for s in signals if s.kind == 'hits'}
         for s in self.values:
             self.shadow.cover(s.addr, s.end)
+        self.shadow.flatten()
         self.values.sort(key=lambda s: s.addr)
+        self._kernel = None                          # feed_columns' tables, built on first use
         self._seeded = False
         self._starts = np.array([s.addr for s in self.values], dtype=np.int64)
         self._max_size = max((s.size for s in self.values), default=0)
@@ -522,6 +543,105 @@ class Extractor:
             st.samples += produced
             store.samples += produced
         return produced
+
+    def feed_columns(self, cols) -> int:
+        """Process decoder columns (fastdecode.Columns), as feed_rows does the
+        rows; compiled (fastextract) where numba is available."""
+        from . import fastextract as fx
+        if not cols.n:
+            return 0
+        if not fx.HAVE_NUMBA or self._max_size > 8:
+            return self.feed_rows(cols.rows())
+        k = self._kernel or self._build_kernel()
+        st = self.stats
+        store = self.store
+        n = cols.n
+        cnt = np.zeros(5, dtype=np.int64)
+        nsig = len(k['sigs'])
+        cap = max(2 * n, 4096) + max(len(self.values), 8) + 1
+        o_sig = np.empty(cap, dtype=np.int32)
+        o_t = np.empty(cap, dtype=np.float64)
+        o_raw = np.empty(cap, dtype=np.uint64)
+        o_flag = np.empty(cap, dtype=np.uint8)
+        o_gap = np.empty(n + 1, dtype=np.float64)
+        produced = 0
+        with store.lock:
+            if self.t0 is None:
+                timed = np.nonzero((cols.cycles >= 0) & (cols.kind != K_GAP))[0]
+                if len(timed):
+                    self._time(int(cols.cycles[timed[0]]))     # time zero: initial samples
+            t0 = self.t0 if self.t0 is not None else 0
+            t_end = store.t_end
+            sh = self.shadow
+            start = 0
+            while start < n:
+                start, m, g, t_end = fx._extract(
+                    cols.cycles, cols.kind, cols.addr, cols.value, cols.size, cols.wp, cols.count,
+                    start, t0, self.emu_hz, t_end, k['s_addr'], k['s_end'], k['s_off'],
+                    self._max_size, k['single'], k['single_size'], k['r_base'], k['r_len'],
+                    k['r_off'], sh.flat_data, sh.flat_known, k['hit_sig'],
+                    o_sig, o_t, o_raw, o_flag, o_gap, cnt)
+                if g:
+                    store.gaps.extend(o_gap[:g].tolist())
+                if not m:
+                    continue
+                sig = o_sig[:m]
+                order = np.argsort(sig, kind='stable')
+                bounds = np.searchsorted(sig[order], np.arange(nsig + 1))
+                for j in np.nonzero(np.diff(bounds))[0].tolist():
+                    idx = order[bounds[j]:bounds[j + 1]]
+                    t = o_t[idx]
+                    s, dec = k['sigs'][j]
+                    if dec is None:                          # watch-point hits
+                        v = np.ones(len(idx))
+                    else:
+                        fl = o_flag[idx]
+                        v, keep = dec(o_raw[idx])
+                        special = fl != fx.F_RAW
+                        if special.any():
+                            v[fl == fx.F_NAN] = np.nan
+                            if keep is not None:
+                                keep = keep | special
+                        if keep is not None and not keep.all():
+                            t, v = t[keep], v[keep]
+                    store.get(s.id).extend(t, v)
+                    produced += len(t)
+            store.t_end = t_end
+            st.events += int(cnt[0])
+            st.untimed += int(cnt[1])
+            st.unmatched += int(cnt[2])
+            st.lost += int(cnt[3])
+            st.gaps += int(cnt[4])
+            st.samples += produced
+            store.samples += produced
+        return produced
+
+    def _build_kernel(self) -> dict:
+        from .fastextract import Decoders
+        sh = self.shadow
+        s_off = []
+        for s in self.values:
+            for (base, d, _), off in zip(sh.ranges, sh.offsets):
+                if base <= s.addr and s.end <= base + len(d):
+                    s_off.append(off + s.addr - base)
+                    break
+        sigs = [(s, Decoders(s)) for s in self.values]
+        hit_sig = np.full(max([8] + [j + 1 for j in self.hits]), -1, dtype=np.int64)
+        for j in sorted(self.hits):
+            hit_sig[j] = len(sigs)
+            sigs.append((self.hits[j], None))
+        single = self.values.index(self.single) if self.single is not None else -1
+        self._kernel = {
+            'sigs': sigs,
+            's_addr': np.array([s.addr for s in self.values], dtype=np.int64),
+            's_end': np.array([s.end for s in self.values], dtype=np.int64),
+            's_off': np.array(s_off, dtype=np.int64),
+            'single': single, 'single_size': self.single.size if self.single else 0,
+            'r_base': np.array([b for b, _, _ in sh.ranges], dtype=np.int64),
+            'r_len': np.array([len(d) for _, d, _ in sh.ranges], dtype=np.int64),
+            'r_off': np.array(sh.offsets, dtype=np.int64),
+            'hit_sig': hit_sig}
+        return self._kernel
 
     def _flush_exact(self) -> None:
         # An exact store's range is its signals' range, which no other

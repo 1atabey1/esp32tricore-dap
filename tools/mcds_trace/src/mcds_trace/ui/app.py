@@ -28,7 +28,7 @@ from .. import elfsyms
 from ..export import parquet_bytes, samples_table, write_parquet
 from ..plotrender import (THEMES, FrameInfo, FrameSpec, SubplotRenderer, Trace, export_png,
                           value_at)
-from ..session import FileSession, LiveSession, Probe, ProbeError
+from ..session import FileSession, LiveSession, ProbeError, open_probe
 from ..signals import PALETTE, Signal, hits_signal, leaf_signal, raw_signal
 from .model import FORMATS, Settings, SubplotModel, Workspace
 
@@ -1005,6 +1005,8 @@ class App:
     def _build_topbar(self) -> None:
         self.host_field = ft.TextField(value=self.host, width=190, dense=True,
                                        label='Probe', text_size=13,
+                                       tooltip='esp32jtag address, or tdm for the '
+                                               'tricore-debug-machine on USB',
                                        on_submit=self.guard(self._host_changed),
                                        on_blur=self.guard(self._host_changed))
         self.probe_dot = ft.Container(width=10, height=10, border_radius=5,
@@ -2306,14 +2308,17 @@ class App:
             self.probe_ok = None
             self.last_status_poll = 0
 
-    def probe(self) -> Probe:
-        return Probe(self.host, self.settings.auth)
+    def probe(self):
+        """The esp32jtag at the host, or the tdm probe on USB ('tdm')."""
+        return open_probe(self.host, self.settings.auth)
 
     async def _poll_probe(self) -> None:
         try:
             st = await asyncio.to_thread(self.probe().status)
             self.probe_ok = True
             cores = ' '.join(p for p in st.split() if p.startswith('cpu'))
+            if not cores and st.startswith('tdm '):         # tdm: link and 24 V state
+                cores = ' '.join(st.split()[2:])
             self.probe_text.value = cores.replace('=', ' ')[:60]
         except ProbeError as ex:
             self.probe_ok = False
@@ -2625,7 +2630,9 @@ class App:
             self.status_left.value = 'LIVE  %s/s  %s recorded  lost %d  probe buffer %d%%%s%s' % (
                 fmt_bytes(st.rate), fmt_bytes(st.bytes), lost, round(100 * fill),
                 # The drain outruns WiFi now: the probe's buffer is what gives.
-                ('  WiFi-limited: %s dropped' % fmt_bytes(dropped)) if dropped else '',
+                ('  %s-limited: %s dropped' % ('USB' if sess.config.get('probe') == 'tdm'
+                                               else 'WiFi', fmt_bytes(dropped)))
+                if dropped else '',
                 ('  decoder behind by %s' % fmt_bytes(st.backlog)) if st.backlog > 2 << 20 else '')
             if sess.error:
                 self.status_left.value += '  ERROR: %s' % sess.error
@@ -2652,7 +2659,8 @@ class App:
             p = sess.stats.probe or {}
             drain, fill, dropped = probe_rates(p)
             ws = p.get('ws') or {}
-            if not ws.get('framed'):
+            usb = sess.config.get('probe') == 'tdm'
+            if usb or not ws.get('framed'):
                 wifi = 'raw stream'
             else:
                 wifi = 'LZ4 on %d of %d frames (%d%% size; compressor %s/s)' % (
@@ -2661,13 +2669,13 @@ class App:
             self.stats_view.value = (
                 'link       %s\n'
                 'probe      drain %s/s, buffer %d%% of %s, dropped %s\n'
-                'wifi       %s/s on the wire, %s\n'
+                '%s       %s/s on the wire, %s\n'
                 'received   %s (%s/s)\nparagraphs %s  lost %s  laps %s\n'
                 'decoded    %d records, backlog %s' % (
                     link_text(sess.config),
                     fmt_bytes(drain), round(100 * fill), fmt_bytes(int(p.get('queue_size', 0))),
-                    fmt_bytes(dropped),
-                    fmt_bytes(1000 * ws.get('wire_kbps', 0)), wifi,
+                    fmt_bytes(dropped), 'usb ' if usb else 'wifi',
+                    fmt_bytes(sess.stats.rate if usb else 1000 * ws.get('wire_kbps', 0)), wifi,
                     fmt_bytes(sess.stats.bytes), fmt_bytes(sess.stats.rate),
                     p.get('paragraphs', '-'), p.get('lost', '-'), p.get('laps', '-'),
                     sess.stats.records, fmt_bytes(max(0, sess.stats.backlog))))

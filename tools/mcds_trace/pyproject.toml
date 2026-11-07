@@ -12,6 +12,9 @@ dependencies = [
     "flet[all]>=1.0.1",
     "pyelftools>=0.33",
     "pyarrow>=25.0.1",
+    "pyusb>=1.2",
+    "libusb-package>=1.0.26",
+    "numba>=0.61",
 ]
 
 [project.scripts]

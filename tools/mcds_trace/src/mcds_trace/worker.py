@@ -1,19 +1,20 @@
 """The trace data path, run apart from the UI.
 
-A worker owns everything between the probe and the samples: the WebSocket
-stream, the capture file, the decoder, the event log and the extractor.  It
-sends the samples it produces to the UI in batches over a
-multiprocessing Connection and answers requests (a new signal selection,
-the accessed addresses).  In a separate process it has its own interpreter
-lock, so neither a busy UI nor rendering can slow the stream down - the file
-stays complete and the probe's buffer drains.  Tests run the same code in a
-thread.
+A worker owns everything between the probe and the samples: the stream (the
+esp32jtag's WebSocket, or the tdm probe's USB endpoint), the capture file,
+the decoder, the event log and the extractor.  It sends the samples it
+produces to the UI in batches over a multiprocessing Connection and answers
+requests (a new signal selection, the accessed addresses, and the commands
+for a tdm probe, whose USB interface it holds).  In a separate process it
+has its own interpreter lock, so neither a busy UI nor rendering can slow
+the stream down - the file stays complete and the probe's buffer drains.
+Tests run the same code in a thread.
 
 Messages to the UI: ('ready',) ('error', text) ('config', dict)
 ('batch', series, gaps, t_end, samples, stats) ('store', series, gaps, t_end,
 samples) ('addresses', dict) ('progress', fraction) ('loaded', stats)
-('done', stats, error).  Requests: ('select', signals) ('addresses',)
-('stop',) ('abort',) ('close',).
+('done', stats, error) ('ctl', result).  Requests: ('select', signals)
+('addresses',) ('ctl', method, args) ('stop',) ('abort',) ('close',).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from dataclasses import asdict
 
 import struct
 
-from . import capfile
+from . import capfile, fastextract
 from .capfile import REC_HEADER, REC_MAGIC, write_header
 from .session import Probe, RecordStream, SessionStats, _Pipeline
 from .zframe import QUERY, unframe
@@ -146,20 +147,17 @@ class _Serve:
         return kind
 
 
-def live_main(conn, host: str, auth: str, out_path: str, signals: list,
-              log_limit: int | None, max_backlog: int) -> None:
-    """The stream is connected before the trace starts, so its first
-    paragraphs cannot overflow the probe's buffer while this process comes
-    up: connect, drop what an earlier session left, report 'ready', then wait
-    for ('begin', config) - the trace has started - to write the file."""
-    import websocket
-    st = SessionStats()
-    try:
-        f = open(out_path, 'wb')
-    except OSError as e:
-        conn.send(('error', 'capture file: %s' % e))
-        return
-    try:
+class _StreamClosed(Exception):
+    pass
+
+
+class _WsStream:
+    """The esp32jtag: /ws/trace (LZ4-framed); commands are HTTP, sent by the UI."""
+
+    def __init__(self, host: str, auth: str):
+        import websocket
+        self._ws_mod = websocket
+        self.host, self.auth = host, auth
         hdr = {'Authorization': 'Basic ' + base64.b64encode(auth.encode()).decode()}
         # Connect and handshake get seconds: over Wi-Fi, with the probe's one
         # HTTP task serving other requests, 0.2 s was often not enough ("trace
@@ -176,6 +174,106 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
             except websocket.WebSocketTimeoutException:
                 pass
         ws.settimeout(1)
+        self.ws = ws
+
+    def recv(self) -> bytes | None:
+        websocket = self._ws_mod
+        try:
+            frame = self.ws.recv()
+        except websocket.WebSocketTimeoutException:
+            return None
+        except (websocket.WebSocketConnectionClosedException, OSError):
+            raise _StreamClosed('the probe closed the trace stream') from None
+        if not frame or isinstance(frame, str):
+            return None
+        return unframe(frame)
+
+    def control(self, method: str, args: tuple):
+        raise RuntimeError('the esp32jtag is controlled over HTTP, not through the worker')
+
+    def stop_trace(self) -> None:
+        Probe(self.host, self.auth, timeout=10).stop()
+
+    def close(self) -> None:
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+class _TdmStream:
+    """The tdm probe over USB: the trace endpoint, and the commands (the
+    worker owns the device for the session; see tdm.TdmSource)."""
+
+    def __init__(self, serial: str | None):
+        from .tdm import TdmProbe
+        self.probe = TdmProbe(serial)
+        self._closed = False
+        self.probe.drain()
+
+    def recv(self) -> bytes | None:
+        from .tdm import TdmError
+        if self._closed:
+            raise _StreamClosed('closed')
+        try:
+            return self.probe.read(200)
+        except TdmError as e:
+            raise _StreamClosed(str(e)) from None
+
+    def control(self, method: str, args: tuple):
+        if self._closed:
+            raise RuntimeError('the trace worker has released the probe')
+        if method not in ('status', 'config', 'post_config', 'start', 'stop'):
+            raise RuntimeError('unknown probe command %r' % method)
+        return getattr(self.probe, method)(*args)
+
+    def stop_trace(self) -> None:
+        self.probe.stop()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self.probe.close()
+
+
+def open_stream(spec: tuple):
+    """('ws', host, auth) or ('tdm', serial)."""
+    if spec[0] == 'tdm':
+        return _TdmStream(spec[1])
+    return _WsStream(spec[1], spec[2])
+
+
+def _answer_control(conn, stream, cmd) -> None:
+    """('ctl', method, args) from the UI: a probe command (tdm)."""
+    try:
+        result = stream.control(cmd[1], tuple(cmd[2]))
+    except Exception as e:
+        conn.send(('failed', '%s: %s' % (cmd[1], e)))
+        return
+    conn.send(('ctl', result))
+
+
+def live_main(conn, spec: tuple, out_path: str, signals: list,
+              log_limit: int | None, max_backlog: int) -> None:
+    """The stream is connected before the trace starts, so its first
+    paragraphs cannot overflow the probe's buffer while this process comes
+    up: connect, drop what an earlier session left, report 'ready', then wait
+    for ('begin', config) - the trace has started - to write the file.
+    spec: see open_stream; a tdm probe's commands ('ctl') are answered here."""
+    st = SessionStats()
+    try:
+        f = open(out_path, 'wb')
+    except OSError as e:
+        conn.send(('error', 'capture file: %s' % e))
+        return
+    try:
+        fastextract.warm()              # before the stream: a cold JIT takes seconds
+    except Exception as e:
+        conn.send(('error', 'decoder: %s' % e))
+        f.close()
+        return
+    try:
+        stream = open_stream(spec)
     except Exception as e:
         f.close()
         conn.send(('error', 'trace stream: %s' % e))
@@ -212,16 +310,13 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                     elif time.monotonic() - idle_since > QUIET_S:
                         break               # the stream has gone quiet after stop
                 try:
-                    frame = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    frame = None
-                except (websocket.WebSocketConnectionClosedException, OSError):
+                    frame = stream.recv()
+                except _StreamClosed as e:
                     if not stop.is_set():
-                        error.append('the probe closed the trace stream')
+                        error.append(str(e))
                     break
                 now = time.monotonic()
-                if frame and not isinstance(frame, str):
-                    frame = unframe(frame)
+                if frame:
                     with lock:
                         if begun[0]:
                             take(frame)
@@ -251,15 +346,15 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
             if cmd[0] == 'begin':
                 config = cmd[1]
                 break
+            if cmd[0] == 'ctl':
+                _answer_control(conn, stream, cmd)
+                continue
             if cmd[0] in ('abort', 'close', 'stop'):
                 raise EOFError
     except (EOFError, OSError):
         stop.set()
-        try:
-            ws.close()
-        except Exception:
-            pass
         rx_thread.join(timeout=QUIET_S + 2)
+        stream.close()
         f.close()
         return
     pipe = _Pipeline(config, signals, log_limit=log_limit)
@@ -280,28 +375,33 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
         while True:
             try:
                 while conn.poll():
-                    kind = serve.handle(conn.recv(), st)
+                    cmd = conn.recv()
+                    if cmd[0] == 'ctl':
+                        _answer_control(conn, stream, cmd)
+                        continue
+                    kind = serve.handle(cmd, st)
                     if kind == 'stop':
                         stop.set()
                     elif kind in ('abort', 'close'):
                         stop.set()
                         decoding = False
-                        try:
-                            ws.close()
-                        except Exception:
-                            pass
+                        if spec[0] == 'tdm':
+                            try:
+                                stream.stop_trace()      # nobody records it now
+                            except Exception:
+                                pass
+                        rx_thread.join(timeout=2)
+                        stream.close()
             except (EOFError, OSError):                  # the UI is gone
                 if not stop.is_set():
                     try:
-                        Probe(host, auth, timeout=10).stop()   # nobody records it now
+                        stream.stop_trace()              # nobody records it now
                     except Exception:
                         pass
                 stop.set()
                 decoding = False
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+                rx_thread.join(timeout=2)
+                stream.close()
             try:
                 item = q.get(timeout=BATCH_S)
             except queue.Empty:
@@ -327,7 +427,7 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
                         dropped += len(nxt)
                     with lock:
                         st.backlog -= dropped
-                    st.decode_skipped += dropped // 1048
+                    st.decode_skipped += dropped // (REC_HEADER.size + 1024)
                     rs = RecordStream()
                     skip_gap = True
                 else:
@@ -360,10 +460,7 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
         stop.set()
     finally:
         rx_thread.join(timeout=QUIET_S + 5)
-        try:
-            ws.close()
-        except Exception:
-            pass
+        stream.close()                  # a tdm probe is free for the UI again
         try:
             f.close()
         except (OSError, ValueError):
@@ -374,7 +471,10 @@ def live_main(conn, host: str, auth: str, out_path: str, signals: list,
             # Stay for re-selections of the recorded trace until the UI
             # closes the session.
             while decoding:
-                if serve.handle(conn.recv(), st) in ('abort', 'close'):
+                cmd = conn.recv()
+                if cmd[0] == 'ctl':
+                    _answer_control(conn, stream, cmd)     # fails: the probe is released
+                elif serve.handle(cmd, st) in ('abort', 'close'):
                     break
         except (EOFError, OSError, BrokenPipeError):
             pass
@@ -390,6 +490,7 @@ def file_main(conn, path: str, signals: list) -> None:
         conn.send(('error', str(e)))
         return
     conn.send(('config', config))
+    fastextract.warm()
     pipe = _Pipeline(config, signals)
     serve = _Serve(conn, pipe)
     n = len(recs)

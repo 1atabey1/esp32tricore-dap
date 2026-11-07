@@ -16,6 +16,7 @@ uv run mcds-trace-ui run.mcds                          # open a capture
 uv run mcds-trace-ui --web                             # in the browser instead of a window
 uv run mcds-trace-ui --serve --port 8550 --bind 0.0.0.0   # serve only, open http://HOST:8550
 uv run mcds-trace-ui --host 192.168.178.99 --workspace bench.mcdsws
+uv run mcds-trace-ui --host tdm                         # the tricore-debug-machine on USB
 uv run flet run                                         # the same through Flet (src/main.py)
 uv run flet run --web -- --elf /abs/path/app.elf        # app arguments after --
 ```
@@ -23,8 +24,31 @@ uv run flet run --web -- --elf /abs/path/app.elf        # app arguments after --
 `flet run` starts the app with `.flet/storage/data` as working directory, so
 pass absolute paths.
 
-Pure Python (flet, matplotlib, numpy, Pillow, pyelftools); `uv` resolves
-everything on each platform, nothing is compiled.
+Python (flet, matplotlib, numpy, Pillow, pyelftools, pyusb); `uv` resolves
+everything on each platform, nothing needs a compiler. The decoder and the
+signal extraction are compiled at run time by numba (cached after the first
+start, about 4 s); without numba (or with `MCDS_TRACE_NO_JIT=1`) the same
+code paths run in plain Python, at a tenth of the speed.
+
+### Probes
+
+The **Probe** field (and `--host`, and the CLI's HOST) takes either probe:
+
+* **esp32jtag**: its address. Configuration and start/stop over HTTP, the
+  trace over the `/ws/trace` WebSocket (LZ4-framed).
+* **tricore-debug-machine** ("tdm"): `tdm`, or `tdm:SERIAL` to pick one of
+  several. It is the same trace firmware behind USB (vendor interface 3;
+  WinUSB binds on Windows without a driver install, libusb comes from the
+  `libusb-package` wheel). The trace runs on the probe's 48 MHz FPGA bin,
+  where wide fast mode is reliable (a DAP bit every 48 MHz clock, as on the
+  esp32jtag, so *Fast* and the divider mean the same); starting a trace
+  loads that bin and attaches the target if needed. The target has to be
+  powered (the status shows the probe's 24 V output). A USB interface has
+  one owner: while a trace runs, its worker process holds the probe and
+  answers the UI's commands; close other tools that use interface 3
+  (`tdm_dap.py`), the CDC ports (GDB, console) are not affected. Measured
+  on a TC38x, the inverter object (CPU2, 0x140 bytes, 80 signals): 4.8 MB/s
+  traced, nothing lost, the live view never behind.
 
 The trace data path - the probe's stream, the capture file, decoding and
 signal extraction - runs in a worker process of its own, so neither a busy
@@ -96,8 +120,10 @@ stream is LZ4-framed (`?z=1`) and compressed only while that is faster than
 sending it raw, and the probe's 4 MB buffer absorbs bursts; once it is full
 the status line says *WiFi-limited* with the bytes dropped. A 30 s trace of 27 members of a 20 kHz task
 (2.2 MB/s) arrives without a gap. The application decodes and extracts about
-4 MB/s; if it ever falls behind, it skips ahead in the live view only - the
-file is always complete. After Stop, the whole file is loaded for review if
+60 MB/s of trace (80 signals; a 24 MB capture replayed through the live
+worker at 12 and 25 MB/s left no backlog), well above the ~12 MB/s a wide
+fast DAP can deliver; if it ever falls behind, it skips ahead in the live
+view only - the file is always complete. After Stop, the whole file is loaded for review if
 the live view had skipped, trimmed its history or dropped old events.
 
 ## Command line
@@ -106,6 +132,7 @@ the live view had skipped, trimmed its history or dropped old events.
 uv run mcds-trace capture 192.168.178.99 run.mcds --cpu 2 --watch 0x5000220C:2:w:mCyclesUntilSecond --seconds 2
 uv run mcds-trace capture 192.168.178.99 run.mcds --config cfg.json --mode compact --seconds 2
 uv run mcds-trace capture 192.168.178.99 run.mcds --seconds 5 --start   # config already on the probe
+uv run mcds-trace capture tdm run.mcds --cpu 2 --watch 0x50002208:0x140:w:app --seconds 5   # over USB
 uv run mcds-trace decode run.mcds                     # summary: message types, gaps, ERR, clock
 uv run mcds-trace decode run.mcds --plot              # value/time per variable + interval histogram
 uv run mcds-trace decode run.mcds --plot out.png --window 0.10:0.11
@@ -124,10 +151,14 @@ The web page writes the same layout.
 | Layer | Module |
 |---|---|
 | paragraph → messages (`<length> <core_ID> <trace_type> <data>`, LSB first, nibble packed) | `tram.py` |
-| DTU (DTW/DTR/DTWD/DTRD/DTA/…), WTU (WPS/WPM/EVC), TSU (TSR/TSA), compression, time | `decode.py` |
+| DTU (DTW/DTR/DTWD/DTRD/DTA/…), WTU (WPS/WPM/EVC), TSU (TSR/TSA), compression, time (the reference) | `decode.py` |
+| the same, compiled (numba): batches of paragraphs to numpy event columns | `fastdecode.py` |
 | ELF/DWARF variables and types, browsable tree, leaf decoding | `elfsyms.py` |
 | shadow memory, per-signal samples, slot planning | `signals.py` |
+| the extraction on event columns, compiled | `fastextract.py` |
 | live capture / capture files, event log, probe HTTP | `session.py` |
+| the trace data path in its own process (stream, file, decoding) | `worker.py` |
+| the tricore-debug-machine probe over USB | `tdm.py` |
 | decimated off-screen plot frames | `plotrender.py` |
 | the application | `ui/` |
 | CLI series, CSV, plots | `analyse.py`, `cli.py` |
