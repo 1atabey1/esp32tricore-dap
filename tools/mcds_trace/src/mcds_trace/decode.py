@@ -102,11 +102,22 @@ class Decoder:
         self.stats = DecodeStats()
         self.tsr = None            # last reconstructed TSR (32 bit)
         self.epoch = 0             # unwrap for the 32-bit counter
+        self.last_cycles = -1      # the latest time decoded (restart continues after it)
         self.reset()
         self._prev_first = None    # first absolute TSR of the paragraph before
         self._interval = 0.0       # running mean of the paragraph interval
         self._intervals = 0
         self._types = [0] * len(_TYPES)
+
+    def restart(self) -> None:
+        """The trace restarted (capfile.FLAG_RESTART): its time stamps start
+        from zero again.  Continue the timeline right after the last time
+        seen (the pause itself is not measured) and forget the TSR history."""
+        last = self.last_cycles
+        self.reset()
+        self.tsr = None
+        self.epoch = last + 1 if last >= 0 else 0
+        self._prev_first = None
 
     def reset(self) -> None:
         """Forget every compression base (after a gap).  The TSR history is
@@ -479,6 +490,8 @@ class Decoder:
 
         self.tsr, self.epoch, self.base_cycles, self.ticks, self.tsr_ok = (tsr, epoch, base,
                                                                             ticks, tsr_ok)
+        if base >= 0 and base + ticks > self.last_cycles:
+            self.last_cycles = base + ticks
         self.tsa, self.tsa_ok = tsa, tsa_ok
         self.wps, self.wps_ok, self.wpm, self.wpm_ok = wps, wps_ok, wpm, wpm_ok
         self.evc_id, self.evc_cnt, self.evc_ok = evc_id, evc_cnt, evc_ok
@@ -513,6 +526,8 @@ def decode_records(records: Iterable, tick_mode: bool = False) -> tuple[list[Eve
     records = list(records)
     legacy = not any(r.final for r in records)     # files from before the FINAL flag
     for k, rec in enumerate(records):
+        if getattr(rec, 'restart', False):
+            dec.restart()
         gap = rec.gap or (prev is not None and rec.seq != prev + 1)
         prev = rec.seq
         final = rec.final or (legacy and k == len(records) - 1)

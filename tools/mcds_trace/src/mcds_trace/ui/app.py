@@ -113,7 +113,9 @@ def hexaddr(a: int) -> str:
 def link_text(cfg: dict) -> str:
     """What the probe's session got: DAP width and clock, and the FIFO drain."""
     st = cfg.get('stats') or {}
-    clock = 'fast 48 MHz' if cfg.get('fast_active') else dict(DIVS).get(cfg.get('dap_div', 0), 'DIV')
+    # fast_mhz: the tdm probe's handshake reports the bin it settled on
+    clock = ('fast %d MHz' % cfg.get('fast_mhz', 48) if cfg.get('fast_active')
+             else dict(DIVS).get(cfg.get('dap_div', 0), 'DIV'))
     return '%s, %s, %s drain' % ('wide' if cfg.get('wide_active') else 'narrow', clock,
                                   'two-line' if st.get('dual') else 'one-line')
 

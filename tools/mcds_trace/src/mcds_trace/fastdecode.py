@@ -98,7 +98,8 @@ class Columns:
 _U_TSR, _U_TSA, _U_WPS, _U_WPM, _U_EVC_ID, _U_EVC_CNT, _U_D0A, _U_D0D, _U_D1A, _U_D1D = range(10)
 # int64 state
 (_S_TSR_SET, _S_EPOCH, _S_BASE, _S_TICKS, _S_TSR_OK, _S_TSA_OK, _S_WPS_OK, _S_WPM_OK,
- _S_EVC_OK, _S_PREV_FIRST, _S_INTERVALS, _S_D0AOK, _S_D0DOK, _S_D1AOK, _S_D1DOK) = range(15)
+ _S_EVC_OK, _S_PREV_FIRST, _S_INTERVALS, _S_D0AOK, _S_D0DOK, _S_D1AOK, _S_D1DOK,
+ _S_LAST) = range(16)
 # counters
 (_C_PARAS, _C_MSGS, _C_UNKNOWN, _C_ERRORS, _C_LOSTM, _C_GAPS, _C_BACK, _C_UNSYNC, _C_TORN,
  _C_LAPS, _C_MALF) = range(11)
@@ -536,6 +537,8 @@ def _decode(buf, poff, flags, tick_mode, us, st, fs, cnt, malf, symlen, len1, su
         st[_S_BASE] = base
         st[_S_TICKS] = ticks
         st[_S_TSR_OK] = 1 if tsr_ok else 0
+        if base >= 0 and base + ticks > st[_S_LAST]:
+            st[_S_LAST] = base + ticks
         # -- end of the paragraph (decode.Decoder.rows) --
 
         if suspect or cnt[_C_UNKNOWN] != unk0 or cnt[_C_MALF] != malf0:
@@ -571,7 +574,7 @@ class FastDecoder:
     def __init__(self, tick_mode: bool = False):
         self.tick_mode = tick_mode
         self._us = np.zeros(10, dtype=np.uint64)
-        self._st = np.zeros(15, dtype=np.int64)
+        self._st = np.zeros(16, dtype=np.int64)
         self._st[_S_BASE] = -1
         self._st[_S_PREV_FIRST] = -1
         self._fs = np.zeros(1, dtype=np.float64)
@@ -579,6 +582,20 @@ class FastDecoder:
         self._malf = np.zeros((32, 8, 8), dtype=np.int64)
         self._stats = DecodeStats()
         self._stats_at = -1
+        self._st[_S_LAST] = -1
+
+    def restart(self) -> None:
+        """As decode.Decoder.restart: continue the timeline after the last
+        time seen, TSR history and compression bases forgotten."""
+        last = int(self._st[_S_LAST])
+        self._us[:] = 0
+        keep = (_S_INTERVALS, _S_LAST)
+        for i in range(len(self._st)):
+            if i not in keep:
+                self._st[i] = 0
+        self._st[_S_BASE] = -1
+        self._st[_S_PREV_FIRST] = -1
+        self._st[_S_EPOCH] = last + 1 if last >= 0 else 0
 
     @property
     def stats(self) -> DecodeStats:
@@ -594,6 +611,10 @@ class FastDecoder:
                            for co, tt, b in zip(*np.nonzero(self._malf))}
             self._stats_at = c[_C_PARAS] + c[_C_GAPS] + c[_C_TORN]
         return self._stats
+
+    @property
+    def last_cycles(self) -> int:
+        return int(self._st[_S_LAST])
 
     def decode(self, payloads: list[bytes], gaps, finals) -> Columns:
         """Paragraphs in order (gap: data was lost before it; final: it may end

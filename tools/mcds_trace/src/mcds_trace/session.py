@@ -257,6 +257,21 @@ class _Pipeline:
             self._records_in(recs, forced_gap, last_is_final)
 
     def _records_in(self, recs, forced_gap: bool, last_is_final: bool = False) -> None:
+        # A restarted trace (capfile.FLAG_RESTART) starts its time again: the
+        # decoder continues the timeline there, so decode up to it first.
+        start = 0
+        for i in range(1, len(recs)):
+            if recs[i].restart:
+                self._decode(recs[start:i], forced_gap, False)
+                forced_gap = False
+                start = i
+        self._decode(recs[start:], forced_gap, last_is_final)
+
+    def _decode(self, recs, forced_gap: bool, last_is_final: bool) -> None:
+        if not recs:
+            return
+        if recs[0].restart:
+            self.decoder.restart()
         payloads, gaps, finals = [], [], []
         for rec in recs:
             gaps.append(forced_gap or rec.gap

@@ -21,6 +21,10 @@ REC_MAGIC = 0x50525444          # "DTRP"
 REC_HEADER = struct.Struct('<IIIHHI')
 FLAG_GAP = 1 << 0
 FLAG_FINAL = 1 << 1               # the session's last paragraph (may end early)
+# tdm probe: the first paragraph of a trace restarted within the session (its
+# clock handshake stepped down a bin): the miniMCDS was reset, its time stamps
+# start from zero again.  Comes with FLAG_GAP.
+FLAG_RESTART = 1 << 2
 
 
 @dataclass
@@ -38,6 +42,10 @@ class Record:
     @property
     def final(self) -> bool:
         return bool(self.flags & FLAG_FINAL)
+
+    @property
+    def restart(self) -> bool:
+        return bool(self.flags & FLAG_RESTART)
 
 
 def write_header(f: BinaryIO, config: dict) -> None:

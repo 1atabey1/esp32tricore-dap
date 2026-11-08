@@ -162,3 +162,38 @@ def test_real_capture_matches():
         pars.append((r.payload, r.gap or (prev is not None and r.seq != prev + 1), r.final))
         prev = r.seq
     _same(pars, tick_mode=config.get('timestamps') == 'ticks', batch=64)
+
+
+def test_restart_continues_the_timeline():
+    """A trace restarted within the session (tdm probe's clock handshake
+    stepping down): time stamps start from zero again.  Both decoders carry
+    on after the last time seen instead of calling every paragraph torn."""
+    first = [(_tsr_par(5_000_000 + 1000 * k, 5_000_500 + 1000 * k), k == 0, True) for k in range(6)]
+    second = [(_tsr_par(100 + 1000 * k, 600 + 1000 * k), k == 0, True) for k in range(6)]
+    for make in (Decoder, FastDecoder):
+        dec = make()
+        rows = []
+        for par, gap, final in first:
+            rows += dec.rows(par, 0, gap, final)
+        dec.restart()
+        for par, gap, final in second:
+            rows += dec.rows(par, 0, gap, final)
+        assert dec.stats.torn == 0, make.__name__
+        times = [r[0] for r in rows if r[0] >= 0]
+        assert times == sorted(times) and len(times) == 24, make.__name__
+        assert times[12] == times[11] + 1 + 100, make.__name__   # right after, plus its own offset
+
+
+def test_pipeline_splits_at_restart_records():
+    from mcds_trace.capfile import FLAG_GAP, FLAG_RESTART, Record
+    from mcds_trace.session import _Pipeline
+    from mcds_trace.signals import Signal
+    recs = [Record(k, 0, (FLAG_GAP if k == 0 else 0) | 2, 0, _tsr_par(5_000_000 + 1000 * k))
+            for k in range(5)]
+    recs += [Record(k, 0, (FLAG_GAP | FLAG_RESTART if k == 0 else 0) | 2, 0, _tsr_par(100 + 1000 * k))
+             for k in range(5)]
+    pipe = _Pipeline({'emu_hz': 1000}, [Signal('v', 'v', 0x70001234, 1)])
+    pipe.records_in(recs)
+    assert pipe.decoder.stats.torn == 0
+    t, _ = pipe.store.snapshot('v')
+    assert len(t) == 10 and all(b > a for a, b in zip(t, t[1:]))

@@ -21,9 +21,13 @@ probe for a live session (stream and commands); `TdmSource` is the UI side,
 which passes its commands to the worker while it holds the probe and opens
 the probe itself otherwise.
 
-Tracing runs on the probe's 48 MHz FPGA bin: fast mode (a DAP bit every
-fabric clock) is reliable there, and the DAP divider means what it means on
-the esp32jtag (0: 24 MHz).  `start` loads that bin and attaches if needed.
+Fast mode (a DAP bit every FPGA fabric clock) uses the probe's clock
+handshake: TRACE_START with the auto flag tries fast mode on each FPGA bin
+from the fastest down and keeps the first whose drain holds up (steps down
+later if it starts failing); config() reports the bin (`fast_mhz`).
+Without fast mode the trace runs on the 48 MHz bin, where the DAP divider
+means what it means on the esp32jtag (0: 24 MHz).  Firmware without the
+handshake ignores the flag and traces on the bin `prepare` loads (48 MHz).
 """
 
 from __future__ import annotations
@@ -325,7 +329,8 @@ class TdmProbe:
         return out
 
     def prepare(self, bin_mhz: int = TRACE_BIN_MHZ) -> dict:
-        """The trace bin loaded and the target attached."""
+        """The trace bin loaded and the target attached (with fast mode the
+        probe's handshake picks the bin itself, starting from this one)."""
         s = self.session()
         if bin_mhz and s['bin_mhz'] != bin_mhz:
             if s['attached']:
@@ -344,16 +349,28 @@ class TdmProbe:
         return s
 
     def start(self) -> str:
+        if self.cfg is None:
+            self.cfg = unpack_config(self._config_raw())
+        fast = bool(self.cfg.get('fast'))
         try:
             self.prepare()
         except TdmError as e:
             return 'failed: %s' % e
-        status, d = self.cmd('TRACE_START', timeout=30000)
+        # auto: the probe picks the bin (it tries them, so this takes up to ~1 s)
+        status, d = self.cmd('TRACE_START', b'\x01' if fast else b'', timeout=60000)
         if status != 0:
             return 'failed: TRACE_START %s' % ESP_ERR.get(status, hex(status))
         if len(d) < INFO_SIZE:
             return 'failed: TRACE_START answered %d bytes, expected %d' % (len(d), INFO_SIZE)
         self.info = unpack_info(d)
+        if len(d) >= INFO_SIZE + 3:
+            bin_mhz, attempts = struct.unpack_from('<HB', d, INFO_SIZE)
+            self.info['bin_mhz'] = bin_mhz
+            self.info['attempts'] = attempts
+            if self.info['fast_active']:
+                self.info['fast_mhz'] = bin_mhz
+        elif self.info['fast_active']:
+            self.info['fast_mhz'] = TRACE_BIN_MHZ
         return 'started emu_hz=%d wide=%d fast=%d' % (self.info['emu_hz'],
                                                       self.info['wide_active'],
                                                       self.info['fast_active'])
