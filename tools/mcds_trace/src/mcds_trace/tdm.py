@@ -55,7 +55,10 @@ ESP_ERR = {-1: 'FAIL', 0x101: 'NO_MEM', 0x102: 'INVALID_ARG', 0x103: 'INVALID_ST
 # lays them out (short enums); the probe reports the config's size.
 _CFG_HEAD = struct.Struct('<9B3x')            # source cpu mode payload timestamps masters div wide fast
 _CFG_SLOT = struct.Struct('<B24s3xIIBBBxIIIB3x')
-CFG_SIZE = _CFG_HEAD.size + 2 * _CFG_SLOT.size          # 124
+_CFG_PROG = struct.Struct('<BBHHBxIIIIHH')    # mode window cft_vshort cft_short exclude lo hi
+                                              # xlo xhi duty_on_us duty_period_us
+CFG_SIZE = _CFG_HEAD.size + 2 * _CFG_SLOT.size + _CFG_PROG.size     # 152
+PROG_MODES = ('off', 'flow', 'calls')
 _INFO_HEAD = struct.Struct('<IIBB2x')
 _SNAP_HEAD = struct.Struct('<IH2x')
 SNAPSHOT_BYTES = 2048
@@ -132,8 +135,18 @@ def pack_config(cfg: dict) -> bytes:
                                   bool(v.get('enabled', False)), _num(v.get('lo'), 0),
                                   _num(v.get('hi'), 0xFFFFFFFF), _num(v.get('mask'), 0xFFFFFFFF),
                                   bool(v.get('signed', False))))
-    if not enabled:
-        raise TdmError('no enabled slot')
+    pg = cfg.get('program') if isinstance(cfg.get('program'), dict) else {}
+    pmode = _pick(pg.get('mode'), PROG_MODES)
+    win = pg.get('window') if isinstance(pg.get('window'), (list, tuple)) else None
+    exc = pg.get('exclude') if isinstance(pg.get('exclude'), (list, tuple)) else None
+    out.append(_CFG_PROG.pack(pmode, win is not None, _num(pg.get('cft_vshort'), 0) & 0x3FF,
+                              _num(pg.get('cft_short'), 0) & 0x3FF, exc is not None,
+                              _num(win[0], 0) if win else 0, _num(win[1], 0) if win else 0,
+                              _num(exc[0], 0) if exc else 0, _num(exc[1], 0) if exc else 0,
+                              _num(pg.get('duty_on_us'), 0) & 0xFFFF,
+                              _num(pg.get('duty_period_us'), 0) & 0xFFFF))
+    if not enabled and not pmode:
+        raise TdmError('no enabled slot and no program trace')
     return b''.join(out)
 
 
@@ -153,6 +166,13 @@ def unpack_config(raw: bytes) -> dict:
             'access': 'rw' if rd and wr else 'r' if rd else 'w',
             'value': {'enabled': bool(ven), 'lo': '0x%08X' % lo, 'hi': '0x%08X' % hi,
                       'mask': '0x%08X' % mask, 'signed': bool(sgn)}})
+    if len(raw) >= CFG_SIZE:
+        (pmode, win, vs, sh, exc, lo, hi, xlo, xhi, don,
+         dper) = _CFG_PROG.unpack_from(raw, CFG_SIZE - _CFG_PROG.size)
+        cfg['program'] = {'mode': PROG_MODES[pmode % 3], 'cft_vshort': vs, 'cft_short': sh,
+                          'window': ['0x%08X' % lo, '0x%08X' % hi] if win else None,
+                          'exclude': ['0x%08X' % xlo, '0x%08X' % xhi] if exc else None,
+                          'duty_on_us': don, 'duty_period_us': dper}
     return cfg
 
 

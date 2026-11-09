@@ -140,6 +140,34 @@ uv run mcds-trace decode run.mcds --csv events.csv --elf app.elf --signed
 uv run pytest                                         # decoder, DWARF, extraction, session tests
 ```
 
+## Program trace (tricore-debug-machine)
+
+Recorded by the probe's tool, analysed afterwards against the ELF that ran:
+
+```sh
+# full flow (coverage + calls), the idle loop traced away, in bursts the drain can take
+tdm_dap.py trace run.dtrp --program flow --cpu 2 --exclude 0x80051d06:0x80051d07     --bursts 100:397 --auto --seconds 5
+# function level only (compact function trace: short leaf functions send less)
+tdm_dap.py trace calls.dtrp --program calls --cpu 2 --cft 20:64 --auto --seconds 5
+uv run mcds-trace program run.dtrp --elf app.elf --cpu 2   # -> run.html, run.info, run.pftrace
+```
+
+- `--program flow`: PTU relative mode, an IPI per taken branch and an IPA after
+  indirect ones; the flow is rebuilt from the ELF's disassembly
+  (`tricore-elf-objdump`, from PATH, `MCDS_OBJDUMP` or WSL). Gives instruction
+  coverage and the full call view.
+- `--program calls`: subroutine mode (calls and returns only); `--cft V:S` drops
+  leaf functions up to V 16-bit units and returns of those up to S.
+- Volume: flow costs about two bytes per taken branch, more than a busy core's
+  drain can take. `--exclude LO:HI` (one range, IP comparator 1) traces an idle
+  loop away (`mcds-trace program` lists the hottest loops), `--window LO:HI`
+  keeps only one range, `--bursts ON:PERIOD` (microseconds, period up to ~430)
+  samples: each burst starts with a sync and is timed at both ends. Pick a
+  period that does not divide the application's task periods.
+- Output: an HTML coverage overview, an lcov tracefile (genhtml, VS Code
+  Coverage Gutters) and a Perfetto trace (`.pftrace`, ui.perfetto.dev; `--json`
+  for Chrome JSON). Coverage is what the trace saw execute.
+
 ## File format
 
 `MCDSCAP1 | u32 json_len | config JSON (incl. emu_hz, snapshot) | DTRP record*`;
@@ -157,6 +185,7 @@ The web page writes the same layout.
 | shadow memory, per-signal samples, slot planning | `signals.py` |
 | the extraction on event columns, compiled | `fastextract.py` |
 | live capture / capture files, event log, probe HTTP | `session.py` |
+| program trace: ELF code model (objdump), PTU flow decoding, coverage/Perfetto | `codemodel.py`, `ptrace.py`, `ptrace_export.py` |
 | the trace data path in its own process (stream, file, decoding) | `worker.py` |
 | the tricore-debug-machine probe over USB | `tdm.py` |
 | decimated off-screen plot frames | `plotrender.py` |

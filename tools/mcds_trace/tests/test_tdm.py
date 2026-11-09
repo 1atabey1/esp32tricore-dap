@@ -20,7 +20,7 @@ def test_config_layout_and_round_trip():
                                                'mask': '0xFF', 'signed': True}},
                      {'enabled': False}]}
     raw = tdm.pack_config(cfg)
-    assert len(raw) == tdm.CFG_SIZE == 124
+    assert len(raw) == tdm.CFG_SIZE == 152
     # as tricore-debug-machine's tdm_dap.py addresses it
     assert raw[0] == 1 and raw[1] == 2 and raw[6] == 3 and raw[7] == 1 and raw[8] == 0
     assert raw[12] == 1 and struct.unpack_from('<II', raw, 12 + 28) == (0x50002208, 0x140)

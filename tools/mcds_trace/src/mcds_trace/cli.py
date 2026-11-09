@@ -133,6 +133,73 @@ def cmd_decode(a) -> int:
     return 0
 
 
+def _emu_hz(a, config: dict) -> float:
+    if a.emu_hz:
+        return float(a.emu_hz)
+    if config.get('emu_hz'):
+        return float(config['emu_hz'])
+    import os
+    import struct
+    info = a.file + '.info'                   # tdm_dap.py trace: dap_mcds_info_t next to it
+    if os.path.exists(info):
+        with open(info, 'rb') as f:
+            raw = f.read(4)
+        if len(raw) == 4:
+            return float(struct.unpack('<I', raw)[0])
+    return 0.0
+
+
+def cmd_program(a) -> int:
+    """Program trace: flow reconstruction against the ELF, coverage, Perfetto."""
+    import os
+    import time
+    from . import codemodel, ptrace, ptrace_export as px
+    t0 = time.time()
+    code = codemodel.load(a.elf)
+    print('%s: %d instructions, %d functions (%.1f s)' % (os.path.basename(a.elf), len(code),
+                                                          len(code.func_name), time.time() - t0))
+    config, stream = capfile.read_file(a.file)
+    recs = list(capfile.records(stream))
+    hz = _emu_hz(a, config)
+    t0 = time.time()
+    dec = ptrace.decode_records(recs, code, hz, a.mode)
+    print('mode: %s' % ('calls (subroutine trace)' if dec.calls_mode else 'flow'))
+    st = dec.stats
+    lost = sum(r.lost for r in recs)
+    print('%d records (%d paragraphs lost in the probe), decoded in %.1f s'
+          % (len(recs), lost, time.time() - t0))
+    print(st.summary())
+    if len(dec.anchors_cyc) >= 2 and hz:
+        span = (dec.anchors_cyc[-1] - dec.anchors_cyc[0]) / hz
+        print('time: %.6f s between the first and last time stamp (emulation clock %.2f MHz)'
+              % (span, hz / 1e6))
+    window = None
+    if a.window:
+        lo, _, hi = a.window.partition(':')
+        window = (int(lo, 0), int(hi, 0))
+    cov = px.coverage(dec, window)
+    print(px.summary_text(cov, a.top))
+    loops = px.hot_loops(dec)
+    if loops:
+        print('hottest loops (trace them away with tdm_dap.py trace --exclude LO:HI):')
+        for lo, hi, n, fn in loops:
+            print('  %10d  --exclude 0x%08x:0x%08x  %s' % (n, lo, hi, fn))
+    base = a.out or os.path.splitext(a.file)[0]
+    title = '%s - %s' % (os.path.basename(a.file), os.path.basename(a.elf))
+    if not a.no_coverage:
+        px.write_lcov(cov, base + '.info')
+        px.write_html(cov, base + '.html', title, st.summary())
+        print('coverage: %s.html, %s.info (lcov)' % (base, base))
+    cpu = a.cpu if a.cpu is not None else int(config.get('cpu', 0) or 0)
+    if not a.no_perfetto:
+        n = px.write_perfetto(dec, base + '.pftrace', cpu)
+        print('perfetto: %s.pftrace (%d slices; open in ui.perfetto.dev)' % (base, n))
+        if a.json:
+            px.write_chrome_json(dec, base + '.json', cpu)
+            print('chrome json: %s.json' % base)
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog='mcds-trace', description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -170,6 +237,25 @@ def main(argv=None) -> int:
     d.add_argument('--signed', action='store_true', help='show values as signed')
     d.add_argument('--dump', type=int, default=0, help='print the first N events')
     d.set_defaults(fn=cmd_decode)
+
+    g = sub.add_parser('program', help='analyse a program trace: coverage and a Perfetto trace',
+                       description='Reconstruct the program flow of a PTU_TC program trace '
+                       '(tdm_dap.py trace --program) against the ELF that ran: code coverage '
+                       '(HTML overview, lcov) and the call view as a Perfetto trace.')
+    g.add_argument('file', help='the recording (.dtrp from tdm_dap.py, or a capture file)')
+    g.add_argument('--elf', required=True, help='the ELF the traced core ran')
+    g.add_argument('--out', help='output base name (default: the recording without extension)')
+    g.add_argument('--cpu', type=int, help='the traced core, for the track name')
+    g.add_argument('--emu-hz', dest='emu_hz', type=float,
+                   help='emulation clock (default: from FILE.info or the capture header)')
+    g.add_argument('--mode', choices=['auto', 'flow', 'calls'], default='auto',
+                   help='what the recording is (default: told by its messages)')
+    g.add_argument('--window', metavar='LO:HI', help='report coverage only for this address range')
+    g.add_argument('--top', type=int, default=20, help='functions in the summary')
+    g.add_argument('--json', action='store_true', help='also write Chrome JSON')
+    g.add_argument('--no-coverage', action='store_true')
+    g.add_argument('--no-perfetto', action='store_true')
+    g.set_defaults(fn=cmd_program)
 
     a = p.parse_args(argv)
     return a.fn(a)
