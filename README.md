@@ -36,8 +36,11 @@ default FPGA image.
 | Debug | `tricore-elf-gdb app.elf` → `target extended-remote <probe>:4242` → `attach 1` |
 | Trace | `http://<probe>/datatrace.html`, or the host app below |
 
+The host app lives in the [tricore-debug-machine repository](https://github.com/1atabey1/tricore-debug-machine/tree/board-bringup/sw/tools/mcds_trace)
+(`sw/tools/mcds_trace`):
+
 ```bash
-cd tools/mcds_trace
+cd tricore-debug-machine/sw/tools/mcds_trace
 uv run mcds-trace-ui --elf app.elf              # desktop window (Windows, Linux, macOS)
 uv run mcds-trace-ui --web                      # in the browser
 uv run mcds-trace capture <probe> run.mcds ...  # command line
@@ -52,7 +55,7 @@ offline review. Subplots take any number of signals.
 | | |
 |---|---|
 | [docs/tricore_usage.md](docs/tricore_usage.md) | All endpoints, GDB, flash, trace, diagnostics |
-| [tools/mcds_trace/README.md](tools/mcds_trace/README.md) | Host application and command line |
+| [mcds_trace](https://github.com/1atabey1/tricore-debug-machine/tree/board-bringup/sw/tools/mcds_trace) | Host application and command line (tricore-debug-machine repository) |
 | [components/dap_probe/README.md](components/dap_probe/README.md) | Firmware internals, FPGA link, limits |
 | [docs/minimcds_trace_spec.md](docs/minimcds_trace_spec.md) | Trace message format (own decoder, no Infineon libraries) |
 
@@ -62,7 +65,7 @@ offline review. Subplots take any number of signals.
 components/dap_probe/   DAP protocol, TriCore GDB target, flash, miniMCDS trace
 fpga/dap_master/        DAP master RTL (iCE40UP5K)
 main/network/           Web pages and HTTP / WebSocket API
-tools/mcds_trace/       Host decoder, UI and CLI (Python, uv)
+tools/mcds_trace/       Pointer: the host tool moved to tricore-debug-machine
 ```
 
 ## License

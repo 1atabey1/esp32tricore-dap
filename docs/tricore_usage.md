@@ -113,8 +113,11 @@ Browser: `http://<board>/datatrace.html` (tab "TriCore Data Trace").
 
 CLI instead of the page (same file format):
 
+The host tool is in the tricore-debug-machine repository
+(`sw/tools/mcds_trace`, see `tools/mcds_trace/README.md` here).
+
 ```sh
-cd tools/mcds_trace
+cd tricore-debug-machine/sw/tools/mcds_trace
 # posts the config, starts, streams 2 s, stops (up to two --watch slots)
 uv run mcds-trace capture <board> run.mcds --cpu 2 --watch 0x5000220C:2:w:mCyclesUntilSecond --seconds 2
 uv run mcds-trace capture <board> run.mcds --config cfg.json --seconds 2   # flags override the file
@@ -138,7 +141,7 @@ the application); sources writing faster lose (flagged) paragraphs.
 
 **Application:** `uv run mcds-trace-ui` (desktop, or `--web`) picks variables from the ELF by name -
 struct members, array elements, bitfields - plans the two watch ranges, traces and plots live, and
-opens captures offline. See `tools/mcds_trace/README.md`.
+opens captures offline. See its README in the tricore-debug-machine repository.
 Addresses are compared as the source sees them (cached 0x8…/0x9… ≠ uncached 0xA…/0xB…).
 
 ## 6. Bring-up diagnostics (CPU DAP path)
