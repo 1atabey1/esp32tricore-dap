@@ -164,6 +164,12 @@ uv run mcds-trace program run.dtrp --elf app.elf --cpu 2   # -> run.html, run.in
   keeps only one range, `--bursts ON:PERIOD` (microseconds, period up to ~430)
   samples: each burst starts with a sync and is timed at both ends. Pick a
   period that does not divide the application's task periods.
+- A window for all of it: `uv run mcds-trace-ptrace` records with these options
+  (DAP clock 120 MHz by default, or auto), analyses right after, and has an ELF
+  browser (demangled names) whose selection becomes the window or the excluded
+  range - one range per comparator, so several functions become the span that
+  holds them (the window lists what else that takes in); the hottest loops of
+  the last analysis can be excluded with a click.
 - Output: an HTML coverage overview, an lcov tracefile (genhtml, VS Code
   Coverage Gutters) and a Perfetto trace (`.pftrace`, ui.perfetto.dev; `--json`
   for Chrome JSON). Coverage is what the trace saw execute.

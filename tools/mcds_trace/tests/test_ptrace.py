@@ -218,3 +218,29 @@ def test_return_unwinds_past_calls_without_returns():
     seq = [(k, dec.names[n]) for _, k, n in dec.events]
     assert seq == [(EV_BEGIN, 'main'), (EV_BEGIN, 'f'), (EV_BEGIN, 'irq'), (EV_END, 'irq'),
                    (EV_END, 'f')]
+
+
+def test_ipa_zero_is_no_ip():
+    p = Packer()
+    p.msg(CORE_PTU, 0, [(0x1000, 32)])               # in main
+    p.msg(CORE_PTU, 2, [(8, 8)])                     # mov, call f
+    p.msg(CORE_PTU, 4, [(0, 4), (2, 8)])             # IPE: window closed after add
+    p.msg(CORE_PTU, 0, [(0, 32)])                    # IPA 0: no valid IP
+    p.msg(CORE_PTU, 2, [(6, 8)])                     # unsynced
+    p.msg(CORE_PTU, 0, [(0x2000, 32)])               # a real one
+    p.msg(CORE_PTU, 2, [(6, 8)])
+    dec = FlowDecoder(_model())
+    dec.paragraph(p.paragraph())
+    st = dec.stats
+    assert (st.invalid_ipa, st.desync, st.unsynced) == (1, 0, 1)
+    assert dec.counts().tolist()[3:5] == [2, 1]
+
+
+def test_demangled_targets_parse():
+    text = ("80049b9a:\t3c 13       \tj 80049bc0 <basic_software::isotp::IsoTpEngine::parse("
+            "me::Span<unsigned char const, 4294967295ul>, bool)+0x26>\n"
+            "80049d04:\t6d 00 10 00 \tcall 80049d24 <isoTp_rxCallback>\n"
+            "80049d08:\t5f f2 ff 7f \tjne %d2,%d15,80049d06 <f(std::array<int, 3ul>&)+0x2>\n")
+    addr, size, kind, target, *_ = cm.parse_objdump(text)
+    assert [hex(t) for t in target] == ['0x80049bc0', '0x80049d24', '0x80049d06']
+    assert [cm.KIND_NAMES[k] for k in kind] == ['jump', 'call', 'cond']

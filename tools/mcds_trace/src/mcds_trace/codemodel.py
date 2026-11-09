@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 
 # Control flow kinds of an instruction.
 K_SEQ = 0        # not a branch
@@ -55,7 +55,9 @@ _UNCOND = {'j': K_JUMP, 'ja': K_JUMP, 'loopu': K_JUMP,
 _RE_INSN = re.compile(r'^([0-9a-f]+):\t((?:[0-9a-f]{2} )+)\s*\t?(\S*)\s*(.*)$')
 _RE_FUNC = re.compile(r'^([0-9a-f]+) <(.+)>:$')
 _RE_LINE = re.compile(r'^(.+):(\d+)(?: \(discriminator \d+\))?$')
-_RE_TARGET = re.compile(r'(?:^|[ ,])([0-9a-f]{1,8}) <[^>]*>$')
+# the branch target: the first address operand that objdump follows with
+# <symbol>; demangled symbols hold '<', '>', ',' and ' ' themselves
+_RE_TARGET = re.compile(r'(?:^|[ ,])([0-9a-f]{1,8}) <')
 
 
 def kind_of(mnemonic: str, operands: str) -> int:
@@ -82,7 +84,7 @@ class CodeModel:
     files: list                 # source paths
     func_start: np.ndarray      # uint32, ascending
     func_end: np.ndarray        # uint32, exclusive
-    func_name: list
+    func_name: list             # demangled
     _index: dict = field(default_factory=dict, repr=False)
     _end_index: dict = field(default_factory=dict, repr=False)
 
@@ -151,29 +153,58 @@ def _code_sections(elf: str) -> list[str]:
                 if s['sh_flags'] & 0x4 and s['sh_size'] and s['sh_type'] == 'SHT_PROGBITS']
 
 
+def _tool_command(tool: str, env_var: str, args: list[str], path: str | None = None) -> list[str]:
+    """A TriCore binutils program (tool = 'objdump', 'c++filt'): $env_var,
+    tricore-elf-<tool> on PATH, the trigcc install, or (on Windows) the same in
+    WSL.  `path`, a file argument, goes last (translated for WSL)."""
+    name = 'tricore-elf-' + tool
+    tail = [path] if path else []
+    env = os.environ.get(env_var)
+    if env:
+        return shlex.split(env) + args + tail
+    exe = shutil.which(name)
+    if exe:
+        return [exe] + args + tail
+    local = os.path.expanduser('~/.local/opt/trigcc/bin/' + name)
+    if os.path.exists(local):
+        return [local] + args + tail
+    if sys.platform == 'win32' and shutil.which('wsl'):
+        script = ('exe=$(command -v %s || echo "$HOME/.local/opt/trigcc/bin/%s"); f="$1"; shift; '
+                  'if [ -n "$f" ]; then exec "$exe" "$@" "$(wslpath -u "$f")"; '
+                  'else exec "$exe" "$@"; fi' % (name, name))
+        return ['wsl', '-e', 'bash', '-lc', script, tool,
+                os.path.abspath(path) if path else ''] + args
+    raise FileNotFoundError('%s not found: put it on PATH or set %s' % (name, env_var))
+
+
 def _objdump_command(elf: str) -> list[str]:
-    """tricore-elf-objdump: $MCDS_OBJDUMP, PATH, the trigcc install, or (on
-    Windows) the same in WSL.  -D over the executable sections: -d shows
-    objects typed as data (a jump table such as PxSvDisptab) as bytes, but the
-    core runs them."""
-    args = ['-D', '-l']
+    """-D over the executable sections: -d shows objects typed as data (a jump
+    table such as PxSvDisptab) as bytes, but the core runs them.  -C: labels
+    demangled."""
+    args = ['-D', '-l', '-C']
     for name in _code_sections(elf):
         args += ['-j', name]
-    env = os.environ.get('MCDS_OBJDUMP')
-    if env:
-        return shlex.split(env) + args + [elf]
-    exe = shutil.which('tricore-elf-objdump')
-    if exe:
-        return [exe] + args + [elf]
-    local = os.path.expanduser('~/.local/opt/trigcc/bin/tricore-elf-objdump')
-    if os.path.exists(local):
-        return [local] + args + [elf]
-    if sys.platform == 'win32' and shutil.which('wsl'):
-        script = ('d="$HOME/.local/opt/trigcc/bin"; exe=$(command -v tricore-elf-objdump || '
-                  'echo "$d/tricore-elf-objdump"); f="$1"; shift; '
-                  'exec "$exe" "$@" "$(wslpath -u "$f")"')
-        return ['wsl', '-e', 'bash', '-lc', script, 'objdump', os.path.abspath(elf)] + args
-    raise FileNotFoundError('tricore-elf-objdump not found: put it on PATH or set MCDS_OBJDUMP')
+    return _tool_command('objdump', 'MCDS_OBJDUMP', args, elf)
+
+
+def demangle_all(names: list[str]) -> list[str]:
+    """C++ (Itanium) names demangled by c++filt, in one run; names it does
+    not know come back as they are, and so does everything without c++filt."""
+    mangled = [k for k, n in enumerate(names) if n.startswith('_Z')]
+    if not mangled:
+        return list(names)
+    try:
+        cmd = _tool_command('c++filt', 'MCDS_CXXFILT', [])
+        out = subprocess.run(cmd, input='\n'.join(names[k] for k in mangled) + '\n',
+                             capture_output=True, text=True, errors='replace', check=True,
+                             timeout=120).stdout.split('\n')
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        return list(names)
+    res = list(names)
+    for k, d in zip(mangled, out):
+        if d.strip():
+            res[k] = d.strip()
+    return res
 
 
 def _functions(path: str) -> tuple[list, list, list]:
@@ -204,7 +235,7 @@ def _functions(path: str) -> tuple[list, list, list]:
         nxt = starts[k + 1] if k + 1 < len(starts) else a + max(n, 2)
         ends.append(a + n if n else nxt)
         names.append(name)
-    return starts, ends, names
+    return starts, ends, demangle_all(names)
 
 
 def parse_objdump(text: str):

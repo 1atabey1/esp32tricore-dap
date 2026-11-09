@@ -66,6 +66,7 @@ class PtraceStats:
     lost_ipi: int = 0             # sum of err_cnt
     gaps: int = 0                 # paragraphs missing between records
     unsynced: int = 0             # IPI/IPE while the IP was unknown
+    invalid_ipa: int = 0          # IPA 0: the PTU had no valid IP (TCXCIP 0 = never seen one)
     desync: int = 0               # an IPI that did not end on an instruction / IPA mismatch
     syncs: int = 0                # IPAs that set or confirmed the IP
     bytes_executed: int = 0
@@ -85,6 +86,8 @@ class PtraceStats:
               '%d returns, %d interrupts/traps' % (self.bytes_executed, self.syncs, self.desync,
                                                    self.unsynced, self.calls, self.returns,
                                                    self.interrupts))
+        if self.invalid_ipa:
+            s += '\n%d IPA without a valid instruction pointer' % self.invalid_ipa
         if self.unknown_ip:
             top = sorted(self.unknown_ip.items(), key=lambda kv: -kv[1])[:5]
             s += '\naddresses outside the ELF: ' + ', '.join('0x%08x (%d)' % kv for kv in top)
@@ -282,6 +285,12 @@ class FlowDecoder:
             self._ret_addr = end
 
     def _on_ipa(self, v: int) -> None:
+        if v == 0:
+            # No valid instruction pointer (seen when the trace re-enables
+            # through an excluded range): unknown until the next real IPA.
+            self.stats.invalid_ipa += 1
+            self._lose()
+            return
         exp = self._expect
         self._expect = None
         if exp is not None:
@@ -322,6 +331,9 @@ class FlowDecoder:
 
     def _calls_ipa(self, v: int) -> None:
         """Subroutine mode: an IPA is a direct call (or the start of trace)."""
+        if v == 0:
+            self.stats.invalid_ipa += 1
+            return
         self.stats.syncs += 1
         if not self._stack:
             self._begin(v, 0)                    # start of trace: where it is

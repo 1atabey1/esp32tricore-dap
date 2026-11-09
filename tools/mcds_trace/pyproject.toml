@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 mcds-trace = "mcds_trace.cli:main"
 mcds-trace-ui = "mcds_trace.ui.app:main"
+mcds-trace-ptrace = "mcds_trace.ptrace_ui:main"
 
 [dependency-groups]
 dev = [

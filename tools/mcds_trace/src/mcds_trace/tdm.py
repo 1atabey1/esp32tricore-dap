@@ -368,16 +368,18 @@ class TdmProbe:
             s = self.session()
         return s
 
-    def start(self) -> str:
+    def start(self, auto: bool = True, bin_mhz: int | None = None) -> str:
+        """Start the trace.  Fast mode with `auto`: the probe's clock handshake
+        picks the bin; else the trace runs on `bin_mhz` (default TRACE_BIN_MHZ)."""
         if self.cfg is None:
             self.cfg = unpack_config(self._config_raw())
         fast = bool(self.cfg.get('fast'))
         try:
-            self.prepare()
+            self.prepare(bin_mhz or TRACE_BIN_MHZ)
         except TdmError as e:
             return 'failed: %s' % e
         # auto: the probe picks the bin (it tries them, so this takes up to ~1 s)
-        status, d = self.cmd('TRACE_START', b'\x01' if fast else b'', timeout=60000)
+        status, d = self.cmd('TRACE_START', b'\x01' if fast and auto else b'', timeout=60000)
         if status != 0:
             return 'failed: TRACE_START %s' % ESP_ERR.get(status, hex(status))
         if len(d) < INFO_SIZE:
@@ -390,7 +392,7 @@ class TdmProbe:
             if self.info['fast_active']:
                 self.info['fast_mhz'] = bin_mhz
         elif self.info['fast_active']:
-            self.info['fast_mhz'] = TRACE_BIN_MHZ
+            self.info['fast_mhz'] = bin_mhz or TRACE_BIN_MHZ
         return 'started emu_hz=%d wide=%d fast=%d' % (self.info['emu_hz'],
                                                       self.info['wide_active'],
                                                       self.info['fast_active'])
