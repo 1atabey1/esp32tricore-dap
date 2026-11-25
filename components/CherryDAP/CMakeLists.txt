@@ -1,3 +1,10 @@
+# esp_private/usb_phy.h is in the usb component up to ESP-IDF v5 and in
+# esp_hw_support from v6, where usb moved to the component registry.
+set(cherrydap_usb_requires)
+if(IDF_VERSION_MAJOR LESS 6)
+    set(cherrydap_usb_requires usb)
+endif()
+
 idf_component_register(
     SRCS
         "dap_main.c"
@@ -28,7 +35,10 @@ idf_component_register(
     REQUIRES
         "esp_http_client"
         "driver"
-        "usb"
+        "esp_driver_gpio"
+        "esp_driver_uart"
+        "esp_driver_usb_serial_jtag"
+        ${cherrydap_usb_requires}
         "nvs_flash"
         "freertos"
 )

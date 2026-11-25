@@ -25,6 +25,9 @@
 #include "types.h"
 #include "uart_websocket.h"
 #include "../gpio_loopback_test.h"
+#include "dap_lock.h"
+#include "dap_phy.h"
+#include "dap_phy_fpga.h"
 #include "../esp32jtag_common.h"
 #include "../port_cfg.h"
 #include "../ice40up5k/ice.h"
@@ -1142,8 +1145,7 @@ static void get_filename_from_path(const char *path, char *filename, size_t file
 {
     const char *last_slash = strrchr(path, '/');
     const char *src = last_slash ? last_slash + 1 : path;
-    strncpy(filename, src, filename_len - 1);
-    filename[filename_len - 1] = '\0';
+    strlcpy(filename, src, filename_len);
 }
 
 static esp_err_t file_upload_handler(httpd_req_t *req) {
@@ -1874,6 +1876,85 @@ static esp_err_t reset_target_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/*
+ * POST /api/trst {"pulse_ms": N}  - pulse the DAP-side reset line (TRST, PC01).
+ *
+ * Pulse only, 1..1000 ms: there is no "assert and hold", so a lost client or a
+ * crashed script cannot leave the target held in reset.  The DAP lock is held
+ * for the pulse, which keeps it from interleaving with a flash, a trace run or
+ * GDB (the fabric path writes the flags register over the same SPI bus).  A
+ * busy probe answers 409 rather than waiting.
+ */
+static esp_err_t trst_handler(httpd_req_t *req)
+{
+    if (check_auth(req) != ESP_OK) return ESP_OK;
+
+    int pulse_ms = 20;
+    char body[64];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    if (len > 0) {
+        int got = httpd_req_recv(req, body, len);
+        if (got <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+            return ESP_OK;
+        }
+        body[got] = '\0';
+        cJSON *root = cJSON_Parse(body);
+        const cJSON *ms = root ? cJSON_GetObjectItem(root, "pulse_ms") : NULL;
+        if (!root || (ms && !cJSON_IsNumber(ms))) {
+            cJSON_Delete(root);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"expected {\\\"pulse_ms\\\": 1-1000}\"}");
+            return ESP_OK;
+        }
+        if (ms) pulse_ms = ms->valueint;
+        cJSON_Delete(root);
+    }
+    if (pulse_ms < 1 || pulse_ms > 1000) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"pulse_ms must be 1-1000\"}");
+        return ESP_OK;
+    }
+
+    if (!dap_trylock(300)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"probe busy (flash, trace or diagnostic running)\"}");
+        return ESP_OK;
+    }
+
+    /* The fabric register when the stock bitstream is up, else the bit-bang pin. */
+    esp_err_t err = ESP_OK;
+    const char *path = "gpio";
+    if (dap_phy_fpga_ready()) {
+        path = "fpga";
+        err = dap_phy_fpga_set_trst(true);
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(pulse_ms));
+        }
+        /* Release even if the assert reported an error. */
+        esp_err_t rel = dap_phy_fpga_set_trst(false);
+        if (err == ESP_OK) err = rel;
+    } else {
+        dap_phy_set_trst(true);
+        vTaskDelay(pdMS_TO_TICKS(pulse_ms));
+        dap_phy_set_trst(false);
+    }
+    dap_unlock();
+
+    ESP_LOGI(TAG, "trst: %d ms pulse via %s -> %s", pulse_ms, path, esp_err_to_name(err));
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "{\"status\":\"%s\",\"path\":\"%s\",\"pulse_ms\":%d}",
+             err == ESP_OK ? "ok" : "error", path, pulse_ms);
+    if (err != ESP_OK) httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, msg);
+    return ESP_OK;
+}
+
 static esp_err_t uart_debug_handler(httpd_req_t *req)
 {
     char json[512];
@@ -2106,6 +2187,13 @@ httpd_uri_t uri_reset_target = {
     .user_ctx = NULL
 };
 
+httpd_uri_t uri_trst = {
+    .uri      = "/api/trst",
+    .method   = HTTP_POST,
+    .handler  = trst_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_uart_debug = {
     .uri      = "/api/uart_debug",
     .method   = HTTP_GET,
@@ -2297,6 +2385,7 @@ esp_err_t web_server_start(httpd_handle_t *http_handle) {
     httpd_register_uri_handler(*http_handle, &uri_la_get_settings);
     httpd_register_uri_handler(*http_handle, &uri_version);
     httpd_register_uri_handler(*http_handle, &uri_reset_target);
+    httpd_register_uri_handler(*http_handle, &uri_trst);
     httpd_register_uri_handler(*http_handle, &uri_uart_debug);
     httpd_register_uri_handler(*http_handle, &uri_sreset_config);
     httpd_register_uri_handler(*http_handle, &uri_portd_output);

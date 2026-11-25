@@ -37,6 +37,7 @@
 #include "dap_probe.h"
 #include "tricore_bmp.h"
 #include "xvc_server.h"
+#include "network/ctrl_server.h"
 #include "esp32jtag_common.h"
 #include "ice.h"
 #include "dap_main.h"
@@ -1179,6 +1180,11 @@ void app_main(void) {
     if (g_app_params.mode == APP_MODE_AP) {
     } else {
         ESP_LOGI(TAG, "Waiting for the network connection...");
+    }
+
+    /* Always-available reboot endpoint, independent of the main web server. */
+    if (ctrl_server_start() != ESP_OK) {
+        ESP_LOGW(TAG, "Control server couldn't be started");
     }
 
     httpd_handle_t http_handle;

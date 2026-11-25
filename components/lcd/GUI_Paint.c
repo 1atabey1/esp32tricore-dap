@@ -35,6 +35,9 @@
 #include <stdlib.h>
 #include <string.h> //memset()
 #include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "GUI_Paint.h"
 #include "DEV_Config.h"
 #include "lcd_library.h"

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/param.h>
 
+#include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"

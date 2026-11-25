@@ -6,6 +6,7 @@ set(sources
     network/network_adapter.c
     network/network_mngr.c
     network/web_server.c
+    network/ctrl_server.c
     network/flash_web.c
     network/dap_web.c
     network/lz4_fast.c
@@ -20,6 +21,10 @@ set(sources
 set(dependencies
     fatfs
     driver
+    esp_driver_gpio
+    esp_driver_ledc
+    esp_driver_spi
+    esp_driver_uart
     nvs_flash
     esp_netif
     console
@@ -31,8 +36,7 @@ set(dependencies
     esp_https_ota
     esp_wifi
     app_update
-    wifi_provisioning
-    json
+    network_provisioning
     compat
     platform_include
     blackmagic_esp32
@@ -40,6 +44,12 @@ set(dependencies
     CherryDAP
     dap_probe
 )
+
+# ESP-IDF v6 dropped the built-in json component; cJSON then comes from the
+# espressif/cjson registry component (main/idf_component.yml).
+if(IDF_VERSION_MAJOR LESS 6)
+    list(APPEND dependencies json)
+endif()
 
 idf_component_register(
     SRCS

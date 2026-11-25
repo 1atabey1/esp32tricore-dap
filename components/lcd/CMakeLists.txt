@@ -20,5 +20,5 @@ idf_component_register(
         "xvc_server.c"
         "pack_jtag_data.c"
         INCLUDE_DIRS "../" "." "../blackmagic_esp32/src/include" "../blackmagic_esp32/src/platforms/esp32/main/" "../../main/"
-        REQUIRES driver esp_wifi nvs_flash esp_timer esp_lcd esp_http_server json fatfs esp_adc esp_http_client
+        REQUIRES driver esp_driver_gpio esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi nvs_flash esp_timer esp_lcd esp_http_server fatfs esp_adc esp_http_client
         )

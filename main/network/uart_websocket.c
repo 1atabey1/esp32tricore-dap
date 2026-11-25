@@ -580,27 +580,35 @@ esp_err_t power_get_handler(httpd_req_t *req)
 }
 #endif
 
+/* A client connected (the handshake is done). */
+static esp_err_t websocket_open(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Handshake done, new connection opened");
+    // New client connects
+    resp_arg.hd = req->handle;
+    int new_fd = httpd_req_to_sockfd(req);
+    if (new_fd > 0) {
+        resp_arg.fd = new_fd;
+        ESP_LOGI(TAG, "New WS connection: fd=%d", new_fd);
+        
+        // Clear any old data from the stream buffer to prevent blasting old logs
+        xStreamBufferReset(xDataBuffer);
+    } else {
+        ESP_LOGE(TAG, "Failed to get sockfd for new connection");
+        return ESP_FAIL;
+    }
+
+    // Reset log monitor state on new connection to avoid mismatch
+    g_log_monitor_enabled = false;
+    return ESP_OK;
+}
+
 esp_err_t websocket_handler(httpd_req_t *req)
 {
+    /* IDF 5.x hands the handshake GET to the handler; IDF 6 calls
+     * ws_post_handshake_cb instead (see websocket_uri). */
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "Handshake done, new connection opened");
-        // New client connects
-        resp_arg.hd = req->handle;
-        int new_fd = httpd_req_to_sockfd(req);
-        if (new_fd > 0) {
-            resp_arg.fd = new_fd;
-            ESP_LOGI(TAG, "New WS connection: fd=%d", new_fd);
-            
-            // Clear any old data from the stream buffer to prevent blasting old logs
-            xStreamBufferReset(xDataBuffer);
-        } else {
-            ESP_LOGE(TAG, "Failed to get sockfd for new connection");
-            return ESP_FAIL;
-        }
-
-        // Reset log monitor state on new connection to avoid mismatch
-        g_log_monitor_enabled = false; 
-        return ESP_OK;
+        return websocket_open(req);
 
     } else {
         //ESP_LOGI(TAG, "Frame/Other req: method=%d", req->method);
@@ -746,7 +754,10 @@ esp_err_t uart_websocket_add_handlers(httpd_handle_t server) {
         .method = HTTP_GET,
         .handler = websocket_handler,
         .user_ctx = rest_context,
-		.is_websocket = true
+		.is_websocket = true,
+#if CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+        .ws_post_handshake_cb = websocket_open,
+#endif
     };
     httpd_register_uri_handler(server, &websocket_uri);
 

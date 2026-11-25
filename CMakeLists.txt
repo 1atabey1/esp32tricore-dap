@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.5)
 
 # set(COMPONENTS main)
 
+# ESP-IDF v6 moved Wi-Fi provisioning to the espressif/network_provisioning
+# registry component (main/idf_component.yml); keep v5.x's built-in copy out.
+set(EXCLUDE_COMPONENTS wifi_provisioning)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 if(${IDF_VERSION_MAJOR} LESS 5)

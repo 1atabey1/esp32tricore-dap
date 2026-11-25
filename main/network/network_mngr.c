@@ -10,7 +10,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_mac.h"
-#include "wifi_provisioning/scheme_softap.h"
+#include "network_provisioning/scheme_softap.h"
 
 #include "storage.h"
 #include "network_mngr.h"
@@ -152,13 +152,13 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     ESP_LOGI(TAG, "%s:%d Event ID %" PRIi32, __func__, __LINE__, event_id);
 
     switch (event_type) {
-    case WIFI_PROV_INIT:
+    case NETWORK_PROV_INIT:
         ESP_LOGI(TAG, "%s:%d WIFI_PROV_INIT", __func__, __LINE__);
         break;
-    case WIFI_PROV_START:
+    case NETWORK_PROV_START:
         ESP_LOGI(TAG, "%s:%d WIFI_PROV_START", __func__, __LINE__);
         break;
-    case WIFI_PROV_CRED_RECV: {
+    case NETWORK_PROV_WIFI_CRED_RECV: {
         wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
         ESP_LOGI(TAG, "Received Wi-Fi credentials"
                  "\n\tSSID     : %s\n\tPassword : %s",
@@ -167,25 +167,25 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         xEventGroupSetBits(s_event_group, WIFI_CRED_RECV_BIT);
         break;
     }
-    case WIFI_PROV_CRED_FAIL: {
-        wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
+    case NETWORK_PROV_WIFI_CRED_FAIL: {
+        network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
         ESP_LOGE(TAG, "Provisioning failed!\n\tReason : %s"
                  "\n\tPlease reset to factory and retry provisioning",
-                 (*reason == WIFI_PROV_STA_AUTH_ERROR) ?
+                 (*reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR) ?
                  "Wi-Fi station authentication failed" : "Wi-Fi access-point not found");
         xEventGroupSetBits(s_event_group, WIFI_CRED_FAIL_BIT);
         break;
     }
-    case WIFI_PROV_CRED_SUCCESS:
+    case NETWORK_PROV_WIFI_CRED_SUCCESS:
         ESP_LOGI(TAG, "%s:%d WIFI_PROV_CRED_SUCCESS", __func__, __LINE__);
         xEventGroupSetBits(s_event_group, WIFI_PROV_DONE_BIT);
         ESP_LOGI(TAG, "Provisioning successful");
         break;
-    case WIFI_PROV_END:
+    case NETWORK_PROV_END:
         ESP_LOGI(TAG, "%s:%d WIFI_PROV_END", __func__, __LINE__);
-        wifi_prov_mgr_deinit();
+        network_prov_mgr_deinit();
         break;
-    case WIFI_PROV_DEINIT:
+    case NETWORK_PROV_DEINIT:
         ESP_LOGI(TAG, "%s:%d WIFI_PROV_DEINIT_BIT", __func__, __LINE__);
         xEventGroupSetBits(s_event_group, WIFI_PROV_DEINIT_BIT);
         break;
@@ -398,7 +398,7 @@ esp_err_t network_mngr_init_prov(const char *ssid, const char *pass, const void 
         s_sta_netif = esp_netif_create_default_wifi_sta();
     }
 
-    esp_err_t status = esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL);
+    esp_err_t status = esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL);
     if (status != ESP_OK) {
         ESP_LOGE(TAG, "%s:%d prov event register error! (%s)", __func__, __LINE__, esp_err_to_name(status));
         return ESP_FAIL;
@@ -411,19 +411,19 @@ esp_err_t network_mngr_init_prov(const char *ssid, const char *pass, const void 
         return ESP_FAIL;
     }
 
-    wifi_prov_mgr_config_t config = {
-        .scheme = wifi_prov_scheme_softap,
-        .scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE
+    network_prov_mgr_config_t config = {
+        .scheme = network_prov_scheme_softap,
+        .scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE
     };
-    status = wifi_prov_mgr_init(config);
+    status = network_prov_mgr_init(config);
     if (status != ESP_OK) {
         ESP_LOGE(TAG, "%s:%d init error! (%s)", __func__, __LINE__, esp_err_to_name(status));
         return ESP_FAIL;
     }
 
-    wifi_prov_scheme_softap_set_httpd_handle((void *)http_handle);
+    network_prov_scheme_softap_set_httpd_handle((void *)http_handle);
 
-    if (wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_1, (const void *)"abcd1234", ssid, pass) != ESP_OK) {
+    if (network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_1, (const void *)"abcd1234", ssid, pass) != ESP_OK) {
         ESP_LOGE(TAG, "wifi mngr prov start failed!");
         return ESP_FAIL;
     }

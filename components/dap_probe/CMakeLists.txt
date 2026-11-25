@@ -11,5 +11,5 @@ idf_component_register(
          "tricore.c" "tricore_regs.c" "tricore_bmp.c"
          "tricore_flash.c" "tricore_flash_loader.c" "tricore_ucb.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_driver_spi esp_hw_support esp_timer platform_include blackmagic_esp32
+    REQUIRES driver esp_driver_gpio esp_driver_spi esp_hw_support esp_timer platform_include blackmagic_esp32
 )

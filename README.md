@@ -50,6 +50,54 @@ Pick variables (numbers, arrays, structs, bitfields) from the ELF, press
 Start, and watch them live; every session is recorded to a `.mcds` file for
 offline review. Subplots take any number of signals.
 
+## HTTP API
+
+Everything on port 80 needs HTTP basic auth (`admin` / `admin` until changed). Examples and
+parameters: [docs/tricore_usage.md](docs/tricore_usage.md).
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| **Control port 8081** | | Separate server with its own task: reachable while port 80 is busy or wedged |
+| `:8081/api/reboot` | POST | Reboot the probe (after 0.5 s) |
+| **System** | | |
+| `/api/version` | GET | Firmware, hardware, IDF and git versions |
+| `/ota_upload` | POST | Firmware update (multipart, field `firmware`); reboots |
+| `/reset_to_factory` | POST | Erase all settings and credentials; reboots |
+| `/set_credentials`, `/get_credentials` | POST, GET | Web login |
+| `/upload/*`, `/delete/*` | POST | Files on the probe's FAT storage |
+| `/log_error` | POST | Browser-side error log |
+| `/test/start`, `/test/status`, `/test/result` | POST, GET, GET | GPIO loopback self-test |
+| **Target reset** | | |
+| `/api/trst` | POST | Pulse TRST / PC01: `{"pulse_ms": 1-1000}` (default 20); 409 if the probe is busy |
+| `/api/reset_target` | POST | Pulse SRESET (Port B must be Vtarget+UART+SReset) |
+| `/api/sreset_config` | POST | SRESET polarity and pulse width |
+| **Flash** | | |
+| `/api/flash/upload` | POST | Upload an Intel HEX body |
+| `/api/flash/start` | POST | Program: `?full=1`, `?slow=1`, `?ucb=1` |
+| `/api/flash/status`, `/api/flash/ucb` | GET | Progress and result; boot mode header report |
+| **GDB and DAP** | | GDB server itself is TCP 4242 |
+| `/api/dap_gdb/attach`, `/api/dap_gdb/status` | GET | Register the cores with GDB; core states and heap |
+| `/api/dap_fpga` | GET | Fabric DAP check; `?wide=1` adds wide mode |
+| `/api/fpga_image` | GET | Show or select the FPGA image: `?sel=stock\|dap` |
+| `/api/fpga_load` | POST | Load a bitstream (body, up to 512 kB) until reboot |
+| `/api/dap_bringup`, `/api/dap_spi`, `/api/dap_bench` | GET | Bring-up checks over bit-bang and SPI; block-read benchmark |
+| **Trace** | | |
+| `/api/dap_trace/start`, `/stop`, `/stats`, `/stream`, `/selftest` | GET | Raw trace capture and drain |
+| `/ws/trace` | WebSocket | Trace stream (`?z=1` compressed) |
+| `/api/mcds/config` | GET, POST | miniMCDS trace configuration |
+| `/api/mcds/start`, `/api/mcds/stop` | GET | Start and stop an MCDS trace |
+| **Port, UART and logic analyser** | | |
+| `/ws` | WebSocket | UART bridge |
+| `/api/uart_debug` | GET | UART state and last received data |
+| `/api/portd_output`, `/api/portd_freq` | POST | Port D output pattern; square-wave generator |
+| `/la_start_capture`, `/instant_capture`, `/la_status`, `/capture_data` | GET | Logic analyser capture |
+| `/la_configure`, `/la_get_settings` | POST, GET | Logic analyser settings |
+| **Pages** | | |
+| `/`, `/help`, `/flash.html`, `/trace.html`, `/datatrace.html`, `/logic_analyzer.html` | GET | Web UI |
+
+The control port is not reachable through a port forward unless you forward it too. It uses the
+same credentials and plain HTTP, so keep it on a trusted network or behind a VPN.
+
 ## Documentation
 
 | | |

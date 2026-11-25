@@ -576,38 +576,45 @@ static void trace_ws_task(void *arg)
  * The handshake starts the sender task (a second client is refused); frames
  * from the client are read and discarded, a close stops the sender.
  */
+static esp_err_t trace_ws_open(httpd_req_t *req)
+{
+    /* A sender whose client just left exits within one idle tick. */
+    for (int i = 0; i < 10 && s_trace_ws_task != NULL && !s_trace_ws_run; i++) {
+        vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
+    }
+    if (s_trace_ws_fd >= 0 || s_trace_ws_task != NULL) {
+        ESP_LOGW(TAG, "trace ws: already streaming to fd %d",
+                 s_trace_ws_fd);
+        return ESP_FAIL;      /* refuse rather than split the stream */
+    }
+    /* ?z=1: the client takes LZ4-compressed frames. */
+    char query[32], val[8];
+    s_trace_ws_z = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+                   httpd_query_key_value(query, "z", val, sizeof(val)) == ESP_OK &&
+                   atoi(val) == 1;
+    s_trace_ws_gen++;
+    req->sess_ctx  = (void *)(uintptr_t)s_trace_ws_gen;
+    req->free_ctx  = trace_ws_session_gone;
+    s_trace_ws_hd  = req->handle;
+    s_trace_ws_fd  = httpd_req_to_sockfd(req);
+    s_trace_ws_run = true;
+
+    /* Core 1 with WiFi/lwIP; the TRAM drain owns core 0. */
+    if (xTaskCreatePinnedToCore(trace_ws_task, "trace_ws", 4096, NULL, 5,
+                                &s_trace_ws_task, 1) != pdPASS) {
+        ESP_LOGE(TAG, "trace ws: could not start the sender");
+        trace_ws_close();
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t trace_ws_handler(httpd_req_t *req)
 {
+    /* IDF 5.x hands the handshake GET to the handler; IDF 6 does not (it
+     * calls ws_post_handshake_cb instead, see uri_trace_ws). */
     if (req->method == HTTP_GET) {
-        /* A sender whose client just left exits within one idle tick. */
-        for (int i = 0; i < 10 && s_trace_ws_task != NULL && !s_trace_ws_run; i++) {
-            vTaskDelay(pdMS_TO_TICKS(TRACE_WS_IDLE_MS));
-        }
-        if (s_trace_ws_fd >= 0 || s_trace_ws_task != NULL) {
-            ESP_LOGW(TAG, "trace ws: already streaming to fd %d",
-                     s_trace_ws_fd);
-            return ESP_FAIL;      /* refuse rather than split the stream */
-        }
-        /* ?z=1: the client takes LZ4-compressed frames. */
-        char query[32], val[8];
-        s_trace_ws_z = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-                       httpd_query_key_value(query, "z", val, sizeof(val)) == ESP_OK &&
-                       atoi(val) == 1;
-        s_trace_ws_gen++;
-        req->sess_ctx  = (void *)(uintptr_t)s_trace_ws_gen;
-        req->free_ctx  = trace_ws_session_gone;
-        s_trace_ws_hd  = req->handle;
-        s_trace_ws_fd  = httpd_req_to_sockfd(req);
-        s_trace_ws_run = true;
-
-        /* Core 1 with WiFi/lwIP; the TRAM drain owns core 0. */
-        if (xTaskCreatePinnedToCore(trace_ws_task, "trace_ws", 4096, NULL, 5,
-                                    &s_trace_ws_task, 1) != pdPASS) {
-            ESP_LOGE(TAG, "trace ws: could not start the sender");
-            trace_ws_close();
-            return ESP_FAIL;
-        }
-        return ESP_OK;
+        return trace_ws_open(req);
     }
 
     httpd_ws_frame_t pkt = {0};
@@ -938,6 +945,9 @@ static httpd_uri_t uri_trace_ws = {
     .uri = "/ws/trace", .method = HTTP_GET,
     .handler = trace_ws_handler, .user_ctx = NULL,
     .is_websocket = true,
+#if CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+    .ws_post_handshake_cb = trace_ws_open,
+#endif
 };
 static httpd_uri_t uri_dap_bringup = {
     .uri = "/api/dap_bringup", .method = HTTP_GET,
